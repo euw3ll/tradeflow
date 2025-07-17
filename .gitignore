@@ -1,0 +1,23 @@
+# Ambiente Virtual
+.venv/
+venv/
+
+# Arquivos de Cache do Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Arquivo de Segredos
+.env
+
+# Banco de Dados SQLite
+*.db
+*.db-journal*
+
+# Arquivo de Sessão do Telethon
+*.session
+*.session-journal
+
+# Arquivos do VSCode
+.vscode/
