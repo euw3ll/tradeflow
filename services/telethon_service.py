@@ -71,33 +71,31 @@ async def list_channel_topics(channel_id: int):
 # Isso reduz drasticamente o número de eventos que o bot precisa processar.
 SIGNAL_PATTERN = re.compile(r'💎\s*Moeda:', re.IGNORECASE)
 
-# O listener agora usa um único decorator com o padrão e escuta tanto mensagens novas quanto editadas.
 @client.on(events.NewMessage(pattern=SIGNAL_PATTERN))
 @client.on(events.MessageEdited(pattern=SIGNAL_PATTERN))
 async def signal_listener(event):
     """
-    Ouve novas e editadas mensagens que JÁ CORRESPONDEM a um padrão de sinal,
-    e então as envia para a fila de processamento.
+    Ouve mensagens que correspondem ao padrão e faz uma verificação final
+    para garantir que é um evento de mensagem válido antes de processar.
     """
     global comm_queue
-    # Verificação de robustez: garante que o evento tem um objeto de mensagem e que a fila está pronta.
-    if not hasattr(event, 'message') or not event.message or not comm_queue:
+    
+    # --- VERIFICAÇÃO FINAL E CORREÇÃO ---
+    # Garante que o evento é do tipo que contém uma mensagem de texto (Message).
+    # Isso ignora com segurança outros eventos como status de usuário, enquetes, etc.
+    if not isinstance(event, (events.NewMessage.Event, events.MessageEdited.Event)):
+        return
+        
+    if not event or not event.text or not comm_queue:
         return
 
-    message_obj = event.message
-
-    # Garante que temos um texto para processar
-    if not message_obj.text:
-        return
-
-    # A partir daqui, o resto do fluxo é o mesmo, pois já sabemos que
-    # é uma mensagem de texto que provavelmente é um sinal.
+    # A partir daqui, o código está seguro, pois sabemos que 'event' é uma mensagem.
     monitored_targets = get_monitored_targets()
     if not monitored_targets:
         return
 
-    chat_id = message_obj.chat_id
-    topic_id = message_obj.reply_to.reply_to_msg_id if message_obj.reply_to else None
+    chat_id = event.chat_id
+    topic_id = event.reply_to.reply_to_msg_id if event.reply_to else None
 
     is_target = any(
         (target.channel_id == chat_id and (target.topic_id is None and topic_id is None)) or
@@ -109,19 +107,18 @@ async def signal_listener(event):
         logger.info(f"Potencial sinal detectado no alvo (Canal: {chat_id}). Adicionando à fila.")
         await comm_queue.put({
             "action": "process_signal",
-            "signal_text": message_obj.text
+            "signal_text": event.text
         })
 
 # --- Processador da Fila ---
 
 async def queue_processor(queue: asyncio.Queue, ptb_app: Application):
-    """Processa pedidos da fila (listar canais, listar tópicos, processar sinal)."""
+    """Processa pedidos da fila, agora passando o 'source_name' adiante."""
     global comm_queue
     comm_queue = queue
     from core.trade_manager import process_new_signal
 
     while True:
-        logger.info("[Queue Processor] ==> Aguardando por um novo pedido na fila...")
         request = await queue.get()
         action = request.get("action")
         logger.info(f"[Queue Processor] ==> Pedido recebido! Ação: '{action}'")
@@ -191,9 +188,13 @@ async def queue_processor(queue: asyncio.Queue, ptb_app: Application):
             elif action == "process_signal":
                 logger.info("[Queue Processor] ... Entrou no bloco de 'process_signal'.")
                 signal_text = request.get("signal_text")
+                # --- MUDANÇA: Pega o nome da fonte do pedido ---
+                source_name = request.get("source_name", "Fonte Desconhecida")
+                
                 signal_data = parse_signal(signal_text)
                 if signal_data:
-                    await process_new_signal(signal_data, ptb_app)
+                    # Passa o nome da fonte para o processador de trades
+                    await process_new_signal(signal_data, ptb_app, source_name)
                 else:
                     logger.info("Mensagem da fila não é um sinal válido.")
             

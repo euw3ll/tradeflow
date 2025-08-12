@@ -21,14 +21,12 @@ class User(Base):
     # Confiança mínima da IA para que o bot entre no trade.
     min_confidence = Column(Float, default=0.0) # Default 0 para aceitar qualquer sinal
 
-
 class InviteCode(Base):
     __tablename__ = 'invite_codes'
     id = Column(Integer, primary_key=True)
     code = Column(String, unique=True, nullable=False)
     is_used = Column(Boolean, default=False)
 
-# Em database/models.py (já deve estar assim)
 class MonitoredTarget(Base):
     __tablename__ = 'monitored_targets'
     id = Column(Integer, primary_key=True)
@@ -40,6 +38,14 @@ class MonitoredTarget(Base):
     # Podemos adicionar um __repr__ para facilitar a visualização
     def __repr__(self):
         return f"<MonitoredTarget(channel='{self.channel_name}', topic='{self.topic_name}')>"
+
+class PendingSignal(Base):
+    """Tabela para armazenar sinais de Ordem Limite que aguardam ativação/cancelamento."""
+    __tablename__ = 'pending_signals'
+    id = Column(Integer, primary_key=True)
+    user_telegram_id = Column(BigInteger, nullable=False)
+    symbol = Column(String, nullable=False, unique=True, index=True) # Apenas um sinal pendente por moeda
+    signal_data = Column(JSON, nullable=False)
 
 class Trade(Base):
     __tablename__ = 'trades'
