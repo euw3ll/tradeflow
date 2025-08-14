@@ -16,7 +16,9 @@ from bot.handlers import (
     ask_min_confidence, receive_min_confidence, ASKING_MIN_CONFIDENCE,
     admin_menu, list_channels_handler, select_channel_to_monitor, select_topic_to_monitor,
     report_handler, manual_close_handler, admin_view_targets_handler, back_to_admin_menu_handler,
-    bot_config_handler, toggle_approval_mode_handler, handle_signal_approval
+    bot_config_handler, toggle_approval_mode_handler, handle_signal_approval, 
+    ask_profit_target, receive_profit_target, ASKING_PROFIT_TARGET,
+    ask_loss_limit, receive_loss_limit, ASKING_LOSS_LIMIT
 )
 from database.session import init_db
 from services.telethon_service import start_signal_monitor
@@ -81,6 +83,16 @@ async def main():
         states={ ASKING_MIN_CONFIDENCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_min_confidence)] },
         fallbacks=[CommandHandler("cancel", cancel)], per_message=False,
     )
+    profit_target_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(ask_profit_target, pattern='^set_profit_target$')],
+        states={ ASKING_PROFIT_TARGET: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_profit_target)] },
+        fallbacks=[CommandHandler("cancel", cancel)], per_message=False,
+    )
+    loss_limit_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(ask_loss_limit, pattern='^set_loss_limit$')],
+        states={ ASKING_LOSS_LIMIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_loss_limit)] },
+        fallbacks=[CommandHandler("cancel", cancel)], per_message=False,
+    )
     
     # Adicionando todos os handlers
     application.add_handler(register_conv)
@@ -89,6 +101,8 @@ async def main():
     application.add_handler(settings_risk_conv)
     application.add_handler(settings_leverage_conv)
     application.add_handler(settings_confidence_conv)
+    application.add_handler(profit_target_conv)
+    application.add_handler(loss_limit_conv)
     
     application.add_handler(CommandHandler("admin", admin_menu))
     application.add_handler(CallbackQueryHandler(list_channels_handler, pattern='^admin_list_channels$'))

@@ -5,7 +5,7 @@ from telegram.ext import Application
 from sqlalchemy.orm import Session # <-- Adicionado 'Session' para a anotação de tipo
 from database.session import SessionLocal
 from database.models import User, Trade, PendingSignal, SignalForApproval
-from services.bybit_service import place_order, get_account_info
+from services.bybit_service import place_order, get_account_info, get_daily_pnl
 from services.notification_service import send_notification
 from utils.security import decrypt_data
 from utils.config import ADMIN_ID
@@ -26,11 +26,9 @@ def _avaliar_sinal(signal_data: dict, user_settings: User) -> Tuple[bool, str]:
         return False, motivo
     return True, "Sinal aprovado pelos seus critérios."
 
-
 async def process_new_signal(signal_data: dict, application: Application, source_name: str):
     """
-    Roteador de sinais: verifica o modo de aprovação do usuário e decide se
-    abre a ordem automaticamente ou se envia para aprovação manual.
+    Roteador de sinais: verifica metas, filtros e modo de aprovação antes de operar.
     """
     signal_type = signal_data.get("type")
     symbol = signal_data.get("coin")
@@ -48,13 +46,44 @@ async def process_new_signal(signal_data: dict, application: Application, source
         if not admin_user:
             logger.error("Admin não encontrado.")
             return
+            
+        api_key = decrypt_data(admin_user.api_key_encrypted)
+        api_secret = decrypt_data(admin_user.api_secret_encrypted)
 
+        # --- ETAPA 1: VERIFICAÇÃO DE METAS DIÁRIAS ---
+        pnl_result = await get_daily_pnl(api_key, api_secret)
+        if pnl_result.get("success"):
+            current_pnl = pnl_result["pnl"]
+            logger.info(f"P/L realizado hoje: ${current_pnl:.2f}")
+
+            # Verifica meta de lucro
+            profit_target = admin_user.daily_profit_target
+            if profit_target > 0 and current_pnl >= profit_target:
+                msg = f"🎯 Meta de lucro diária de ${profit_target:.2f} atingida (P/L atual: ${current_pnl:.2f}). Novas ordens pausadas por hoje."
+                logger.info(msg)
+                await send_notification(application, msg)
+                return # Bloqueia a abertura do trade
+
+            # Verifica limite de perda
+            loss_limit = admin_user.daily_loss_limit
+            if loss_limit > 0 and current_pnl <= -loss_limit:
+                msg = f"🛑 Limite de perda diário de ${loss_limit:.2f} atingido (P/L atual: ${current_pnl:.2f}). Novas ordens pausadas por hoje."
+                logger.info(msg)
+                await send_notification(application, msg)
+                return # Bloqueia a abertura do trade
+        else:
+            logger.error("Não foi possível verificar o P/L diário. Abertura de trade cancelada por segurança.")
+            await send_notification(application, "⚠️ Falha ao verificar metas diárias. A operação não foi aberta.")
+            return
+
+        # --- ETAPA 2: AVALIAÇÃO DO SINAL (lógica existente) ---
         aprovado, motivo = _avaliar_sinal(signal_data, admin_user)
         if not aprovado:
             rejection_msg = f"⚠️ <b>Sinal para {symbol} Ignorado</b>\n<b>Fonte:</b> {source_name}\n<b>Motivo:</b> {motivo}"
             await send_notification(application, rejection_msg)
             return
 
+        # --- ETAPA 3: MODO DE APROVAÇÃO E EXECUÇÃO (lógica existente) ---
         if admin_user.approval_mode == 'AUTOMATIC':
             logger.info(f"Modo AUTOMÁTICO. Tentando abrir ordem para {symbol}...")
             await _execute_trade(signal_data, admin_user, application, db, source_name)

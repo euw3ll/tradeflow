@@ -16,6 +16,7 @@ from core.trade_manager import _execute_trade
 # Estados para as conversas
 (WAITING_CODE, WAITING_API_KEY, WAITING_API_SECRET, CONFIRM_REMOVE_API) = range(4)
 (ASKING_RISK_PERCENT, ASKING_MAX_LEVERAGE, ASKING_MIN_CONFIDENCE) = range(10, 13)
+(ASKING_PROFIT_TARGET, ASKING_LOSS_LIMIT) = range(13, 15)
 
 logger = logging.getLogger(__name__)
 
@@ -884,7 +885,10 @@ async def toggle_approval_mode_handler(update: Update, context: ContextTypes.DEF
 
     db = SessionLocal()
     try:
-        user = get_user_by_id(user_id)
+        # --- CORREÇÃO APLICADA AQUI ---
+        # Busca o usuário usando a sessão local da função, em vez de get_user_by_id
+        user = db.query(User).filter(User.telegram_id == user_id).first()
+        
         if user:
             # Lógica para alternar o modo
             if user.approval_mode == 'AUTOMATIC':
@@ -892,15 +896,20 @@ async def toggle_approval_mode_handler(update: Update, context: ContextTypes.DEF
             else:
                 user.approval_mode = 'AUTOMATIC'
             
-            db.commit()
+            db.commit() # Agora o commit salvará o objeto 'user' que pertence a esta sessão 'db'
             
-            # Edita a mensagem para refletir a mudança, redesenhando o teclado
-            await query.edit_message_text(
-                "<b>🤖 Configuração do Bot</b>\n\n"
-                "Ajuste o comportamento geral do bot.",
-                parse_mode='HTML',
-                reply_markup=bot_config_keyboard(user)
-            )
+            try:
+                await query.edit_message_text(
+                    "<b>🤖 Configuração do Bot</b>\n\n"
+                    "Ajuste o comportamento geral do bot.",
+                    parse_mode='HTML',
+                    reply_markup=bot_config_keyboard(user)
+                )
+            except BadRequest as e:
+                if "Message is not modified" in str(e):
+                    pass
+                else:
+                    logger.error(f"Erro ao editar mensagem em toggle_approval_mode: {e}")
     finally:
         db.close()
 
@@ -942,3 +951,117 @@ async def handle_signal_approval(update: Update, context: ContextTypes.DEFAULT_T
     
     finally:
         db.close()
+
+# --- FLUXO DE CONFIGURAÇÃO DE METAS DIÁRIAS ---
+
+async def ask_profit_target(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Pergunta ao usuário a nova meta de lucro diário."""
+    query = update.callback_query
+    await query.answer()
+    
+    context.user_data['settings_message_id'] = query.message.message_id
+    
+    await query.edit_message_text(
+        "Envie a sua meta de **lucro diário** em USDT.\n"
+        "O bot irá parar de abrir novas ordens quando o lucro do dia atingir este valor.\n\n"
+        "Envie apenas o número (ex: `100` para $100) ou `0` para desativar.",
+        parse_mode='Markdown'
+    )
+    return ASKING_PROFIT_TARGET
+
+async def receive_profit_target(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Recebe, valida e salva a nova meta de lucro."""
+    user_id = update.effective_user.id
+    message_id_to_edit = context.user_data.get('settings_message_id')
+    
+    await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id)
+
+    try:
+        target_value = float(update.message.text.replace(',', '.'))
+        if target_value < 0:
+            raise ValueError("Valor não pode ser negativo")
+
+        db = SessionLocal()
+        try:
+            user = db.query(User).filter_by(telegram_id=user_id).first()
+            user.daily_profit_target = target_value
+            db.commit()
+            
+            feedback_text = f"✅ Meta de lucro diário atualizada para ${target_value:.2f}."
+            if target_value == 0:
+                feedback_text = "✅ Meta de lucro diário foi desativada."
+
+            await context.bot.edit_message_text(
+                chat_id=update.effective_chat.id,
+                message_id=message_id_to_edit,
+                text=f"{feedback_text}\n\nAjuste outra configuração ou volte.",
+                reply_markup=bot_config_keyboard(user)
+            )
+        finally:
+            db.close()
+
+    except (ValueError, TypeError):
+        await context.bot.edit_message_text(
+            chat_id=update.effective_chat.id,
+            message_id=message_id_to_edit,
+            text="❌ Valor inválido. Por favor, tente novamente com um número (ex: 100)."
+        )
+        return ASKING_PROFIT_TARGET
+
+    return ConversationHandler.END
+
+async def ask_loss_limit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Pergunta ao usuário o novo limite de perda diário."""
+    query = update.callback_query
+    await query.answer()
+    
+    context.user_data['settings_message_id'] = query.message.message_id
+    
+    await query.edit_message_text(
+        "Envie o seu limite de **perda diária** em USDT.\n"
+        "O bot irá parar de abrir novas ordens se a perda do dia atingir este valor.\n\n"
+        "Envie um número positivo (ex: `50` para um limite de $50) ou `0` para desativar.",
+        parse_mode='Markdown'
+    )
+    return ASKING_LOSS_LIMIT
+
+async def receive_loss_limit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Recebe, valida e salva o novo limite de perda."""
+    user_id = update.effective_user.id
+    message_id_to_edit = context.user_data.get('settings_message_id')
+
+    await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id)
+
+    try:
+        limit_value = float(update.message.text.replace(',', '.'))
+        if limit_value < 0:
+            raise ValueError("Valor não pode ser negativo")
+
+        db = SessionLocal()
+        try:
+            user = db.query(User).filter_by(telegram_id=user_id).first()
+            user.daily_loss_limit = limit_value
+            db.commit()
+
+            feedback_text = f"✅ Limite de perda diário atualizado para ${limit_value:.2f}."
+            if limit_value == 0:
+                feedback_text = "✅ Limite de perda diário foi desativado."
+
+            await context.bot.edit_message_text(
+                chat_id=update.effective_chat.id,
+                message_id=message_id_to_edit,
+                text=f"{feedback_text}\n\nAjuste outra configuração ou volte.",
+                reply_markup=bot_config_keyboard(user)
+            )
+        finally:
+            db.close()
+
+    except (ValueError, TypeError):
+        await context.bot.edit_message_text(
+            chat_id=update.effective_chat.id,
+            message_id=message_id_to_edit,
+            text="❌ Valor inválido. Por favor, tente novamente com um número positivo (ex: 50)."
+        )
+        return ASKING_LOSS_LIMIT
+
+    return ConversationHandler.END

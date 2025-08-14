@@ -1,5 +1,4 @@
-from sqlalchemy import (Column, Integer, String, BigInteger, 
-                        Boolean, Float, JSON, DateTime)
+from sqlalchemy import (Column, Integer, String, BigInteger, Boolean, Float, JSON, DateTime)
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.sql import func
 
@@ -16,6 +15,10 @@ class User(Base):
     max_leverage = Column(Integer, default=10)
     min_confidence = Column(Float, default=0.0)
     approval_mode = Column(String, default='AUTOMATIC', nullable=False)
+    # Meta de lucro diário. 0.0 significa desativado.
+    daily_profit_target = Column(Float, default=0.0, nullable=False)
+    # Limite de perda diário (valor positivo). 0.0 significa desativado.
+    daily_loss_limit = Column(Float, default=0.0, nullable=False)
 
 class InviteCode(Base):
     __tablename__ = 'invite_codes'

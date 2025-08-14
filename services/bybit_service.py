@@ -1,6 +1,7 @@
 import logging
 import asyncio
 from typing import Dict
+from datetime import datetime, time
 from pybit.unified_trading import HTTP
 from database.models import User
 
@@ -135,4 +136,35 @@ async def get_open_positions(api_key: str, api_secret: str) -> dict:
         except Exception as e:
             logger.error(f"Exceção ao buscar posições abertas: {e}", exc_info=True)
             return {"success": False, "data": [], "error": str(e)}
+    return await asyncio.to_thread(_sync_call)
+
+async def get_daily_pnl(api_key: str, api_secret: str) -> dict:
+    """Busca o P/L (Lucro/Prejuízo) realizado para o dia atual."""
+    def _sync_call():
+        try:
+            session = get_session(api_key, api_secret)
+            
+            # Define o início do dia de hoje (meia-noite) em milissegundos
+            today_start_dt = datetime.combine(datetime.today(), time.min)
+            start_timestamp_ms = int(today_start_dt.timestamp() * 1000)
+
+            response = session.get_closed_pnl(
+                category="linear",
+                startTime=start_timestamp_ms,
+                limit=100 # Limite de trades fechados para buscar
+            )
+
+            if response.get('retCode') == 0:
+                pnl_list = response.get('result', {}).get('list', [])
+                total_pnl = sum(float(item.get('closedPnl', 0)) for item in pnl_list)
+                return {"success": True, "pnl": total_pnl}
+            else:
+                error_msg = response.get('retMsg', 'Erro desconhecido ao buscar P/L.')
+                logger.error(f"Erro da API Bybit ao buscar P/L diário: {error_msg}")
+                return {"success": False, "error": error_msg}
+
+        except Exception as e:
+            logger.error(f"Exceção em get_daily_pnl: {e}", exc_info=True)
+            return {"success": False, "error": str(e)}
+
     return await asyncio.to_thread(_sync_call)

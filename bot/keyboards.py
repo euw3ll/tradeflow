@@ -73,19 +73,29 @@ def settings_menu_keyboard(user_settings):
 
 def bot_config_keyboard(user_settings):
     """
-    Retorna o teclado para o menu de configuração do bot, mostrando o modo de aprovação.
+    Retorna o teclado para o menu de configuração do bot, mostrando o modo de aprovação e as metas.
     """
+    # Botão de Modo de Aprovação (lógica existente)
     mode = user_settings.approval_mode
-    
-    # Define o texto e o emoji com base no modo atual
     if mode == 'AUTOMATIC':
-        button_text = "Modo de Aprovação: Automático ⚡"
+        approval_button_text = "Modo de Aprovação: Automático ⚡"
     else:
-        button_text = "Modo de Aprovação: Manual 👋"
+        approval_button_text = "Modo de Aprovação: Manual 👋"
+
+    # --- NOVOS BOTÕES DE METAS ---
+    # Formata a meta de lucro para exibição
+    profit_target = user_settings.daily_profit_target
+    profit_text = f"Meta de Lucro Diária: ${profit_target:.2f}" if profit_target > 0 else "Meta de Lucro Diária: Desativada"
+
+    # Formata o limite de perda para exibição
+    loss_limit = user_settings.daily_loss_limit
+    loss_text = f"Limite de Perda Diário: ${loss_limit:.2f}" if loss_limit > 0 else "Limite de Perda Diário: Desativado"
 
     keyboard = [
-        # Botão que vai alternar o modo
-        [InlineKeyboardButton(button_text, callback_data='toggle_approval_mode')],
+        [InlineKeyboardButton(approval_button_text, callback_data='toggle_approval_mode')],
+        # --- NOVAS LINHAS ADICIONADAS AO TECLADO ---
+        [InlineKeyboardButton(profit_text, callback_data='set_profit_target')],
+        [InlineKeyboardButton(loss_text, callback_data='set_loss_limit')],
         [InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data='back_to_main_menu')]
     ]
     return InlineKeyboardMarkup(keyboard)
