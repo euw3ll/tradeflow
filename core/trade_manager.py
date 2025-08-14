@@ -93,25 +93,33 @@ async def process_new_signal(signal_data: dict, application: Application, source
     finally:
         db.close()
 
-# --- ANOTAÇÃO DE TIPO CORRIGIDA E CÓDIGO FALTANDO ADICIONADO ---
 async def _execute_trade(signal_data: dict, user: User, application: Application, db: Session, source_name: str):
     """Função interna que contém a lógica para abrir uma posição na Bybit."""
     api_key = decrypt_data(user.api_key_encrypted)
     api_secret = decrypt_data(user.api_secret_encrypted)
     
-    account_info = get_account_info(api_key, api_secret)
+    # --- AWAIT ADICIONADO ---
+    account_info = await get_account_info(api_key, api_secret)
     if not account_info.get("success"):
         await send_notification(application, f"❌ Falha ao buscar saldo da Bybit para operar {signal_data['coin']}.")
         return
-        
-    balance = float(account_info['data']['totalEquity'])
-    result = place_order(api_key, api_secret, signal_data, user, balance)
+    
+    balances = account_info.get("data", [])
+    if not balances:
+        await send_notification(application, f"❌ Falha: Nenhuma informação de saldo recebida da Bybit para operar {signal_data['coin']}.")
+        return
+
+    # --- CORREÇÃO: Pega o saldo total do primeiro item da lista ---
+    balance = float(balances[0].get('totalEquity', 0))
+    
+    # --- AWAIT ADICIONADO ---
+    result = await place_order(api_key, api_secret, signal_data, user, balance)
     
     if result.get("success"):
         order_data = result['data']
         order_id = order_data['orderId']
 
-        # --- CÓDIGO FALTANDO PARA SALVAR O TRADE ---
+        # Salva o trade bem-sucedido no banco de dados
         new_trade = Trade(
             user_telegram_id=user.telegram_id,
             order_id=order_id,
@@ -128,7 +136,6 @@ async def _execute_trade(signal_data: dict, user: User, application: Application
         db.add(new_trade)
         db.commit()
         logger.info(f"Trade {order_id} salvo no banco de dados para rastreamento.")
-        # ------------------------------------
 
         await send_notification(application, f"📈 <b>Ordem Aberta com Sucesso!</b>\n<b>Moeda:</b> {signal_data['coin']}\n<b>ID:</b> {order_id}")
     else:

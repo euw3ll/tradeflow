@@ -1,0 +1,2390 @@
+========================================
+# Arquivo: Dockerfile
+========================================
+
+# Usa uma imagem oficial do Python como base
+FROM python:3.11-slim
+
+# Define o diretório de trabalho dentro do container
+WORKDIR /app
+
+# --- NOVA SEÇÃO: INSTALAÇÃO DO TAILSCALE ---
+# Adiciona pacotes necessários para a instalação e funcionamento do Tailscale
+RUN apt-get update && apt-get install -y ca-certificates curl gnupg && \
+    # Adiciona o repositório do Tailscale
+    curl -fsSL https://pkgs.tailscale.com/stable/debian/bookworm.noarmor.gpg | tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null && \
+    curl -fsSL https://pkgs.tailscale.com/stable/debian/bookworm.tailscale-keyring.list | tee /etc/apt/sources.list.d/tailscale.list && \
+    # Instala o Tailscale
+    apt-get update && apt-get install -y tailscale && \
+    # Limpa o cache
+    rm -rf /var/lib/apt/lists/*
+# ----------------------------------------------
+
+# Copia o arquivo de dependências primeiro
+COPY requirements.txt .
+
+# Instala as dependências do Python
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copia todo o resto do código do projeto
+COPY . .
+
+# Comando que será executado quando o container iniciar
+CMD ["./start.sh"]
+
+========================================
+# Arquivo: fly.toml
+========================================
+
+app = "tradeflow"
+primary_region = "gru"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[mounts]
+  source = "tradeflow_data"
+  destination = "/data"
+
+[processes]
+  app = "./start.sh" # Agora o processo principal é nosso script
+
+========================================
+# Arquivo: main.py
+========================================
+
+import logging
+import asyncio
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, filters, 
+    ConversationHandler, CallbackQueryHandler
+)
+from utils.config import TELEGRAM_TOKEN
+from bot.handlers import (
+    start, receive_invite_code, cancel, WAITING_CODE,
+    config_api, receive_api_key, receive_api_secret, WAITING_API_KEY, WAITING_API_SECRET,
+    remove_api_prompt, remove_api_action, CONFIRM_REMOVE_API,
+    my_positions_handler, user_dashboard_handler, user_settings_handler,
+    back_to_main_menu_handler,
+    ask_risk_percent, receive_risk_percent, ASKING_RISK_PERCENT,
+    ask_max_leverage, receive_max_leverage, ASKING_MAX_LEVERAGE,
+    ask_min_confidence, receive_min_confidence, ASKING_MIN_CONFIDENCE,
+    admin_menu, list_channels_handler, select_channel_to_monitor, select_topic_to_monitor,
+    report_handler, manual_close_handler, admin_view_targets_handler, back_to_admin_menu_handler,
+    bot_config_handler, toggle_approval_mode_handler, handle_signal_approval
+)
+from database.session import init_db
+from services.telethon_service import start_signal_monitor
+from core.position_tracker import run_tracker
+
+# --- Configuração do Logging ---
+logging.basicConfig(
+    format="%(asctime)s - [%(levelname)s] - %(name)s - %(message)s",
+    level=logging.INFO
+)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+logger = logging.getLogger(__name__)
+
+async def run_ptb(application: Application, queue: asyncio.Queue):
+    """Inicializa e roda a aplicação python-telegram-bot."""
+    application.bot_data['comm_queue'] = queue
+    logger.info("Inicializando o bot do Telegram (PTB)...")
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling()
+    logger.info("✅ Bot do Telegram (PTB) ativo.")
+
+async def main():
+    """Configura os handlers e inicia o PTB e o Telethon em paralelo."""
+    init_db()
+    comm_queue = asyncio.Queue()
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    await comm_queue.put(application)
+
+    # --- Handlers de Conversa ---
+    register_conv = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
+        states={ WAITING_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_invite_code)] },
+        fallbacks=[CommandHandler("cancel", cancel)], per_message=False,
+    )
+    api_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(config_api, pattern='^config_api$')],
+        states={
+            WAITING_API_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_api_key)],
+            WAITING_API_SECRET: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_api_secret)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)], per_message=False,
+    )
+    remove_api_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(remove_api_prompt, pattern='^remove_api_prompt$')],
+        states={ CONFIRM_REMOVE_API: [CallbackQueryHandler(remove_api_action, pattern='^remove_api_confirm|remove_api_cancel$')] },
+        fallbacks=[CommandHandler("cancel", cancel)], per_message=False,
+    )
+    settings_risk_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(ask_risk_percent, pattern='^set_risk_percent$')],
+        states={ ASKING_RISK_PERCENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_risk_percent)] },
+        fallbacks=[CommandHandler("cancel", cancel)], per_message=False,
+    )
+    settings_leverage_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(ask_max_leverage, pattern='^set_max_leverage$')],
+        states={ ASKING_MAX_LEVERAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_max_leverage)] },
+        fallbacks=[CommandHandler("cancel", cancel)], per_message=False,
+    )
+    settings_confidence_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(ask_min_confidence, pattern='^set_min_confidence$')],
+        states={ ASKING_MIN_CONFIDENCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_min_confidence)] },
+        fallbacks=[CommandHandler("cancel", cancel)], per_message=False,
+    )
+    
+    # Adicionando todos os handlers
+    application.add_handler(register_conv)
+    application.add_handler(api_conv)
+    application.add_handler(remove_api_conv)
+    application.add_handler(settings_risk_conv)
+    application.add_handler(settings_leverage_conv)
+    application.add_handler(settings_confidence_conv)
+    
+    application.add_handler(CommandHandler("admin", admin_menu))
+    application.add_handler(CallbackQueryHandler(list_channels_handler, pattern='^admin_list_channels$'))
+    application.add_handler(CallbackQueryHandler(select_channel_to_monitor, pattern='^monitor_channel_'))
+    application.add_handler(CallbackQueryHandler(select_topic_to_monitor, pattern='^monitor_topic_'))
+    application.add_handler(CallbackQueryHandler(admin_view_targets_handler, pattern='^admin_view_targets$'))
+    application.add_handler(CallbackQueryHandler(back_to_admin_menu_handler, pattern='^back_to_admin_menu$'))
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("relatorio", report_handler))
+    
+    application.add_handler(CallbackQueryHandler(my_positions_handler, pattern='^user_positions$'))
+    application.add_handler(CallbackQueryHandler(user_settings_handler, pattern='^user_settings$'))
+    application.add_handler(CallbackQueryHandler(user_dashboard_handler, pattern='^user_dashboard$'))
+    application.add_handler(CallbackQueryHandler(back_to_main_menu_handler, pattern='^back_to_main_menu$'))
+    application.add_handler(CallbackQueryHandler(manual_close_handler, pattern='^manual_close_'))
+
+    application.add_handler(CallbackQueryHandler(bot_config_handler, pattern='^bot_config$'))
+    application.add_handler(CallbackQueryHandler(toggle_approval_mode_handler, pattern='^toggle_approval_mode$'))
+
+    application.add_handler(CallbackQueryHandler(handle_signal_approval, pattern=r'^(approve_signal_|reject_signal_)'))
+
+
+    logger.info("Bot configurado. Iniciando todos os serviços...")
+
+    await asyncio.gather(
+        run_ptb(application, comm_queue),
+        start_signal_monitor(comm_queue),
+        run_tracker(application)
+    )
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot desligado pelo usuário.")
+    except Exception as e:
+        logger.critical(f"Erro crítico não tratado: {e}", exc_info=True)
+
+========================================
+# Arquivo: start.sh
+========================================
+
+#!/bin/sh
+
+# Inicia o Tailscale em segundo plano
+/usr/sbin/tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock &
+
+# Espera um pouco para o Tailscale iniciar
+sleep 2
+
+# Conecta à rede Tailscale usando a chave de autenticação
+/usr/bin/tailscale up --authkey=${TAILSCALE_AUTHKEY} --hostname="tradeflow-bot"
+
+# Inicia a aplicação principal do bot
+echo "Iniciando o bot TradeFlow..."
+python main.py
+
+========================================
+# Arquivo: database/__init__.py
+========================================
+
+
+
+========================================
+# Arquivo: database/crud.py
+========================================
+
+from .session import SessionLocal
+from .models import User
+
+def get_user_by_id(telegram_id: int):
+    """Busca um usuário no banco de dados pelo seu ID do Telegram."""
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.telegram_id == telegram_id).first()
+        return user
+    finally:
+        db.close()
+
+========================================
+# Arquivo: database/models.py
+========================================
+
+from sqlalchemy import (Column, Integer, String, BigInteger, 
+                        Boolean, Float, JSON, DateTime)
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.sql import func
+
+Base = declarative_base()
+
+class User(Base):
+    __tablename__ = 'users'
+    id = Column(Integer, primary_key=True)
+    telegram_id = Column(BigInteger, unique=True, nullable=False, index=True)
+    first_name = Column(String)
+    api_key_encrypted = Column(String)
+    api_secret_encrypted = Column(String)
+    risk_per_trade_percent = Column(Float, default=1.0)
+    max_leverage = Column(Integer, default=10)
+    min_confidence = Column(Float, default=0.0)
+    approval_mode = Column(String, default='AUTOMATIC', nullable=False)
+
+class InviteCode(Base):
+    __tablename__ = 'invite_codes'
+    id = Column(Integer, primary_key=True)
+    code = Column(String, unique=True, nullable=False)
+    is_used = Column(Boolean, default=False)
+
+class MonitoredTarget(Base):
+    __tablename__ = 'monitored_targets'
+    id = Column(Integer, primary_key=True)
+    channel_id = Column(BigInteger, nullable=False)
+    channel_name = Column(String)
+    topic_id = Column(BigInteger, unique=True, nullable=True)
+    topic_name = Column(String)
+
+class Trade(Base):
+    __tablename__ = 'trades'
+    id = Column(Integer, primary_key=True)
+    user_telegram_id = Column(BigInteger, nullable=False)
+    order_id = Column(String, unique=True, nullable=False)
+    symbol = Column(String, nullable=False)
+    side = Column(String, nullable=False)
+    qty = Column(Float, nullable=False)
+    entry_price = Column(Float)
+    stop_loss = Column(Float)
+    current_stop_loss = Column(Float)
+    initial_targets = Column(JSON)
+    status = Column(String, default='ACTIVE')
+    remaining_qty = Column(Float)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+class PendingSignal(Base):
+    __tablename__ = 'pending_signals'
+    id = Column(Integer, primary_key=True)
+    user_telegram_id = Column(BigInteger, nullable=False)
+    symbol = Column(String, nullable=False, unique=True, index=True)
+    signal_data = Column(JSON, nullable=False)
+
+class SignalForApproval(Base):
+    __tablename__ = 'signals_for_approval'
+    id = Column(Integer, primary_key=True)
+    user_telegram_id = Column(BigInteger, nullable=False, index=True)
+    symbol = Column(String, nullable=False)
+    source_name = Column(String)
+    signal_data = Column(JSON, nullable=False)
+    approval_message_id = Column(BigInteger)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+========================================
+# Arquivo: database/session.py
+========================================
+
+import os # Importa a biblioteca 'os'
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from .models import Base
+
+# --- LÓGICA DE CAMINHO DINÂMICO ---
+if os.path.isdir('/data'):
+    # Caminho para o banco de dados no servidor Fly.io
+    DATABASE_URL = "sqlite:////data/tradeflow.db"
+else:
+    # Caminho para o banco de dados local (no seu Mac)
+    DATABASE_URL = "sqlite:///./tradeflow.db"
+
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+def init_db():
+    Base.metadata.create_all(bind=engine)
+
+========================================
+# Arquivo: core/__init__.py
+========================================
+
+
+
+========================================
+# Arquivo: core/position_tracker.py
+========================================
+
+import asyncio
+import logging
+from telegram.ext import Application
+from database.session import SessionLocal
+from database.models import Trade, User
+from services.bybit_service import get_market_price, close_partial_position, modify_position_stop_loss
+from services.notification_service import send_notification
+from utils.security import decrypt_data
+from utils.config import ADMIN_ID
+
+logger = logging.getLogger(__name__)
+
+async def check_active_trades(application: Application):
+    """Verifica e gerencia ativamente os trades com múltiplos TPs e trailing stop."""
+    db = SessionLocal()
+    try:
+        # Busca todos os trades que não estão completamente fechados
+        active_trades = db.query(Trade).filter(~Trade.status.like('%CLOSED%')).all()
+        if not active_trades: return
+
+        logger.info(f"Rastreador: {len(active_trades)} trade(s) ativo(s) para verificar.")
+        
+        admin_user = db.query(User).filter_by(telegram_id=ADMIN_ID).first()
+        if not admin_user or not admin_user.api_key_encrypted:
+            logger.error("Rastreador: Admin ou chaves de API não encontrados.")
+            return
+        
+        api_key = decrypt_data(admin_user.api_key_encrypted)
+        api_secret = decrypt_data(admin_user.api_secret_encrypted)
+
+        for trade in active_trades:
+            price_result = get_market_price(trade.symbol)
+            if not price_result.get("success"):
+                # ... (código de erro)
+                continue
+            
+            current_price = price_result["price"]
+            
+            # --- LÓGICA DE TAKE PROFIT (MULTI-ALVO) ---
+            if trade.initial_targets:
+                next_target_price = trade.initial_targets[0]
+
+                if (trade.side == 'LONG' and current_price >= next_target_price) or \
+                   (trade.side == 'SHORT' and current_price <= next_target_price):
+                    
+                    total_targets = len(db.query(Trade).filter_by(id=trade.id).first().initial_targets)
+                    current_tp_number = total_targets - len(trade.initial_targets) + 1
+                    
+                    logger.info(f"✅ TP{current_tp_number} ATINGIDO para {trade.symbol}! Preço: {current_price}")
+                    
+                    # Define a quantidade a ser fechada (ex: 50% no TP1, 100% do restante no TP2)
+                    qty_to_close = trade.remaining_qty if len(trade.initial_targets) == 1 else trade.remaining_qty / 2
+                    
+                    close_result = close_partial_position(api_key, api_secret, trade.symbol, qty_to_close, trade.side)
+                    
+                    if close_result.get("success"):
+                        # --- LÓGICA DE TRAILING STOP ---
+                        # No TP1, move para o breakeven. Nos TPs seguintes, move para o TP anterior.
+                        new_stop_loss = trade.entry_price if trade.status == 'ACTIVE' else trade.initial_targets[-1]
+                        
+                        sl_result = modify_position_stop_loss(api_key, api_secret, trade.symbol, new_stop_loss)
+
+                        if sl_result.get("success"):
+                            # Atualiza o trade no banco de dados
+                            trade.remaining_qty -= qty_to_close
+                            trade.initial_targets = trade.initial_targets[1:]
+                            trade.current_stop_loss = new_stop_loss # Atualiza o SL no DB
+                            
+                            if trade.remaining_qty < 0.0001:
+                                trade.status = 'CLOSED_PROFIT'
+                            else:
+                                trade.status = f'ACTIVE_TP{current_tp_number}'
+                            
+                            await send_notification(
+                                application,
+                                f"💰 <b>TP{current_tp_number} Atingido! ({trade.symbol})</b>\n"
+                                f"Posição parcialmente realizada. Novo Stop Loss em ${new_stop_loss:,.4f}."
+                            )
+                        else:
+                            logger.error(f"-> Falha ao mover Stop Loss: {sl_result.get('error')}")
+                            await send_notification(application, f"⚠️ Falha ao mover Stop Loss para {trade.symbol}.")
+                    else:
+                        logger.error(f"-> Falha ao fechar posição parcial: {close_result.get('error')}")
+                        await send_notification(application, f"⚠️ Falha ao realizar lucro parcial para {trade.symbol}.")
+
+            # --- LÓGICA DE STOP LOSS ---
+            if (trade.side == 'LONG' and current_price <= trade.current_stop_loss) or \
+               (trade.side == 'SHORT' and current_price >= trade.current_stop_loss):
+                logger.info(f"❌ STOP LOSS ATINGIDO para {trade.symbol}! Preço: {current_price}, Stop: {trade.current_stop_loss}")
+                trade.status = 'CLOSED_LOSS'
+                await send_notification(
+                    application,
+                    f"🛑 <b>Stop Loss Atingido</b>\n<b>Moeda:</b> {trade.symbol}\nPosição foi fechada pela corretora."
+                )
+        
+        db.commit()
+        
+    except Exception as e:
+        logger.error(f"Erro no ciclo do rastreador de posições: {e}", exc_info=True)
+    finally:
+        db.close()
+
+async def run_tracker(application: Application):
+    """Função principal que roda o verificador em loop."""
+    logger.info("Iniciando Rastreador de Posições...")
+    while True:
+        try:
+            await check_active_trades(application)
+        except Exception as e:
+            logger.critical(f"Erro crítico no loop do rastreador: {e}", exc_info=True)
+        # Espera 60 segundos antes de verificar novamente
+        await asyncio.sleep(60)
+
+========================================
+# Arquivo: core/report_service.py
+========================================
+
+import logging
+from database.session import SessionLocal
+from database.models import Trade
+
+logger = logging.getLogger(__name__)
+
+def generate_performance_report(user_telegram_id: int) -> str:
+    """
+    Busca os trades fechados de um usuário e gera um relatório de texto.
+    """
+    db = SessionLocal()
+    try:
+        # Busca todos os trades que foram fechados (com lucro ou prejuízo)
+        closed_trades = db.query(Trade).filter(
+            Trade.user_telegram_id == user_telegram_id,
+            Trade.status.like('%CLOSED%')
+        ).all()
+
+        if not closed_trades:
+            return "Nenhum trade fechado encontrado para gerar um relatório."
+
+        # --- Cálculos ---
+        total_trades = len(closed_trades)
+        winning_trades = [t for t in closed_trades if t.status == 'CLOSED_PROFIT']
+        losing_trades = [t for t in closed_trades if t.status == 'CLOSED_LOSS']
+        
+        win_rate = (len(winning_trades) / total_trades) * 100 if total_trades > 0 else 0
+
+        # --- Montagem da Mensagem ---
+        report_message = "<b>📊 Relatório de Performance do Bot</b>\n\n"
+        report_message += f"<b>Total de Trades Fechados:</b> {total_trades}\n"
+        report_message += f"<b>Trades Vencedores:</b> {len(winning_trades)}\n"
+        report_message += f"<b>Trades Perdedores:</b> {len(losing_trades)}\n"
+        report_message += f"<b>Taxa de Acerto:</b> {win_rate:.2f}%\n\n"
+        report_message += "Este é um relatório inicial. Futuramente, podemos adicionar o P/L (Lucro/Prejuízo) total."
+
+        return report_message
+
+    except Exception as e:
+        logger.error(f"Erro ao gerar relatório de performance: {e}")
+        return "Ocorreu um erro ao gerar seu relatório."
+    finally:
+        db.close()
+
+========================================
+# Arquivo: core/trade_manager.py
+========================================
+
+import os
+import logging
+from typing import Tuple
+from telegram.ext import Application
+from sqlalchemy.orm import Session # <-- Adicionado 'Session' para a anotação de tipo
+from database.session import SessionLocal
+from database.models import User, Trade, PendingSignal, SignalForApproval
+from services.bybit_service import place_order, get_account_info
+from services.notification_service import send_notification
+from utils.security import decrypt_data
+from utils.config import ADMIN_ID
+from bot.keyboards import signal_approval_keyboard
+
+logger = logging.getLogger(__name__)
+
+def _avaliar_sinal(signal_data: dict, user_settings: User) -> Tuple[bool, str]:
+    """
+    Função interna para aplicar todos os filtros configurados pelo usuário.
+    Retorna (True, "Motivo") se aprovado, ou (False, "Motivo") se rejeitado.
+    """
+    # Filtro 1: Confiança Mínima
+    min_confidence = user_settings.min_confidence
+    signal_confidence = signal_data.get('confidence')
+    if signal_confidence is not None and signal_confidence < min_confidence:
+        motivo = f"Confiança ({signal_confidence:.2f}%) é menor que o seu mínimo ({min_confidence:.2f}%)"
+        return False, motivo
+    return True, "Sinal aprovado pelos seus critérios."
+
+
+async def process_new_signal(signal_data: dict, application: Application, source_name: str):
+    """
+    Roteador de sinais: verifica o modo de aprovação do usuário e decide se
+    abre a ordem automaticamente ou se envia para aprovação manual.
+    """
+    signal_type = signal_data.get("type")
+    symbol = signal_data.get("coin")
+    db = SessionLocal()
+    try:
+        if signal_type == 'CANCELLED':
+            pending = db.query(PendingSignal).filter_by(symbol=symbol, user_telegram_id=ADMIN_ID).first()
+            if pending:
+                db.delete(pending)
+                db.commit()
+                await send_notification(application, f"⚠️ <b>Monitoramento Cancelado</b>\nO sinal limite para <b>{symbol}</b> foi cancelado pela fonte '{source_name}'.")
+            return
+
+        admin_user = db.query(User).filter_by(telegram_id=ADMIN_ID).first()
+        if not admin_user:
+            logger.error("Admin não encontrado.")
+            return
+
+        aprovado, motivo = _avaliar_sinal(signal_data, admin_user)
+        if not aprovado:
+            rejection_msg = f"⚠️ <b>Sinal para {symbol} Ignorado</b>\n<b>Fonte:</b> {source_name}\n<b>Motivo:</b> {motivo}"
+            await send_notification(application, rejection_msg)
+            return
+
+        if admin_user.approval_mode == 'AUTOMATIC':
+            logger.info(f"Modo AUTOMÁTICO. Tentando abrir ordem para {symbol}...")
+            await _execute_trade(signal_data, admin_user, application, db, source_name)
+        
+        elif admin_user.approval_mode == 'MANUAL':
+            logger.info(f"Modo MANUAL. Enviando sinal para aprovação: {symbol}")
+            
+            new_signal_for_approval = SignalForApproval(
+                user_telegram_id=ADMIN_ID,
+                symbol=symbol,
+                source_name=source_name,
+                signal_data=signal_data
+            )
+            db.add(new_signal_for_approval)
+            db.commit()
+
+            signal_details = (
+                f"<b>Sinal Recebido de: {source_name}</b>\n\n"
+                f"<b>Moeda:</b> {signal_data['coin']}\n"
+                f"<b>Tipo:</b> {signal_data['order_type']}\n"
+                f"<b>Entrada:</b> {signal_data['entries'][0]}\n"
+                f"<b>Stop:</b> {signal_data['stop_loss']}\n"
+                f"<b>Alvo 1:</b> {signal_data['targets'][0]}\n\n"
+                f"O sinal passou nos seus filtros. Você aprova a entrada?"
+            )
+            
+            sent_message = await application.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=signal_details,
+                parse_mode='HTML',
+                reply_markup=signal_approval_keyboard(new_signal_for_approval.id)
+            )
+            
+            new_signal_for_approval.approval_message_id = sent_message.message_id
+            db.commit()
+    finally:
+        db.close()
+
+async def _execute_trade(signal_data: dict, user: User, application: Application, db: Session, source_name: str):
+    """Função interna que contém a lógica para abrir uma posição na Bybit."""
+    api_key = decrypt_data(user.api_key_encrypted)
+    api_secret = decrypt_data(user.api_secret_encrypted)
+    
+    # --- AWAIT ADICIONADO ---
+    account_info = await get_account_info(api_key, api_secret)
+    if not account_info.get("success"):
+        await send_notification(application, f"❌ Falha ao buscar saldo da Bybit para operar {signal_data['coin']}.")
+        return
+    
+    balances = account_info.get("data", [])
+    if not balances:
+        await send_notification(application, f"❌ Falha: Nenhuma informação de saldo recebida da Bybit para operar {signal_data['coin']}.")
+        return
+
+    # --- CORREÇÃO: Pega o saldo total do primeiro item da lista ---
+    balance = float(balances[0].get('totalEquity', 0))
+    
+    # --- AWAIT ADICIONADO ---
+    result = await place_order(api_key, api_secret, signal_data, user, balance)
+    
+    if result.get("success"):
+        order_data = result['data']
+        order_id = order_data['orderId']
+
+        # Salva o trade bem-sucedido no banco de dados
+        new_trade = Trade(
+            user_telegram_id=user.telegram_id,
+            order_id=order_id,
+            symbol=signal_data['coin'],
+            side=signal_data['order_type'],
+            qty=float(order_data.get('qty', 0)),
+            entry_price=signal_data['entries'][0],
+            stop_loss=signal_data['stop_loss'],
+            current_stop_loss=signal_data['stop_loss'],
+            initial_targets=signal_data['targets'],
+            status='ACTIVE',
+            remaining_qty=float(order_data.get('qty', 0))
+        )
+        db.add(new_trade)
+        db.commit()
+        logger.info(f"Trade {order_id} salvo no banco de dados para rastreamento.")
+
+        await send_notification(application, f"📈 <b>Ordem Aberta com Sucesso!</b>\n<b>Moeda:</b> {signal_data['coin']}\n<b>ID:</b> {order_id}")
+    else:
+        error_msg = result.get('error')
+        await send_notification(application, f"❌ <b>Falha ao Abrir Ordem</b>\n<b>Moeda:</b> {signal_data['coin']}\n<b>Motivo:</b> {error_msg}")
+
+========================================
+# Arquivo: utils/__init__.py
+========================================
+
+
+
+========================================
+# Arquivo: utils/config.py
+========================================
+
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+ENCRYPTION_KEY = os.getenv('ENCRYPTION_KEY')
+
+API_ID = os.getenv('API_ID')
+API_HASH = os.getenv('API_HASH')
+ADMIN_ID = int(os.getenv('ADMIN_TELEGRAM_ID', 0)) # Converte para int
+
+========================================
+# Arquivo: utils/security.py
+========================================
+
+from cryptography.fernet import Fernet
+from .config import ENCRYPTION_KEY
+
+# Inicializa o 'cofre' com a sua chave
+cipher_suite = Fernet(ENCRYPTION_KEY.encode())
+
+def encrypt_data(data: str) -> str:
+    """Criptografa um texto e retorna a versão em string."""
+    if not data:
+        return None
+    encrypted_bytes = cipher_suite.encrypt(data.encode())
+    return encrypted_bytes.decode()
+
+def decrypt_data(encrypted_data: str) -> str:
+    """Descriptografa um texto e retorna a versão original."""
+    if not encrypted_data:
+        return None
+    decrypted_bytes = cipher_suite.decrypt(encrypted_data.encode())
+    return decrypted_bytes.decode()
+
+========================================
+# Arquivo: scripts/create_invite.py
+========================================
+
+import sys
+from database.session import SessionLocal, init_db
+from database.models import InviteCode
+
+def create_invite_code(code: str):
+    db = SessionLocal()
+    try:
+        existing_code = db.query(InviteCode).filter(InviteCode.code == code).first()
+        if existing_code:
+            print(f"Código '{code}' já existe.")
+            return
+
+        new_code = InviteCode(code=code)
+        db.add(new_code)
+        db.commit()
+        print(f"Código de convite '{code}' criado com sucesso!")
+    finally:
+        db.close()
+
+if __name__ == "__main__":
+    init_db()
+    # Agora ele lê o código a partir do seu comando no terminal
+    if len(sys.argv) > 1:
+        code_to_create = sys.argv[1]
+        create_invite_code(code_to_create)
+    else:
+        print("Erro: Por favor, forneça um código para criar. Exemplo: python create_invite.py MEU-CODIGO-NOVO")
+
+========================================
+# Arquivo: scripts/generate_session.py
+========================================
+
+import asyncio
+from telethon.sync import TelegramClient
+from dotenv import load_dotenv
+import os
+
+# Carrega as variáveis de ambiente (API_ID, API_HASH)
+load_dotenv()
+API_ID = os.getenv('API_ID')
+API_HASH = os.getenv('API_HASH')
+
+# --- CORREÇÃO PRINCIPAL ---
+# Define o caminho completo para salvar o arquivo dentro do volume persistente
+SESSION_NAME = '/data/tradeflow_user'
+
+async def main():
+    print(f"Gerando o arquivo de sessão em '{SESSION_NAME}.session'...")
+    # Usa 'with' para garantir que o cliente se desconecte corretamente
+    async with TelegramClient(SESSION_NAME, API_ID, API_HASH) as client:
+        me = await client.get_me()
+        print(f"Login bem-sucedido como: {me.first_name}")
+        print("Arquivo de sessão foi criado/atualizado com sucesso no local correto.")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+========================================
+# Arquivo: scripts/test_bybit_connection.py
+========================================
+
+import os
+import logging
+from dotenv import load_dotenv
+from pybit.unified_trading import HTTP
+
+# Configura o logging para vermos mais detalhes em caso de erro
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+def test_connection():
+    """
+    Script de teste isolado para validar a conexão e as credenciais da Bybit.
+    """
+    # 1. Carrega as credenciais do seu arquivo .env
+    load_dotenv()
+    api_key = os.getenv("BYBIT_API_KEY")
+    api_secret = os.getenv("BYBIT_API_SECRET")
+
+    if not api_key or not api_secret:
+        print("\n❌ ERRO: Verifique se BYBIT_API_KEY e BYBIT_API_SECRET estão no seu arquivo .env")
+        return
+
+    print("\n--- INICIANDO TESTE DE CONEXÃO COM A BYBIT ---")
+    print(f"Usando API Key que termina em: ...{api_key[-4:]}")
+
+    try:
+        # 2. Tenta criar a sessão e buscar o saldo (exatamente como o bot faz)
+        session = HTTP(
+            testnet=False, # Conectando na conta REAL
+            api_key=api_key,
+            api_secret=api_secret
+        )
+        
+        print("\nEtapa 1: Conectando e buscando saldo da Carteira Unificada...")
+        response = session.get_wallet_balance(accountType="UNIFIED")
+
+        # 3. Analisa a resposta da Bybit
+        if response.get('retCode') == 0:
+            print("\n✅ SUCESSO! Conexão bem-sucedida e permissões corretas.")
+            balance = response['result']['list'][0]['totalEquity']
+            print(f"   - Saldo Total da Conta Unificada: {balance} USDT")
+        else:
+            print("\n❌ FALHA! A Bybit retornou um erro.")
+            print(f"   - Código do Erro: {response.get('retCode')}")
+            print(f"   - Mensagem da API: {response.get('retMsg')}")
+
+    except Exception as e:
+        print("\n❌ FALHA CRÍTICA! Ocorreu uma exceção ao tentar conectar.")
+        print("   Isso geralmente indica um problema de rede (bloqueio de IP) ou de configuração do ambiente.")
+        print(f"\n   Detalhes do Erro:\n   {e}")
+
+    print("\n--- TESTE FINALIZADO ---")
+
+if __name__ == "__main__":
+    test_connection()
+
+========================================
+# Arquivo: scripts/test_trade.py
+========================================
+
+import os
+from dotenv import load_dotenv
+from services.bybit_service import get_account_info
+import json
+
+load_dotenv()
+
+BYBIT_API_KEY = os.getenv("BYBIT_API_KEY")
+BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET")
+
+def run_auth_test():
+    if not BYBIT_API_KEY or not BYBIT_API_SECRET:
+        print("❌ Por favor, defina BYBIT_API_KEY e BYBIT_API_SECRET no seu arquivo .env")
+        return
+
+    # --- LINHAS DE DIAGNÓSTICO ADICIONADAS ---
+    print("="*40)
+    print("VERIFICAÇÃO DAS CHAVES CARREGADAS PELO SCRIPT:")
+    print(f"API Key lida....: {BYBIT_API_KEY[:4]}...{BYBIT_API_KEY[-4:]}")
+    print(f"API Secret lida..: {BYBIT_API_SECRET[:4]}...{BYBIT_API_SECRET[-4:]}")
+    print("="*40)
+    # ---------------------------------------------
+
+    print("\n▶️  Tentando autenticar e buscar o saldo da conta de testes...")
+    
+    result = get_account_info(BYBIT_API_KEY, BYBIT_API_SECRET)
+    
+    print("\n" + "="*30)
+    if result.get("success"):
+        print("✅ Autenticação bem-sucedida!")
+        print(json.dumps(result.get("data"), indent=2))
+    else:
+        print("❌ Falha na autenticação.")
+        print(f"Motivo: {result.get('error')}")
+    print("="*30)
+
+if __name__ == "__main__":
+    run_auth_test()
+
+========================================
+# Arquivo: bot/__init__.py
+========================================
+
+
+
+========================================
+# Arquivo: bot/handlers.py
+========================================
+
+import logging
+import asyncio
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ContextTypes, ConversationHandler
+from database.session import SessionLocal
+from database.models import User, InviteCode, MonitoredTarget, Trade, SignalForApproval
+from .keyboards import main_menu_keyboard, confirm_remove_keyboard, admin_menu_keyboard, dashboard_menu_keyboard, settings_menu_keyboard, view_targets_keyboard, bot_config_keyboard
+from utils.security import encrypt_data, decrypt_data
+from services.bybit_service import get_open_positions, get_account_info, close_partial_position
+from utils.config import ADMIN_ID
+from core.report_service import generate_performance_report
+from database.crud import get_user_by_id
+from core.trade_manager import _execute_trade
+
+# Estados para as conversas
+(WAITING_CODE, WAITING_API_KEY, WAITING_API_SECRET, CONFIRM_REMOVE_API) = range(4)
+(ASKING_RISK_PERCENT, ASKING_MAX_LEVERAGE, ASKING_MIN_CONFIDENCE) = range(10, 13)
+
+logger = logging.getLogger(__name__)
+
+# --- FLUXO DE USUÁRIO (START, CADASTRO, MENUS) ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    telegram_user = update.effective_user
+    user_in_db = get_user_by_id(telegram_user.id)
+    if user_in_db:
+        await update.message.reply_text(
+            "Menu Principal:",
+            reply_markup=main_menu_keyboard(telegram_id=telegram_user.id)
+        )
+        return ConversationHandler.END
+    else:
+        await update.message.reply_text(
+            f"Olá, {telegram_user.first_name}! Para usar o TradeFlow, insira seu código de convite."
+        )
+        return WAITING_CODE
+
+async def receive_invite_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    code_text = update.message.text
+    telegram_user = update.effective_user
+    db = SessionLocal()
+    try:
+        invite_code = db.query(InviteCode).filter(InviteCode.code == code_text, InviteCode.is_used == False).first()
+        if invite_code:
+            new_user = User(telegram_id=telegram_user.id, first_name=telegram_user.first_name)
+            db.add(new_user)
+            invite_code.is_used = True
+            db.commit()
+            await update.message.reply_text(
+                "✅ Cadastro realizado com sucesso! O próximo passo é configurar sua API.",
+                reply_markup=main_menu_keyboard(telegram_id=telegram_user.id)
+            )
+            return ConversationHandler.END
+        else:
+            await update.message.reply_text("❌ Código de convite inválido ou já utilizado. Tente novamente.")
+            return WAITING_CODE
+    finally:
+        db.close()
+
+async def back_to_main_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        "Menu Principal:",
+        reply_markup=main_menu_keyboard(telegram_id=update.effective_user.id)
+    )
+
+# --- FLUXO DE CONFIGURAÇÃO DE API ---
+async def config_api(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Inicia o fluxo de configuração de API com um tutorial melhorado."""
+    query = update.callback_query
+    await query.answer()
+    
+    context.user_data['entry_message_id'] = query.message.message_id
+    
+    tutorial_text = (
+        "🔑 <b>Como Criar suas Chaves de API na Bybit</b> 🔑\n\n"
+        "Siga estes passos com atenção para conectar sua conta:\n\n"
+        "1️⃣  Faça login em <b>Bybit.com</b> e vá para <i>Perfil > API</i>.\n\n"
+        "2️⃣  Clique em <b>'Criar Nova Chave'</b> e selecione <i>'Chaves Geradas pelo Sistema'</i>.\n\n"
+        "3️⃣  Dê um nome para sua chave (ex: `TradeFlowBot`) e selecione as permissões de <b>'Leitura e Escrita'</b>.\n\n"
+        "4️⃣  Nas permissões, marque <b>APENAS</b> as seguintes caixas:\n"
+        "   - <b>Contrato</b> (`Contract`): ✅ `Ordens` e ✅ `Posições`\n"
+        "   - <b>Trading Unificado</b> (`UTA`): ✅ `Trade`\n\n"
+        "5️⃣  🛡️ <b>MUITO IMPORTANTE:</b> Por segurança, <b>NÃO</b> marque a permissão de <i>'Saque' (Withdraw)</i>.\n\n"
+        # --- NOVA LINHA DE AVISO ---
+        "⚠️ <b>Atenção:</b> Este bot opera exclusivamente com pares de trade terminados em **USDT**.\n\n"
+        "6️⃣  Conclua a verificação de segurança e copie sua <b>API Key</b> e <b>API Secret</b>.\n\n"
+        "-------------------------------------\n"
+        "Pronto! Agora, por favor, envie sua <b>API Key</b>."
+    )
+    
+    await query.edit_message_text(
+        text=tutorial_text,
+        parse_mode='HTML'
+    )
+    return WAITING_API_KEY
+
+async def receive_api_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Recebe a API Key, apaga a mensagem do usuário e pede a API Secret."""
+    # Apaga a mensagem do usuário que contém a chave
+    await context.bot.delete_message(
+        chat_id=update.effective_chat.id,
+        message_id=update.message.message_id
+    )
+
+    api_key = update.message.text
+    context.user_data['api_key'] = api_key
+    
+    # Envia a próxima pergunta e guarda a mensagem para apagar depois
+    prompt_message = await update.message.reply_text(
+        "Chave API recebida com segurança. Agora, por favor, envie sua *API Secret*.",
+        parse_mode='Markdown'
+    )
+    # Guarda o ID da mensagem do bot para o próximo passo
+    context.user_data['prompt_message_id'] = prompt_message.message_id
+    
+    return WAITING_API_SECRET
+
+async def receive_api_secret(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Recebe a API Secret, apaga as mensagens, criptografa e salva no banco."""
+    # Apaga a mensagem do usuário que contém o segredo
+    await context.bot.delete_message(
+        chat_id=update.effective_chat.id,
+        message_id=update.message.message_id
+    )
+
+    # Apaga a pergunta anterior do bot ("...envie sua API Secret")
+    prompt_message_id = context.user_data.get('prompt_message_id')
+    if prompt_message_id:
+        await context.bot.delete_message(
+            chat_id=update.effective_chat.id,
+            message_id=prompt_message_id
+        )
+
+    api_secret = update.message.text
+    api_key = context.user_data.get('api_key')
+    telegram_id = update.effective_user.id
+
+    # Criptografa e salva as chaves no banco (lógica existente)
+    encrypted_key = encrypt_data(api_key)
+    encrypted_secret = encrypt_data(api_secret)
+
+    db = SessionLocal()
+    try:
+        user_to_update = db.query(User).filter(User.telegram_id == telegram_id).first()
+        if user_to_update:
+            user_to_update.api_key_encrypted = encrypted_key
+            user_to_update.api_secret_encrypted = encrypted_secret
+            db.commit()
+            
+            # Edita a mensagem original do menu para a confirmação final
+            await context.bot.edit_message_text(
+                chat_id=update.effective_chat.id,
+                message_id=context.user_data['entry_message_id'], # ID da mensagem do menu
+                text="✅ Suas chaves de API foram salvas com sucesso!",
+            )
+            # Envia um novo menu principal
+            await context.bot.send_message(
+                chat_id=telegram_id,
+                text="Menu Principal:",
+                reply_markup=main_menu_keyboard(telegram_id=telegram_id)
+            )
+        else:
+            await update.message.reply_text("Ocorreu um erro. Usuário não encontrado.")
+    finally:
+        db.close()
+        context.user_data.clear()
+
+    return ConversationHandler.END
+
+# --- FLUXO DE REMOÇÃO DE API ---
+async def remove_api_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        text="⚠️ Você tem certeza que deseja remover suas chaves de API?",
+        reply_markup=confirm_remove_keyboard()
+    )
+    return CONFIRM_REMOVE_API
+
+async def remove_api_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    telegram_id = update.effective_user.id
+
+    if query.data == 'remove_api_confirm':
+        db = SessionLocal()
+        try:
+            user_to_update = db.query(User).filter(User.telegram_id == telegram_id).first()
+            if user_to_update:
+                user_to_update.api_key_encrypted = None
+                user_to_update.api_secret_encrypted = None
+                db.commit()
+            await query.edit_message_text("✅ Suas chaves de API foram removidas.")
+        finally:
+            db.close()
+    else: # Cancelou
+        await query.edit_message_text("Operação cancelada.")
+
+    # Envia um novo menu principal atualizado
+    await context.bot.send_message(
+        chat_id=telegram_id,
+        text="Menu Principal:",
+        reply_markup=main_menu_keyboard(telegram_id=telegram_id)
+    )
+    return ConversationHandler.END
+
+# --- PAINÉIS DO USUÁRIO ---
+async def my_positions_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("Buscando suas posições gerenciadas...")
+    user_id = update.effective_user.id
+    db = SessionLocal()
+    try:
+        active_trades = db.query(Trade).filter(Trade.user_telegram_id == user_id, ~Trade.status.like('%CLOSED%')).all()
+        message = "<b>📊 Suas Posições Ativas (Gerenciadas pelo Bot)</b>\n\n"
+        keyboard = []
+        if active_trades:
+            for trade in active_trades:
+                side_emoji = "🔼" if trade.side == 'LONG' else "🔽"
+                message += f"- {side_emoji} {trade.symbol} ({trade.qty} unid.)\n  Entrada: ${trade.entry_price:,.4f} | Status: {trade.status}\n\n"
+                keyboard.append([InlineKeyboardButton(f"Fechar {trade.symbol} ❌", callback_data=f"manual_close_{trade.id}")])
+        else:
+            message += "Nenhuma posição sendo gerenciada no momento."
+        
+        keyboard.append([InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data='back_to_main_menu')])
+        await query.edit_message_text(message, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(keyboard))
+    finally:
+        db.close()
+
+async def user_dashboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Exibe o painel com saldo detalhado por moeda, posições e menus."""
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("Buscando informações do painel...")
+
+    user_id = update.effective_user.id
+    db = SessionLocal()
+    
+    try:
+        user = get_user_by_id(user_id)
+        if not user or not user.api_key_encrypted:
+            # ... (código existente para usuário sem API)
+            return
+
+        api_key = decrypt_data(user.api_key_encrypted)
+        api_secret = decrypt_data(user.api_secret_encrypted)
+
+        account_info = await get_account_info(api_key, api_secret)
+        positions_info = await get_open_positions(api_key, api_secret)
+        
+        message = "<b>ℹ️ Seu Painel de Controle</b>\n\n"
+
+        # --- LÓGICA DE SALDO ATUALIZADA ---
+        message += "<b>Saldo em Conta (Bybit):</b>\n"
+        if account_info.get("success"):
+            balances = account_info.get("data", [])
+            
+            if balances:
+                total_balance_info = balances[0]
+                total_equity = float(total_balance_info.get('totalEquity', '0'))
+                message += f"- Saldo Total (Equivalente): ${total_equity:,.2f} USD\n"
+
+                # Loop para moedas individuais com saldo significativo
+                for coin_balance in balances:
+                    coin_name = coin_balance.get('coin')
+                    if coin_name:
+                        wallet_balance = float(coin_balance.get('walletBalance', '0'))
+                        usd_value = float(coin_balance.get('usdValue', '0'))
+                        
+                        # Exibe se o valor em USD for maior que 0.01
+                        if usd_value > 0.01:
+                            balance_str = f"{wallet_balance:.8f}".rstrip('0').rstrip('.')
+                            message += f"- {coin_name}: {balance_str} (~${usd_value:,.2f})\n"
+            else:
+                message += "- Nenhum saldo encontrado.\n"
+        else:
+            message += f"- Erro ao buscar saldo: {account_info.get('error')}\n"
+        message += "\n"
+
+        # Seção de Posições Abertas (sem alteração)
+        message += "<b>Posições Abertas na Corretora:</b>\n"
+        if positions_info.get("success") and positions_info.get("data"):
+            for pos in positions_info["data"]:
+                try:
+                    entry_price = float(pos.get('avgPrice', '0'))
+                    size = float(pos.get('size', '0'))
+                    pnl = float(pos.get('unrealisedPnl', '0'))
+                    pnl_percent = (pnl / (entry_price * size)) * 100 if entry_price > 0 and size > 0 else 0
+                    side_emoji = "🔼" if pos['side'] == 'Buy' else "🔽"
+                    message += f"- {side_emoji} {pos['symbol']}: {pos['size']} | P/L: ${pnl:,.2f} ({pnl_percent:.2f}%)\n"
+                except (ValueError, TypeError, ZeroDivisionError):
+                    message += f"- {pos.get('symbol', '???')}: Dados de P/L inválidos.\n"
+        else:
+            message += "- Nenhuma posição aberta no momento.\n"
+
+        # Rodapé com aviso sobre USDT (sem alteração)
+        message += "\n\n<i>*Este bot opera exclusivamente com pares USDT.</i>"
+
+        await query.edit_message_text(
+            message, 
+            parse_mode='HTML', 
+            reply_markup=dashboard_menu_keyboard()
+        )
+
+    except Exception as e:
+        logger.error(f"Erro ao montar o painel do usuário: {e}", exc_info=True)
+        await query.edit_message_text("Ocorreu um erro ao buscar os dados do seu painel.")
+    finally:
+        db.close()
+
+# --- CANCELAMENTO ---
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Cancela a operação atual."""
+    await update.message.reply_text("Operação cancelada.")
+    return ConversationHandler.END
+
+# --- FLUXO DE ADMINISTRAÇÃO ---
+async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Mostra o menu de administrador, se o usuário for o admin."""
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID:
+        await update.message.reply_text("Você não tem permissão para usar este comando.")
+        return
+
+    await update.message.reply_text(
+        "Bem-vindo ao painel de administração.",
+        reply_markup=admin_menu_keyboard()
+    )
+
+
+async def admin_view_targets_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Busca e exibe a lista de todos os canais e tópicos sendo monitorados."""
+    query = update.callback_query
+    await query.answer()
+    
+    db = SessionLocal()
+    try:
+        targets = db.query(MonitoredTarget).all()
+        
+        message = "<b>👁️ Alvos Atualmente Monitorados</b>\n\n"
+        
+        if targets:
+            for target in targets:
+                if target.topic_name:
+                    message += f"- <b>Grupo:</b> {target.channel_name}\n  - <b>Tópico:</b> {target.topic_name}\n"
+                else:
+                    message += f"- <b>Canal:</b> {target.channel_name}\n"
+        else:
+            message += "Nenhum alvo sendo monitorado no momento."
+            
+        await query.edit_message_text(
+            text=message,
+            parse_mode='HTML',
+            reply_markup=view_targets_keyboard()
+        )
+    finally:
+        db.close()
+
+async def back_to_admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Retorna o usuário para o menu de administração principal."""
+    query = update.callback_query
+    await query.answer()
+    
+    await query.edit_message_text(
+        "Bem-vindo ao painel de administração.",
+        reply_markup=admin_menu_keyboard()
+    )
+
+async def list_channels_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Coloca um pedido na fila para listar os grupos e canais do usuário."""
+    query = update.callback_query
+    await query.answer()
+    
+    comm_queue = context.application.bot_data.get('comm_queue')
+    if not comm_queue:
+        await query.edit_message_text("Erro: Fila de comunicação não encontrada.")
+        return
+    
+    request_data = {
+        "action": "list_channels",
+        "chat_id": query.message.chat_id,
+        "message_id": query.message.message_id,
+    }
+    
+    await comm_queue.put(request_data)
+    
+    # --- MENSAGEM MODIFICADA ---
+    await query.edit_message_text("Buscando sua lista de canais... Se você tiver muitos grupos, isso pode levar até um minuto. Por favor, aguarde.")
+    
+async def select_channel_to_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Coloca um pedido na fila para listar tópicos (ou gerenciar um canal plano)."""
+    query = update.callback_query
+    await query.answer()
+    comm_queue = context.application.bot_data.get('comm_queue')
+    if not comm_queue: return
+
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID: return
+
+    channel_id = int(query.data.split('_')[-1])
+    
+    # Encontra o nome do canal a partir do botão clicado
+    channel_name = ""
+    for row in query.message.reply_markup.inline_keyboard:
+        for button in row:
+            if button.callback_data == query.data:
+                channel_name = button.text.replace(" ✅", "")
+                break
+
+    request_data = {
+        "action": "list_topics",
+        "chat_id": query.message.chat_id,
+        "message_id": query.message.message_id,
+        "channel_id": channel_id,
+        "channel_name": channel_name # --- Enviando o nome do canal ---
+    }
+    
+    await comm_queue.put(request_data)
+    await query.edit_message_text("Processando...")
+
+async def select_topic_to_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Salva/remove o tópico e pede para a fila recarregar o menu de tópicos."""
+    query = update.callback_query
+    await query.answer() # Responde ao clique imediatamente para o ícone de 'carregando' sumir
+
+    comm_queue = context.application.bot_data.get('comm_queue')
+    if not comm_queue:
+        logger.error("Fila de comunicação não encontrada no contexto do bot.")
+        return
+
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID: return
+
+    # Extrai os IDs do callback_data
+    _, _, channel_id_str, topic_id_str = query.data.split('_')
+    channel_id = int(channel_id_str)
+    topic_id = int(topic_id_str)
+    
+    db = SessionLocal()
+    try:
+        existing_target = db.query(MonitoredTarget).filter_by(channel_id=channel_id, topic_id=topic_id).first()
+        
+        if existing_target:
+            # Se já existe, remove da lista
+            db.delete(existing_target)
+        else:
+            # Se não existe, adiciona na lista
+            topic_name = ""
+            for row in query.message.reply_markup.inline_keyboard:
+                for button in row:
+                    if button.callback_data == query.data:
+                        topic_name = button.text.replace(" ✅", "")
+                        break
+            new_target = MonitoredTarget(channel_id=channel_id, topic_id=topic_id, topic_name=topic_name)
+            db.add(new_target)
+        
+        db.commit()
+    finally:
+        db.close()
+
+    # --- LÓGICA DE RECARREGAMENTO ---
+    # Cria um novo "pedido" para a fila, para listar os tópicos do mesmo canal novamente.
+    # O processador da fila vai receber isso e redesenhar o menu.
+    request_data = {
+        "action": "list_topics",
+        "chat_id": query.message.chat_id,
+        "message_id": query.message.message_id,
+        "channel_id": channel_id,
+        "channel_name": "" # Não é necessário aqui, pois estamos apenas listando tópicos
+    }
+    await comm_queue.put(request_data)
+
+async def back_to_channels_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Retorna o usuário para a lista de canais/grupos."""
+    # Simplesmente chama a função que já lista os canais
+    await list_channels_handler(update, context)
+
+    async def my_dashboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Exibe um painel completo com informações da conta, posições e monitoramentos."""
+        query = update.callback_query
+        await query.answer()
+        await query.edit_message_text("Buscando informações do seu painel, aguarde...")
+
+        user_id = update.effective_user.id
+        db = SessionLocal()
+        
+        try:
+            user = db.query(User).filter_by(telegram_id=user_id).first()
+            if not user or not user.api_key_encrypted:
+                await query.edit_message_text("Você precisa configurar suas chaves de API primeiro.", reply_markup=main_menu_keyboard(user_id))
+                return
+
+            api_key = decrypt_data(user.api_key_encrypted)
+            api_secret = decrypt_data(user.api_secret_encrypted)
+
+            # 1. Buscar Saldo da Conta
+            account_info = get_account_info(api_key, api_secret)
+            
+            # 2. Buscar Posições Abertas na Bybit
+            positions_info = get_open_positions(api_key, api_secret)
+            
+            # 3. Buscar Alvos Monitorados no nosso DB
+            monitored_targets = db.query(MonitoredTarget).all()
+
+            # --- Montagem da Mensagem ---
+            message = "<b>Seu Painel de Controle</b>\n\n"
+
+            # Seção de Saldo
+            if account_info.get("success"):
+                balance = float(account_info['data']['totalEquity'])
+                message += f"<b>Conta Bybit:</b>\n- Saldo Total: ${balance:,.2f}\n\n"
+            else:
+                message += "<b>Conta Bybit:</b>\n- Erro ao buscar saldo.\n\n"
+
+            # Seção de Posições Abertas
+            message += "<b>Posições Abertas:</b>\n"
+            if positions_info.get("success") and positions_info.get("data"):
+                for pos in positions_info["data"]:
+                    pnl_percent = float(pos.get('unrealisedPnl', '0')) / (float(pos.get('avgPrice', '1')) * float(pos.get('size', '1'))) * 100 if pos.get('avgPrice') and pos.get('size') else 0
+                    message += f"- {pos['symbol']} ({pos['side']}): {pos['size']} | P/L: ${float(pos.get('unrealisedPnl', '0')):,.2f} ({pnl_percent:.2f}%)\n"
+            else:
+                message += "- Nenhuma posição aberta no momento.\n\n"
+
+            # Seção de Monitoramentos
+            message += "<b>Alvos Monitorados:</b>\n"
+            if monitored_targets:
+                for target in monitored_targets:
+                    if target.topic_id:
+                        message += f"- {target.channel_name or 'Grupo'} | Tópico: {target.topic_name}\n"
+                    else:
+                        message += f"- Canal/Grupo: {target.channel_name}\n"
+            else:
+                message += "- Nenhum alvo sendo monitorado."
+
+            await query.edit_message_text(message, parse_mode='HTML')
+
+        except Exception as e:
+            logger.error(f"Erro ao montar o painel: {e}")
+            await query.edit_message_text("Ocorreu um erro ao buscar os dados do seu painel.")
+        finally:
+            db.close()
+
+async def my_positions_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Exibe as posições ativas com botões para gerenciamento manual."""
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("Buscando suas posições gerenciadas...")
+
+    user_id = update.effective_user.id
+    db = SessionLocal()
+    try:
+        # Busca os trades que o bot abriu e que não estão fechados
+        active_trades = db.query(Trade).filter(
+            Trade.user_telegram_id == user_id, 
+            ~Trade.status.like('%CLOSED%')
+        ).all()
+        
+        message = "<b>📊 Suas Posições Ativas (Gerenciadas pelo Bot)</b>\n\n"
+        keyboard = [] # Vamos construir o teclado dinamicamente
+
+        if active_trades:
+            for trade in active_trades:
+                side_emoji = "🔼" if trade.side == 'LONG' else "🔽"
+                message += f"- {side_emoji} {trade.symbol} ({trade.qty} unid.)\n"
+                message += f"  Entrada: ${trade.entry_price:,.4f} | Status: {trade.status}\n\n"
+                
+                # Adiciona um botão para cada trade, passando o ID do trade no callback
+                keyboard.append([
+                    InlineKeyboardButton(f"Fechar {trade.symbol} ❌", callback_data=f"manual_close_{trade.id}")
+                ])
+        else:
+            message += "Nenhuma posição sendo gerenciada no momento."
+        
+        # Adiciona o botão de voltar ao menu principal
+        keyboard.append([InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data='back_to_main_menu')])
+        
+        reply_markup=main_menu_keyboard(telegram_id=user_id)
+        await query.edit_message_text(message, parse_mode='HTML', reply_markup=reply_markup)
+    finally:
+        db.close()
+
+async def back_to_main_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Retorna o usuário para o menu principal."""
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    # Simplesmente edita a mensagem para mostrar o menu principal correto
+    await query.edit_message_text(
+        "Menu Principal:",
+        reply_markup=main_menu_keyboard(telegram_id=user_id)
+    )
+
+async def user_settings_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Exibe o menu de configurações de trade com os valores atuais do usuário."""
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter_by(telegram_id=user_id).first()
+        if user:
+            await query.edit_message_text(
+                "<b>⚙️ Configurações de Trade</b>\n\n"
+                "Aqui você pode definir seus parâmetros de risco e automação.",
+                parse_mode='HTML',
+                reply_markup=settings_menu_keyboard(user)
+            )
+    finally:
+        db.close()
+
+async def ask_risk_percent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Pergunta ao usuário qual o novo percentual de risco."""
+    query = update.callback_query
+    await query.answer()
+    
+    # Guarda o ID da mensagem para podermos editá-la ou apagá-la depois
+    context.user_data['settings_message_id'] = query.message.message_id
+    
+    await query.edit_message_text(
+        "Por favor, envie o novo percentual de risco por trade.\n"
+        "Envie apenas o número (ex: `1.5` para 1.5%)."
+    )
+    return ASKING_RISK_PERCENT
+
+async def receive_risk_percent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Recebe, valida e salva o novo percentual de risco."""
+    user_id = update.effective_user.id
+    message_id_to_edit = context.user_data.get('settings_message_id')
+
+    try:
+        risk_value = float(update.message.text.replace(',', '.'))
+        if not (0.1 <= risk_value <= 100):
+            raise ValueError("Valor fora do range permitido")
+
+        db = SessionLocal()
+        try:
+            user = db.query(User).filter_by(telegram_id=user_id).first()
+            user.risk_per_trade_percent = risk_value
+            db.commit()
+            
+            # Edita a mensagem original para mostrar o menu de configurações atualizado
+            await context.bot.edit_message_text(
+                chat_id=update.effective_chat.id,
+                message_id=message_id_to_edit,
+                text=f"✅ Risco por trade atualizado para {risk_value:.2f}%.\n\n"
+                     "Selecione outra opção para editar ou volte.",
+                reply_markup=settings_menu_keyboard(user)
+            )
+        finally:
+            db.close()
+
+    except (ValueError, TypeError):
+        await context.bot.edit_message_text(
+            chat_id=update.effective_chat.id,
+            message_id=message_id_to_edit,
+            text="❌ Valor inválido. Por favor, tente novamente com um número (ex: 1.5)."
+        )
+        # Permite que o usuário tente novamente sem sair da conversa
+        return ASKING_RISK_PERCENT
+    finally:
+        # Apaga a mensagem do usuário com o número
+        await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id)
+
+    return ConversationHandler.END # Finaliza a conversa
+
+async def ask_max_leverage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Pergunta ao usuário qual a nova alavancagem máxima."""
+    query = update.callback_query
+    await query.answer()
+    
+    context.user_data['settings_message_id'] = query.message.message_id
+    
+    await query.edit_message_text(
+        "Qual a alavancagem máxima que o bot deve usar?\n"
+        "Envie apenas o número (ex: `10` para 10x)."
+    )
+    return ASKING_MAX_LEVERAGE
+
+async def receive_max_leverage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Recebe, valida e salva a nova alavancagem máxima."""
+    user_id = update.effective_user.id
+    message_id_to_edit = context.user_data.get('settings_message_id')
+
+    try:
+        # Tenta converter o texto para um número inteiro
+        leverage_value = int(update.message.text)
+        # Limites da Bybit, por segurança
+        if not (1 <= leverage_value <= 125):
+            raise ValueError("Alavancagem fora do limite (1-125)")
+
+        db = SessionLocal()
+        try:
+            user = db.query(User).filter_by(telegram_id=user_id).first()
+            user.max_leverage = leverage_value
+            db.commit()
+            
+            # Edita a mensagem original para mostrar o menu de configurações atualizado
+            await context.bot.edit_message_text(
+                chat_id=update.effective_chat.id,
+                message_id=message_id_to_edit,
+                text=f"✅ Alavancagem máxima atualizada para {leverage_value}x.\n\n"
+                     "Selecione outra opção para editar ou volte.",
+                reply_markup=settings_menu_keyboard(user)
+            )
+        finally:
+            db.close()
+
+    except (ValueError, TypeError):
+        await context.bot.edit_message_text(
+            chat_id=update.effective_chat.id,
+            message_id=message_id_to_edit,
+            text="❌ Valor inválido. Por favor, tente novamente com um número inteiro (ex: 10)."
+        )
+        return ASKING_MAX_LEVERAGE
+    finally:
+        # Apaga a mensagem do usuário com o número
+        await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id)
+
+    return ConversationHandler.END
+
+async def ask_min_confidence(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Pergunta ao usuário qual o novo valor de confiança mínima."""
+    query = update.callback_query
+    await query.answer()
+    context.user_data['settings_message_id'] = query.message.message_id
+    await query.edit_message_text("Envie o valor da confiança mínima da IA (ex: 75 para 75%).\nSinais com confiança abaixo disso serão ignorados.")
+    return ASKING_MIN_CONFIDENCE
+
+async def receive_min_confidence(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Recebe, valida e salva o novo valor de confiança."""
+    user_id = update.effective_user.id
+    message_id_to_edit = context.user_data.get('settings_message_id')
+    
+    # Apaga a mensagem do usuário (seja ela válida ou não) para manter o chat limpo
+    await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id)
+
+    try:
+        confidence_value = float(update.message.text.replace(',', '.'))
+        if not (0 <= confidence_value <= 100):
+            raise ValueError("Valor fora do range permitido (0-100)")
+
+        db = SessionLocal()
+        try:
+            user = db.query(User).filter_by(telegram_id=user_id).first()
+            user.min_confidence = confidence_value
+            db.commit()
+            
+            # Edita a mensagem do bot para mostrar o menu de configurações atualizado
+            await context.bot.edit_message_text(
+                chat_id=update.effective_chat.id,
+                message_id=message_id_to_edit,
+                text=f"✅ Confiança mínima atualizada para {confidence_value:.2f}%.\n\n"
+                     "Selecione outra opção para editar ou volte.",
+                reply_markup=settings_menu_keyboard(user)
+            )
+        finally:
+            db.close()
+
+        return ConversationHandler.END # Finaliza a conversa APENAS se deu tudo certo
+
+    except (ValueError, TypeError):
+        # --- LÓGICA DE TRATAMENTO DE ERRO ---
+        logger.warning(f"Usuário {user_id} enviou um valor inválido para confiança: {update.message.text}")
+        
+        # Edita a mensagem do bot para avisar do erro e pedir para tentar de novo
+        await context.bot.edit_message_text(
+            chat_id=update.effective_chat.id,
+            message_id=message_id_to_edit,
+            text="❌ <b>Valor inválido.</b>\nPor favor, envie apenas um número entre 0 e 100 (ex: 75).",
+            parse_mode='HTML'
+        )
+        
+        # Mantém o usuário na mesma etapa para que ele possa tentar de novo
+        return ASKING_MIN_CONFIDENCE
+    
+async def report_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Envia o relatório de performance para o usuário."""
+    user_id = update.effective_user.id
+    
+    # Gera a mensagem do relatório chamando nossa nova função
+    report_text = generate_performance_report(user_id)
+    
+    await update.message.reply_text(
+        text=report_text,
+        parse_mode='HTML'
+    )
+
+async def manual_close_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lida com o fechamento manual de uma posição pelo usuário."""
+    query = update.callback_query
+    await query.answer("Processando fechamento...")
+
+    # Extrai o ID do trade do callback_data (ex: "manual_close_12")
+    trade_id = int(query.data.split('_')[-1])
+    user_id = update.effective_user.id
+
+    db = SessionLocal()
+    try:
+        # Busca o trade específico no banco de dados
+        trade_to_close = db.query(Trade).filter_by(id=trade_id, user_telegram_id=user_id).first()
+
+        if not trade_to_close:
+            await query.edit_message_text("Erro: Trade não encontrado ou já fechado.")
+            return
+
+        # Pega as credenciais do usuário
+        user = db.query(User).filter_by(telegram_id=user_id).first()
+        api_key = decrypt_data(user.api_key_encrypted)
+        api_secret = decrypt_data(user.api_secret_encrypted)
+
+        # Chama a função para fechar a quantidade restante da posição
+        close_result = close_partial_position(
+            api_key, 
+            api_secret, 
+            trade_to_close.symbol, 
+            trade_to_close.remaining_qty, 
+            trade_to_close.side
+        )
+
+        if close_result.get("success"):
+            trade_to_close.status = 'CLOSED_MANUAL'
+            db.commit()
+            await query.edit_message_text(f"✅ Posição para {trade_to_close.symbol} fechada manualmente com sucesso!")
+            # Opcional: Recarregar o menu de posições para mostrar a lista atualizada
+            await my_positions_handler(update, context)
+        else:
+            error_msg = close_result.get('error')
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"❌ Erro ao fechar a posição para {trade_to_close.symbol}: {error_msg}"
+            )
+    finally:
+        db.close()
+
+async def bot_config_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Exibe o menu de configuração do bot com o modo de aprovação atual."""
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    
+    db = SessionLocal()
+    try:
+        user = get_user_by_id(user_id)
+        if user:
+            await query.edit_message_text(
+                "<b>🤖 Configuração do Bot</b>\n\n"
+                "Ajuste o comportamento geral do bot.",
+                parse_mode='HTML',
+                reply_markup=bot_config_keyboard(user)
+            )
+    finally:
+        db.close()
+
+async def toggle_approval_mode_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Alterna o modo de aprovação de ordens entre Manual e Automático."""
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+
+    db = SessionLocal()
+    try:
+        user = get_user_by_id(user_id)
+        if user:
+            # Lógica para alternar o modo
+            if user.approval_mode == 'AUTOMATIC':
+                user.approval_mode = 'MANUAL'
+            else:
+                user.approval_mode = 'AUTOMATIC'
+            
+            db.commit()
+            
+            # Edita a mensagem para refletir a mudança, redesenhando o teclado
+            await query.edit_message_text(
+                "<b>🤖 Configuração do Bot</b>\n\n"
+                "Ajuste o comportamento geral do bot.",
+                parse_mode='HTML',
+                reply_markup=bot_config_keyboard(user)
+            )
+    finally:
+        db.close()
+
+async def handle_signal_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Lida com a decisão do usuário (Aprovar/Rejeitar) para um sinal manual.
+    """
+    query = update.callback_query
+    await query.answer()
+
+    action, signal_id_str = query.data.split('_', 1)[-1].rsplit('_', 1)
+    signal_id = int(signal_id_str)
+    
+    db = SessionLocal()
+    try:
+        # Busca o sinal que está aguardando aprovação no banco de dados
+        signal_to_process = db.query(SignalForApproval).filter_by(id=signal_id).first()
+
+        if not signal_to_process:
+            await query.edit_message_text("Este sinal já foi processado ou expirou.")
+            return
+
+        if action == 'approve':
+            await query.edit_message_text("✅ **Entrada Aprovada!** Processando ordem...")
+            
+            user = get_user_by_id(signal_to_process.user_telegram_id)
+            signal_data = signal_to_process.signal_data
+            source_name = signal_to_process.source_name
+            
+            # Chama a função que executa o trade (que já criamos)
+            await _execute_trade(signal_data, user, context.application, db, source_name)
+            
+        elif action == 'reject':
+            await query.edit_message_text("❌ **Entrada Rejeitada.** O sinal foi descartado.")
+        
+        # Remove o sinal da tabela de aprovação em ambos os casos
+        db.delete(signal_to_process)
+        db.commit()
+    
+    finally:
+        db.close()
+
+
+========================================
+# Arquivo: bot/keyboards.py
+========================================
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from database.crud import get_user_by_id
+
+def main_menu_keyboard(telegram_id: int):
+    """
+    Retorna o teclado do menu principal de forma inteligente,
+    verificando o status do usuário diretamente no banco de dados.
+    """
+    user = get_user_by_id(telegram_id)
+    has_api_keys = user and user.api_key_encrypted is not None
+
+    keyboard = []
+    if has_api_keys:
+        keyboard.append([InlineKeyboardButton("📊 Minhas Posições", callback_data='user_positions')])
+        keyboard.append([InlineKeyboardButton("⚙️ Configurações de Trade", callback_data='user_settings')])
+        # --- NOVO BOTÃO ---
+        keyboard.append([InlineKeyboardButton("🤖 Configuração do Bot", callback_data='bot_config')])
+        keyboard.append([InlineKeyboardButton("ℹ️ Meu Painel", callback_data='user_dashboard')])
+    else:
+        keyboard.append([InlineKeyboardButton("⚙️ Configurar API Bybit", callback_data='config_api')])
+
+    return InlineKeyboardMarkup(keyboard)
+
+def dashboard_menu_keyboard():
+    """Retorna o teclado para o painel do usuário, com a opção de remover a API."""
+    keyboard = [
+        [InlineKeyboardButton("🗑️ Remover API", callback_data='remove_api_prompt')],
+        [InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data='back_to_main_menu')]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def admin_menu_keyboard():
+    """Retorna o teclado do menu de administrador."""
+    keyboard = [
+        [InlineKeyboardButton("📡 Listar Grupos/Canais", callback_data='admin_list_channels')],
+        # --- NOVO BOTÃO ---
+        [InlineKeyboardButton("👁️ Ver Alvos Ativos", callback_data='admin_view_targets')]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def view_targets_keyboard():
+    """Retorna o teclado para a tela de visualização de alvos, com um botão de voltar."""
+    keyboard = [
+        [InlineKeyboardButton("⬅️ Voltar ao Menu Admin", callback_data='back_to_admin_menu')]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def confirm_remove_keyboard():
+    """Retorna o teclado de confirmação para remover a API."""
+    keyboard = [
+        [InlineKeyboardButton("✅ Sim, remover", callback_data='remove_api_confirm')],
+        [InlineKeyboardButton("❌ Não, cancelar", callback_data='remove_api_cancel')],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def settings_menu_keyboard(user_settings):
+    """
+    Retorna o teclado do menu de configurações, mostrando os valores atuais.
+    'user_settings' é o objeto User vindo do banco de dados.
+    """
+    # Pega os valores do objeto do usuário
+    risk_percent = user_settings.risk_per_trade_percent
+    max_leverage = user_settings.max_leverage
+    min_confidence = user_settings.min_confidence # <-- ESTA LINHA FALTAVA
+
+    keyboard = [
+        [InlineKeyboardButton(f"Risco por Trade: {risk_percent:.2f}%", callback_data='set_risk_percent')],
+        [InlineKeyboardButton(f"Alavancagem Máxima: {max_leverage}x", callback_data='set_max_leverage')],
+        [InlineKeyboardButton(f"Confiança Mínima (IA): {min_confidence:.2f}%", callback_data='set_min_confidence')],
+        [InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data='back_to_main_menu')]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def bot_config_keyboard(user_settings):
+    """
+    Retorna o teclado para o menu de configuração do bot, mostrando o modo de aprovação.
+    """
+    mode = user_settings.approval_mode
+    
+    # Define o texto e o emoji com base no modo atual
+    if mode == 'AUTOMATIC':
+        button_text = "Modo de Aprovação: Automático ⚡"
+    else:
+        button_text = "Modo de Aprovação: Manual 👋"
+
+    keyboard = [
+        # Botão que vai alternar o modo
+        [InlineKeyboardButton(button_text, callback_data='toggle_approval_mode')],
+        [InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data='back_to_main_menu')]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def signal_approval_keyboard(signal_for_approval_id: int):
+    """
+    Retorna o teclado com os botões de Aprovar/Rejeitar para um sinal manual.
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Aprovar Entrada", callback_data=f'approve_signal_{signal_for_approval_id}'),
+            InlineKeyboardButton("❌ Rejeitar", callback_data=f'reject_signal_{signal_for_approval_id}')
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+========================================
+# Arquivo: services/__init__.py
+========================================
+
+
+
+========================================
+# Arquivo: services/bybit_service.py
+========================================
+
+import logging
+import asyncio
+from typing import Dict
+from pybit.unified_trading import HTTP
+from database.models import User
+
+logger = logging.getLogger(__name__)
+
+# Função auxiliar síncrona, não precisa de 'async'
+def get_session(api_key: str, api_secret: str) -> HTTP:
+    """Cria e retorna uma sessão HTTP para ser usada em threads."""
+    return HTTP(
+        testnet=False,
+        api_key=api_key,
+        api_secret=api_secret
+    )
+
+async def get_account_info(api_key: str, api_secret: str) -> dict:
+    """Busca informações da conta de forma assíncrona."""
+    def _sync_call():
+        try:
+            session = get_session(api_key, api_secret)
+            response = session.get_wallet_balance(accountType="UNIFIED")
+            if response.get('retCode') == 0:
+                return {"success": True, "data": response['result']['list']}
+            return {"success": False, "data": [], "error": response.get('retMsg', 'Erro desconhecido')}
+        except Exception as e:
+            logger.error(f"Exceção em get_account_info: {e}", exc_info=True)
+            return {"success": False, "data": [], "error": str(e)}
+    return await asyncio.to_thread(_sync_call)
+
+async def place_order(api_key: str, api_secret: str, signal_data: dict, user_settings: User, balance: float) -> dict:
+    """Abre uma nova posição de forma assíncrona."""
+    def _sync_call():
+        try:
+            session = get_session(api_key, api_secret)
+            symbol = signal_data['coin']
+            side = "Buy" if signal_data['order_type'] == 'LONG' else "Sell"
+            leverage = str(user_settings.max_leverage)
+            entry_price = signal_data['entries'][0]
+            stop_loss_price = float(signal_data['stop_loss'])
+            take_profit_price = str(signal_data['targets'][0]) if signal_data.get('targets') else None
+            
+            risk_percent = user_settings.risk_per_trade_percent
+            dollar_amount_to_risk = balance * (risk_percent / 100)
+            
+            stop_loss_distance_percent = abs(entry_price - stop_loss_price) / entry_price
+            if stop_loss_distance_percent == 0:
+                return {"success": False, "error": "Distância do Stop Loss é zero."}
+
+            position_size_dollars = dollar_amount_to_risk / stop_loss_distance_percent
+            qty = round(position_size_dollars / entry_price, 3) 
+            
+            logger.info(f"Calculando ordem para {symbol}: Side={side}, Qty={qty}, Leverage={leverage}")
+
+            session.set_leverage(category="linear", symbol=symbol, buyLeverage=leverage, sellLeverage=leverage)
+
+            response = session.place_order(
+                category="linear", symbol=symbol, side=side, orderType="Market",
+                qty=str(qty), takeProfit=take_profit_price, stopLoss=str(stop_loss_price), isLeverage=1
+            )
+            if response.get('retCode') == 0:
+                return {"success": True, "data": response['result']}
+            else:
+                return {"success": False, "error": response.get('retMsg')}
+        except Exception as e:
+            logger.error(f"Exceção ao abrir ordem: {e}", exc_info=True)
+            return {"success": False, "error": str(e)}
+    return await asyncio.to_thread(_sync_call)
+    
+async def get_market_price(symbol: str) -> dict:
+    """Busca o preço de mercado atual de forma assíncrona."""
+    def _sync_call():
+        try:
+            session = HTTP(testnet=False)
+            response = session.get_tickers(category="linear", symbol=symbol)
+            if response.get('retCode') == 0 and response['result']['list']:
+                price = float(response['result']['list'][0]['lastPrice'])
+                return {"success": True, "price": price}
+            else:
+                return {"success": False, "error": response.get('retMsg', 'Preço não encontrado')}
+        except Exception as e:
+            logger.error(f"Exceção ao buscar preço de mercado para {symbol}: {e}", exc_info=True)
+            return {"success": False, "error": str(e)}
+    return await asyncio.to_thread(_sync_call)
+
+async def close_partial_position(api_key: str, api_secret: str, symbol: str, qty_to_close: float, side: str) -> dict:
+    """Fecha uma parte de uma posição aberta de forma assíncrona."""
+    def _sync_call():
+        try:
+            session = get_session(api_key, api_secret)
+            close_side = "Sell" if side == 'LONG' else "Buy"
+            
+            response = session.place_order(
+                category="linear", symbol=symbol, side=close_side,
+                orderType="Market", qty=str(qty_to_close), reduceOnly=True
+            )
+            if response.get('retCode') == 0:
+                return {"success": True, "data": response['result']}
+            else:
+                return {"success": False, "error": response.get('retMsg')}
+        except Exception as e:
+            logger.error(f"Exceção ao fechar posição parcial: {e}", exc_info=True)
+            return {"success": False, "error": str(e)}
+    return await asyncio.to_thread(_sync_call)
+
+async def modify_position_stop_loss(api_key: str, api_secret: str, symbol: str, new_stop_loss: float) -> dict:
+    """Modifica o Stop Loss de uma posição aberta de forma assíncrona."""
+    def _sync_call():
+        try:
+            session = get_session(api_key, api_secret)
+            response = session.set_trading_stop(
+                category="linear", symbol=symbol, stopLoss=str(new_stop_loss)
+            )
+            if response.get('retCode') == 0:
+                return {"success": True, "data": response['result']}
+            else:
+                return {"success": False, "error": response.get('retMsg')}
+        except Exception as e:
+            logger.error(f"Exceção ao modificar Stop Loss: {e}", exc_info=True)
+            return {"success": False, "error": str(e)}
+    return await asyncio.to_thread(_sync_call)
+
+async def get_open_positions(api_key: str, api_secret: str) -> dict:
+    """Busca todas as posições abertas de forma assíncrona."""
+    def _sync_call():
+        try:
+            session = get_session(api_key, api_secret)
+            response = session.get_positions(category="linear", settleCoin="USDT")
+            if response.get('retCode') == 0:
+                open_positions = [p for p in response['result']['list'] if float(p['size']) > 0]
+                return {"success": True, "data": open_positions}
+            else:
+                return {"success": False, "data": [], "error": response.get('retMsg')}
+        except Exception as e:
+            logger.error(f"Exceção ao buscar posições abertas: {e}", exc_info=True)
+            return {"success": False, "data": [], "error": str(e)}
+    return await asyncio.to_thread(_sync_call)
+
+========================================
+# Arquivo: services/notification_service.py
+========================================
+
+import logging
+from telegram.ext import Application
+from utils.config import ADMIN_ID
+
+logger = logging.getLogger(__name__)
+
+async def send_notification(application: Application, message: str):
+    """
+    Envia uma mensagem de notificação para o administrador do bot.
+    """
+    if not application:
+        logger.warning("Tentativa de enviar notificação sem a instância da aplicação.")
+        return
+    try:
+        await application.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=message,
+            parse_mode='HTML'
+        )
+        logger.info(f"Notificação enviada para o admin: {message[:50]}...")
+    except Exception as e:
+        logger.error(f"Falha ao enviar notificação para o admin: {e}")
+
+========================================
+# Arquivo: services/signal_parser.py
+========================================
+
+import re
+import logging
+from typing import Dict, Any, List, Optional
+
+logger = logging.getLogger(__name__)
+
+def parse_signal(message_text: str) -> Optional[Dict[str, Any]]:
+    """
+    Analisa a mensagem para extrair dados e, crucialmente, o TIPO de sinal
+    (Limite, Mercado, Cancelado).
+    """
+    
+    def find_single_value(pattern: str, text: str) -> Optional[str]:
+        match = re.search(pattern, text, re.IGNORECASE)
+        return match.group(1).strip() if match else None
+
+    def find_multiple_values(pattern: str, text: str) -> List[float]:
+        matches = re.findall(pattern, text, re.IGNORECASE)
+        return [float(v) for v in matches]
+
+    # --- Etapa 1: Análise de Tipo/Status ---
+    text_lower = message_text.lower()
+    signal_type = None
+    if 'sinal cancelado' in text_lower:
+        signal_type = 'CANCELLED'
+    elif 'ordem limite' in text_lower:
+        signal_type = 'LIMIT'
+    elif 'ordem à mercado' in text_lower or 'sinal entrou no preço' in text_lower:
+        signal_type = 'MARKET'
+
+    # --- Etapa 2: Extração dos Dados ---
+    coin = find_single_value(r'.*Moeda:\s*(\w+)', message_text)
+    
+    # Para um cancelamento, tentamos extrair a moeda da linha de cancelamento se não encontrarmos no formato padrão
+    if signal_type == 'CANCELLED' and not coin:
+        coin = find_single_value(r'(\w+)\s*Sinal Cancelado', message_text)
+
+    order_type = find_single_value(r'Tipo:\s*(LONG|SHORT)', message_text)
+    leverage_str = find_single_value(r'Alavancagem:\s*(\d+)x', message_text)
+    entry_zone_str = find_single_value(r'Zona de Entrada:\s*([\d\.\s-]+)', message_text)
+    stop_loss_str = find_single_value(r'Stop Loss:\s*([\d\.]+)', message_text)
+    targets = find_multiple_values(r'T\d+:\s*([\d\.]+)', message_text)
+    confidence_str = find_single_value(r'Confiança:\s*([\d\.]+)%', message_text)
+
+    # --- Etapa 3: Validação e Retorno por Tipo ---
+    if not coin:
+        logger.warning("[Parser] Campo 'Moeda' não encontrado no sinal.")
+        return None
+
+    if signal_type == 'CANCELLED':
+        # Para um cancelamento, só precisamos do tipo e da moeda.
+        return {"type": signal_type, "coin": f"{coin.upper()}USDT"}
+
+    # Validação para ordens de mercado/limite
+    if not order_type or not entry_zone_str or not stop_loss_str:
+        logger.warning("[Parser] Sinal não contém todos os campos necessários (Tipo, Entrada, Stop).")
+        return None
+
+    entries = [float(val) for val in re.findall(r'([\d\.]+)', entry_zone_str)]
+    if not entries:
+        logger.warning("[Parser] Nenhum preço numérico encontrado na 'Zona de Entrada'.")
+        return None
+
+    # --- Etapa 4: Montagem do Dicionário Final ---
+    signal_data = {
+        "type": signal_type,
+        "coin": f"{coin.upper()}USDT",
+        "order_type": order_type.upper(),
+        "leverage": int(leverage_str) if leverage_str else 10,
+        "entries": entries,
+        "stop_loss": float(stop_loss_str),
+        "targets": targets,
+        "confidence": float(confidence_str) if confidence_str else None
+    }
+    
+    return signal_data
+
+========================================
+# Arquivo: services/telethon_service.py
+========================================
+
+
+
+import logging
+import asyncio
+import os
+import re
+from telegram.ext import Application
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telethon.sync import TelegramClient
+from telethon import events
+from telethon.errors.rpcerrorlist import ChannelForumMissingError
+from telethon.tl.functions.channels import GetForumTopicsRequest
+from utils.config import API_ID, API_HASH
+from database.session import SessionLocal
+from database.models import MonitoredTarget
+from .signal_parser import parse_signal
+
+logger = logging.getLogger(__name__)
+
+# --- LÓGICA DE CAMINHO DINÂMICO ---
+if os.path.isdir('/data'):
+    SESSION_PATH = '/data/tradeflow_user'
+else:
+    SESSION_PATH = 'tradeflow_user'
+
+# --- DEFINIÇÃO ÚNICA E CORRETA DO CLIENTE ---
+client = TelegramClient(SESSION_PATH, API_ID, API_HASH)
+comm_queue = None
+
+# --- Funções de Busca (Helpers) ---
+
+def get_monitored_targets():
+    """Busca no DB a lista de todos os alvos (canal/tópico) monitorados."""
+    db = SessionLocal()
+    try:
+        return db.query(MonitoredTarget).all()
+    finally:
+        db.close()
+
+async def list_channels():
+    """Lista todos os canais e supergrupos com logging detalhado."""
+    logger.info("[list_channels] Iniciando busca de diálogos...")
+    channels = []
+    count = 0
+    try:
+        async for dialog in client.iter_dialogs():
+            count += 1
+            # A cada 50 chats processados, ele vai imprimir um log de progresso
+            if count % 50 == 0:
+                logger.info(f"[list_channels] ... processou {count} diálogos...")
+            
+            if dialog.is_channel:
+                channels.append((dialog.name, dialog.id))
+        
+        logger.info(f"[list_channels] Busca de diálogos finalizada. Total de {count} diálogos processados.")
+    except Exception as e:
+        logger.error(f"[list_channels] Erro durante iter_dialogs: {e}", exc_info=True)
+        
+    return channels
+
+async def list_channel_topics(channel_id: int):
+    """Busca os tópicos de um canal específico."""
+    topics = []
+    try:
+        entity = await client.get_entity(channel_id)
+        result = await client(GetForumTopicsRequest(
+            channel=entity, offset_date=0, offset_id=0, offset_topic=0, limit=100
+        ))
+        for topic in result.topics:
+            topics.append((topic.title, topic.id))
+    except ChannelForumMissingError:
+        logger.warning(f"Canal {channel_id} não possui tópicos (não é um fórum).")
+    except Exception as e:
+        logger.error(f"Exceção em list_channel_topics para o canal {channel_id}: {e}", exc_info=True)
+    return topics
+
+# --- Listener de Sinais ---
+# Um padrão regex para pré-filtrar mensagens. Ele só aciona o handler
+# se a mensagem contiver o emoji de diamante e a palavra "Moeda".
+# Isso reduz drasticamente o número de eventos que o bot precisa processar.
+SIGNAL_PATTERN = re.compile(r'💎\s*Moeda:', re.IGNORECASE)
+
+@client.on(events.NewMessage(pattern=SIGNAL_PATTERN))
+@client.on(events.MessageEdited(pattern=SIGNAL_PATTERN))
+async def signal_listener(event):
+    """
+    Ouve mensagens que correspondem ao padrão e faz uma verificação final
+    para garantir que é um evento de mensagem válido antes de processar.
+    """
+    global comm_queue
+    
+    # --- VERIFICAÇÃO FINAL E CORREÇÃO ---
+    # Garante que o evento é do tipo que contém uma mensagem de texto (Message).
+    # Isso ignora com segurança outros eventos como status de usuário, enquetes, etc.
+    if not isinstance(event, (events.NewMessage.Event, events.MessageEdited.Event)):
+        return
+        
+    if not event or not event.text or not comm_queue:
+        return
+
+    # A partir daqui, o código está seguro, pois sabemos que 'event' é uma mensagem.
+    monitored_targets = get_monitored_targets()
+    if not monitored_targets:
+        return
+
+    chat_id = event.chat_id
+    topic_id = event.reply_to.reply_to_msg_id if event.reply_to else None
+
+    is_target = any(
+        (target.channel_id == chat_id and (target.topic_id is None and topic_id is None)) or
+        (target.channel_id == chat_id and target.topic_id == topic_id)
+        for target in monitored_targets
+    )
+
+    if is_target:
+        logger.info(f"Potencial sinal detectado no alvo (Canal: {chat_id}). Adicionando à fila.")
+        await comm_queue.put({
+            "action": "process_signal",
+            "signal_text": event.text
+        })
+
+# --- Processador da Fila ---
+
+async def queue_processor(queue: asyncio.Queue, ptb_app: Application):
+    """Processa pedidos da fila, agora passando o 'source_name' adiante."""
+    global comm_queue
+    comm_queue = queue
+    from core.trade_manager import process_new_signal
+
+    while True:
+        request = await queue.get()
+        action = request.get("action")
+        logger.info(f"[Queue Processor] ==> Pedido recebido! Ação: '{action}'")
+        
+        try:
+            if action == "list_channels":
+                logger.info("[Queue Processor] ... Entrou no bloco de 'list_channels'.")
+                chat_id = request.get("chat_id")
+                message_id = request.get("message_id")
+                channels = await list_channels()
+                db = SessionLocal()
+                monitored_channels_ids = {target.channel_id for target in db.query(MonitoredTarget).all()}
+                db.close()
+                keyboard = []
+                if channels:
+                    for channel_name, channel_id in channels:
+                        suffix = " ✅" if channel_id in monitored_channels_ids else ""
+                        keyboard.append([InlineKeyboardButton(f"{channel_name}{suffix}", callback_data=f"monitor_channel_{channel_id}")])
+                if keyboard:
+                    await ptb_app.bot.edit_message_text(
+                        chat_id=chat_id, message_id=message_id,
+                        text="Selecione um grupo/canal (✅ = algum monitoramento ativo):",
+                        reply_markup=InlineKeyboardMarkup(keyboard)
+                    )
+                else:
+                    await ptb_app.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="Nenhum canal ou supergrupo encontrado.")
+
+            # --- LÓGICA COMPLETA PARA LISTAR TÓPICOS ---
+            elif action == "list_topics":
+                logger.info("[Queue Processor] ... Entrou no bloco de 'list_topics'.")
+                channel_id = request.get("channel_id")
+                chat_id = request.get("chat_id")
+                message_id = request.get("message_id")
+                channel_name = request.get("channel_name")
+                
+                topics = await list_channel_topics(channel_id)
+                db = SessionLocal()
+                
+                if topics:
+                    monitored_topic_ids = {t.topic_id for t in db.query(MonitoredTarget).filter_by(channel_id=channel_id).all() if t.topic_id}
+                    keyboard = [[InlineKeyboardButton("⬅️ Voltar para Grupos", callback_data="admin_list_channels")]]
+                    for name, topic_id in topics:
+                        suffix = " ✅" if topic_id in monitored_topic_ids else ""
+                        keyboard.append([InlineKeyboardButton(f"{name}{suffix}", callback_data=f"monitor_topic_{channel_id}_{topic_id}")])
+                    
+                    await ptb_app.bot.edit_message_text(
+                        chat_id=chat_id, message_id=message_id,
+                        text="Selecione o tópico para monitorar (✅ = já monitorado):",
+                        reply_markup=InlineKeyboardMarkup(keyboard)
+                    )
+                else:
+                    # Lógica para canais sem tópicos (adicionar/remover da lista de monitoramento)
+                    existing = db.query(MonitoredTarget).filter_by(channel_id=channel_id, topic_id=None).first()
+                    if existing:
+                        db.delete(existing)
+                        feedback_msg = f"❌ Canal '{channel_name}' removido da lista de monitoramento."
+                    else:
+                        new_target = MonitoredTarget(channel_id=channel_id, channel_name=channel_name)
+                        db.add(new_target)
+                        feedback_msg = f"✅ Canal '{channel_name}' adicionado à lista de monitoramento."
+                    
+                    db.commit()
+                    await ptb_app.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=feedback_msg)
+                
+                db.close()
+
+            elif action == "process_signal":
+                logger.info("[Queue Processor] ... Entrou no bloco de 'process_signal'.")
+                signal_text = request.get("signal_text")
+                # --- MUDANÇA: Pega o nome da fonte do pedido ---
+                source_name = request.get("source_name", "Fonte Desconhecida")
+                
+                signal_data = parse_signal(signal_text)
+                if signal_data:
+                    # Passa o nome da fonte para o processador de trades
+                    await process_new_signal(signal_data, ptb_app, source_name)
+                else:
+                    logger.info("Mensagem da fila não é um sinal válido.")
+            
+            else:
+                logger.warning(f"[Queue Processor] Ação desconhecida ou nula recebida: '{action}'")
+
+        except Exception as e:
+            logger.error(f"Erro CRÍTICO no processador da fila ao manusear a ação '{action}': {e}", exc_info=True)
+        finally:
+            queue.task_done()
+            logger.info(f"[Queue Processor] <== Pedido '{action}' finalizado.")
+
+# --- Função Principal do Serviço ---
+
+async def start_signal_monitor(queue: asyncio.Queue):
+    """Inicia o cliente Telethon, o ouvinte de sinais e o processador da fila."""
+    logger.info("Iniciando monitor de sinais com Telethon...")
+    
+    # Adiciona o ouvinte de mensagens ao cliente
+    client.add_event_handler(signal_listener)
+    
+    # Conecta o cliente Telethon
+    await client.start()
+    
+    # Pega a instância da aplicação do bot que foi colocada na fila no main.py
+    ptb_app = await queue.get()
+
+    logger.info("✅ Monitor de sinais e processador de fila ativos.")
+    
+    # Inicia o processador da fila como uma tarefa de fundo
+    asyncio.create_task(queue_processor(queue, ptb_app))
+    
+    await client.run_until_disconnected()
+

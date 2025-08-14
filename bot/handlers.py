@@ -2,6 +2,7 @@ import logging
 import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes, ConversationHandler
+from telegram.error import BadRequest
 from database.session import SessionLocal
 from database.models import User, InviteCode, MonitoredTarget, Trade, SignalForApproval
 from .keyboards import main_menu_keyboard, confirm_remove_keyboard, admin_menu_keyboard, dashboard_menu_keyboard, settings_menu_keyboard, view_targets_keyboard, bot_config_keyboard
@@ -230,9 +231,15 @@ async def my_positions_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         db.close()
 
 async def user_dashboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Exibe o painel com saldo detalhado por moeda, posições e opção de remover API."""
+    """Exibe o painel com saldo focado em USDT, outras moedas relevantes e posições."""
     query = update.callback_query
-    await query.answer()
+    
+    try:
+        await query.answer()
+    except BadRequest as e:
+        logger.warning(f"Não foi possível responder ao callback_query (pode ser antigo): {e}")
+        return
+
     await query.edit_message_text("Buscando informações do painel...")
 
     user_id = update.effective_user.id
@@ -242,7 +249,7 @@ async def user_dashboard_handler(update: Update, context: ContextTypes.DEFAULT_T
         user = get_user_by_id(user_id)
         if not user or not user.api_key_encrypted:
             await query.edit_message_text(
-                "Você precisa configurar suas chaves de API primeiro.", 
+                "Você precisa configurar sua API primeiro.",
                 reply_markup=main_menu_keyboard(telegram_id=user_id)
             )
             return
@@ -250,43 +257,68 @@ async def user_dashboard_handler(update: Update, context: ContextTypes.DEFAULT_T
         api_key = decrypt_data(user.api_key_encrypted)
         api_secret = decrypt_data(user.api_secret_encrypted)
 
-        account_info = get_account_info(api_key, api_secret)
-        positions_info = get_open_positions(api_key, api_secret)
+        account_info, positions_info = await asyncio.gather(
+            get_account_info(api_key, api_secret),
+            get_open_positions(api_key, api_secret)
+        )
         
         message = "<b>ℹ️ Seu Painel de Controle</b>\n\n"
-
-        # --- NOVA LÓGICA DE SALDO DETALHADO ---
-        message += "<b>Saldo em Conta (Bybit):</b>\n"
+        
+        # --- MELHORIA DE LAYOUT APLICADA AQUI ---
+        message += "<b>Saldos na Carteira:</b>\n"
+        
         if account_info.get("success"):
             balances = account_info.get("data", [])
-            has_balance = False
-            # Loop sobre a lista de moedas retornada pela API
-            for coin_balance in balances:
-                balance = float(coin_balance.get('walletBalance', '0'))
-                # Só exibe moedas com saldo maior que $1 para não poluir
-                if balance > 1:
-                    coin = coin_balance.get('coin', '???')
-                    message += f"- {coin}: {balance:,.2f}\n"
-                    has_balance = True
             
-            if not has_balance:
-                message += "- Nenhum saldo significativo encontrado.\n"
-            message += "\n" # Adiciona uma linha em branco para separar as seções
-        else:
-            message += f"- Erro ao buscar saldo: {account_info.get('error')}\n\n"
+            if balances and isinstance(balances, list) and len(balances) > 0:
+                coin_list = balances[0].get('coin', [])
+                
+                usdt_balance_value = 0.0
+                other_coins_lines = []
+                found_relevant_coins = False
 
-        # --- Seção de Posições (sem alterações) ---
-        message += "<b>Posições Abertas na Corretora:</b>\n"
+                for coin_balance in coin_list:
+                    coin_name = coin_balance.get('coin')
+                    wallet_balance = float(coin_balance.get('walletBalance', '0'))
+
+                    if coin_name == 'USDT':
+                        usdt_balance_value = wallet_balance
+                        found_relevant_coins = True
+                    elif wallet_balance >= 0.1:
+                        balance_str = f"{wallet_balance:.2f}"
+                        other_coins_lines.append(f"- {coin_name}: {balance_str}")
+                        found_relevant_coins = True
+                
+                usdt_display = f"{usdt_balance_value:.2f}"
+                message += f"<b>- USDT: {usdt_display}</b>\n"
+
+                if other_coins_lines:
+                    message += "\n".join(other_coins_lines)
+                
+                if not found_relevant_coins and usdt_balance_value == 0.0:
+                    message += "Nenhum saldo relevante encontrado.\n"
+
+            else:
+                 message += "Nenhuma moeda encontrada na carteira.\n"
+        else:
+            message += f"Erro ao buscar saldo: {account_info.get('error')}\n"
+        
+        # --- MELHORIA DE LAYOUT APLICADA AQUI ---
+        message += "\n\n" # Adiciona espaço extra antes da próxima seção
+        
+        message += "<b>Posições Abertas:</b>\n"
         if positions_info.get("success") and positions_info.get("data"):
             for pos in positions_info["data"]:
-                pnl_percent = float(pos.get('unrealisedPnl', '0')) / (float(pos.get('avgPrice', '1')) * float(pos.get('size', '1'))) * 100
-                side_emoji = "🔼" if pos['side'] == 'Buy' else "🔽"
-                message += f"- {side_emoji} {pos['symbol']}: {pos['size']} | P/L: ${float(pos.get('unrealisedPnl', '0')):,.2f} ({pnl_percent:.2f}%)\n"
+                try:
+                    pnl = float(pos.get('unrealisedPnl', '0'))
+                    side_emoji = "🔼" if pos['side'] == 'Buy' else "🔽"
+                    message += f"- {side_emoji} {pos['symbol']}: {pos['size']} | P/L: ${pnl:,.2f}\n"
+                except (ValueError, TypeError):
+                    message += f"- {pos.get('symbol', '???')}: Dados de P/L inválidos.\n"
         else:
-            message += "- Nenhuma posição aberta no momento.\n"
+            message += "- Nenhuma posição aberta no momento."
 
-        # --- NOVO AVISO USDT ---
-        message += "\n\n<i>*Este bot opera exclusivamente com pares USDT.</i>"
+        message += "\n\n<i>⚠️ Este bot opera exclusivamente com pares USDT.</i>"
 
         await query.edit_message_text(
             message, 

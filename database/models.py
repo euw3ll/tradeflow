@@ -1,4 +1,5 @@
-from sqlalchemy import (create_engine, Column, Integer, String, BigInteger, Boolean, Float, JSON, DateTime)
+from sqlalchemy import (Column, Integer, String, BigInteger, 
+                        Boolean, Float, JSON, DateTime)
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.sql import func
 
@@ -27,58 +28,38 @@ class MonitoredTarget(Base):
     id = Column(Integer, primary_key=True)
     channel_id = Column(BigInteger, nullable=False)
     channel_name = Column(String)
-    topic_id = Column(Integer, nullable=True) # <-- Campo para o ID do tópico
-    topic_name = Column(String, nullable=True) # <-- Campo para o nome do tópico
-    
-    # Podemos adicionar um __repr__ para facilitar a visualização
-    def __repr__(self):
-        return f"<MonitoredTarget(channel='{self.channel_name}', topic='{self.topic_name}')>"
-
-class PendingSignal(Base):
-    """Tabela para armazenar sinais de Ordem Limite que aguardam ativação/cancelamento."""
-    __tablename__ = 'pending_signals'
-    id = Column(Integer, primary_key=True)
-    user_telegram_id = Column(BigInteger, nullable=False)
-    symbol = Column(String, nullable=False, unique=True, index=True) # Apenas um sinal pendente por moeda
-    signal_data = Column(JSON, nullable=False)
+    topic_id = Column(BigInteger, unique=True, nullable=True)
+    topic_name = Column(String)
 
 class Trade(Base):
     __tablename__ = 'trades'
     id = Column(Integer, primary_key=True)
     user_telegram_id = Column(BigInteger, nullable=False)
-    
-    # Dados da Bybit
     order_id = Column(String, unique=True, nullable=False)
     symbol = Column(String, nullable=False)
-    
-    # Dados do Trade
-    side = Column(String) # 'LONG' ou 'SHORT'
-    qty = Column(Float)
+    side = Column(String, nullable=False)
+    qty = Column(Float, nullable=False)
     entry_price = Column(Float)
-    
-    # Gerenciamento
     stop_loss = Column(Float)
-    initial_targets = Column(JSON) # Armazenaremos a lista de todos os alvos aqui
-    
-    # Status Ativo
-    status = Column(String, default='ACTIVE') # Ex: ACTIVE, TP1_HIT, CLOSED
-    remaining_qty = Column(Float) # Quantidade que ainda está aberta
+    current_stop_loss = Column(Float)
+    initial_targets = Column(JSON)
+    status = Column(String, default='ACTIVE')
+    remaining_qty = Column(Float)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
 
-    # Armazena o valor atual do Stop Loss, que será modificado pelo tracker.
-    current_stop_loss = Column(Float, nullable=True)
+class PendingSignal(Base):
+    __tablename__ = 'pending_signals'
+    id = Column(Integer, primary_key=True)
+    user_telegram_id = Column(BigInteger, nullable=False)
+    symbol = Column(String, nullable=False, unique=True, index=True)
+    signal_data = Column(JSON, nullable=False)
 
 class SignalForApproval(Base):
-    """Armazena sinais que estão aguardando a aprovação manual do usuário."""
     __tablename__ = 'signals_for_approval'
     id = Column(Integer, primary_key=True)
     user_telegram_id = Column(BigInteger, nullable=False, index=True)
     symbol = Column(String, nullable=False)
     source_name = Column(String)
-    
-    # Armazena todos os dados do sinal parseado em um campo JSON
     signal_data = Column(JSON, nullable=False)
-    
-    # Armazena o ID da mensagem de aprovação para futura edição
     approval_message_id = Column(BigInteger)
-    
     created_at = Column(DateTime(timezone=True), server_default=func.now())
