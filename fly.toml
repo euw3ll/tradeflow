@@ -1,0 +1,12 @@
+app = "tradeflow"
+primary_region = "gru"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[mounts]
+  source = "tradeflow_data"
+  destination = "/data"
+
+[processes]
+  app = "./start.sh" # Agora o processo principal é nosso script

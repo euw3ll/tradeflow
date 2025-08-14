@@ -1,25 +1,20 @@
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, BigInteger, Float, JSON
-from sqlalchemy.orm import declarative_base
-
+from sqlalchemy import (create_engine, Column, Integer, String, BigInteger, Boolean, Float, JSON, DateTime)
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.sql import func
 
 Base = declarative_base()
 
 class User(Base):
     __tablename__ = 'users'
     id = Column(Integer, primary_key=True)
-    telegram_id = Column(BigInteger, unique=True, nullable=False)
+    telegram_id = Column(BigInteger, unique=True, nullable=False, index=True)
     first_name = Column(String)
-    is_active = Column(Boolean, default=True)
     api_key_encrypted = Column(String)
     api_secret_encrypted = Column(String)
-
-    # --- NOVAS COLUNAS PARA CONFIGURAÇÕES DE TRADE ---
-    # Risco em % do saldo total da conta por operação. Ex: 2.0 para 2%
-    risk_per_trade_percent = Column(Float, default=1.0) 
-    # Alavancagem máxima que o bot pode usar.
+    risk_per_trade_percent = Column(Float, default=1.0)
     max_leverage = Column(Integer, default=10)
-    # Confiança mínima da IA para que o bot entre no trade.
-    min_confidence = Column(Float, default=0.0) # Default 0 para aceitar qualquer sinal
+    min_confidence = Column(Float, default=0.0)
+    approval_mode = Column(String, default='AUTOMATIC', nullable=False)
 
 class InviteCode(Base):
     __tablename__ = 'invite_codes'
@@ -71,3 +66,19 @@ class Trade(Base):
 
     # Armazena o valor atual do Stop Loss, que será modificado pelo tracker.
     current_stop_loss = Column(Float, nullable=True)
+
+class SignalForApproval(Base):
+    """Armazena sinais que estão aguardando a aprovação manual do usuário."""
+    __tablename__ = 'signals_for_approval'
+    id = Column(Integer, primary_key=True)
+    user_telegram_id = Column(BigInteger, nullable=False, index=True)
+    symbol = Column(String, nullable=False)
+    source_name = Column(String)
+    
+    # Armazena todos os dados do sinal parseado em um campo JSON
+    signal_data = Column(JSON, nullable=False)
+    
+    # Armazena o ID da mensagem de aprovação para futura edição
+    approval_message_id = Column(BigInteger)
+    
+    created_at = Column(DateTime(timezone=True), server_default=func.now())

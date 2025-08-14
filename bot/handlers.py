@@ -3,13 +3,14 @@ import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes, ConversationHandler
 from database.session import SessionLocal
-from database.models import User, InviteCode, MonitoredTarget, Trade
-from .keyboards import main_menu_keyboard, confirm_remove_keyboard, admin_menu_keyboard, dashboard_menu_keyboard, settings_menu_keyboard
+from database.models import User, InviteCode, MonitoredTarget, Trade, SignalForApproval
+from .keyboards import main_menu_keyboard, confirm_remove_keyboard, admin_menu_keyboard, dashboard_menu_keyboard, settings_menu_keyboard, view_targets_keyboard, bot_config_keyboard
 from utils.security import encrypt_data, decrypt_data
 from services.bybit_service import get_open_positions, get_account_info, close_partial_position
 from utils.config import ADMIN_ID
 from core.report_service import generate_performance_report
 from database.crud import get_user_by_id
+from core.trade_manager import _execute_trade
 
 # Estados para as conversas
 (WAITING_CODE, WAITING_API_KEY, WAITING_API_SECRET, CONFIRM_REMOVE_API) = range(4)
@@ -69,7 +70,6 @@ async def config_api(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
     
-    # Guarda o ID da mensagem para podermos editá-la depois
     context.user_data['entry_message_id'] = query.message.message_id
     
     tutorial_text = (
@@ -82,6 +82,8 @@ async def config_api(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         "   - <b>Contrato</b> (`Contract`): ✅ `Ordens` e ✅ `Posições`\n"
         "   - <b>Trading Unificado</b> (`UTA`): ✅ `Trade`\n\n"
         "5️⃣  🛡️ <b>MUITO IMPORTANTE:</b> Por segurança, <b>NÃO</b> marque a permissão de <i>'Saque' (Withdraw)</i>.\n\n"
+        # --- NOVA LINHA DE AVISO ---
+        "⚠️ <b>Atenção:</b> Este bot opera exclusivamente com pares de trade terminados em **USDT**.\n\n"
         "6️⃣  Conclua a verificação de segurança e copie sua <b>API Key</b> e <b>API Secret</b>.\n\n"
         "-------------------------------------\n"
         "Pronto! Agora, por favor, envie sua <b>API Key</b>."
@@ -89,7 +91,7 @@ async def config_api(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     
     await query.edit_message_text(
         text=tutorial_text,
-        parse_mode='HTML' # Usamos HTML para mais opções de formatação
+        parse_mode='HTML'
     )
     return WAITING_API_KEY
 
@@ -228,7 +230,7 @@ async def my_positions_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         db.close()
 
 async def user_dashboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Exibe o painel com saldo, monitoramentos e opção de remover API."""
+    """Exibe o painel com saldo detalhado por moeda, posições e opção de remover API."""
     query = update.callback_query
     await query.answer()
     await query.edit_message_text("Buscando informações do painel...")
@@ -237,67 +239,63 @@ async def user_dashboard_handler(update: Update, context: ContextTypes.DEFAULT_T
     db = SessionLocal()
     
     try:
-        user = db.query(User).filter_by(telegram_id=user_id).first()
+        user = get_user_by_id(user_id)
         if not user or not user.api_key_encrypted:
-            await query.edit_message_text("Você precisa configurar suas chaves de API primeiro.", reply_markup=main_menu_keyboard(telegram_id=user_id))
-            db.close()
+            await query.edit_message_text(
+                "Você precisa configurar suas chaves de API primeiro.", 
+                reply_markup=main_menu_keyboard(telegram_id=user_id)
+            )
             return
 
         api_key = decrypt_data(user.api_key_encrypted)
         api_secret = decrypt_data(user.api_secret_encrypted)
 
-        # 1. Buscar Saldo da Conta
         account_info = get_account_info(api_key, api_secret)
-        
-        # 2. Buscar Posições Abertas na Bybit
         positions_info = get_open_positions(api_key, api_secret)
         
-        # 3. Buscar Alvos Monitorados no nosso DB
-        monitored_targets = db.query(MonitoredTarget).all()
+        message = "<b>ℹ️ Seu Painel de Controle</b>\n\n"
 
-        # --- Montagem da Mensagem ---
-        message = "<b>Seu Painel de Controle</b>\n\n"
-
-        # Seção de Saldo
+        # --- NOVA LÓGICA DE SALDO DETALHADO ---
+        message += "<b>Saldo em Conta (Bybit):</b>\n"
         if account_info.get("success"):
-            balance = float(account_info['data']['totalEquity'])
-            message += f"<b>Conta Bybit:</b>\n- Saldo Total: ${balance:,.2f}\n\n"
+            balances = account_info.get("data", [])
+            has_balance = False
+            # Loop sobre a lista de moedas retornada pela API
+            for coin_balance in balances:
+                balance = float(coin_balance.get('walletBalance', '0'))
+                # Só exibe moedas com saldo maior que $1 para não poluir
+                if balance > 1:
+                    coin = coin_balance.get('coin', '???')
+                    message += f"- {coin}: {balance:,.2f}\n"
+                    has_balance = True
+            
+            if not has_balance:
+                message += "- Nenhum saldo significativo encontrado.\n"
+            message += "\n" # Adiciona uma linha em branco para separar as seções
         else:
-            message += "<b>Conta Bybit:</b>\n- Erro ao buscar saldo.\n\n"
+            message += f"- Erro ao buscar saldo: {account_info.get('error')}\n\n"
 
-        # Seção de Posições Abertas
+        # --- Seção de Posições (sem alterações) ---
         message += "<b>Posições Abertas na Corretora:</b>\n"
         if positions_info.get("success") and positions_info.get("data"):
             for pos in positions_info["data"]:
-                try:
-                    # Cálculo mais seguro para PNL em %
-                    entry_price = float(pos.get('avgPrice', '0'))
-                    size = float(pos.get('size', '0'))
-                    pnl = float(pos.get('unrealisedPnl', '0'))
-                    pnl_percent = (pnl / (entry_price * size)) * 100 if entry_price > 0 and size > 0 else 0
-                    
-                    side_emoji = "🔼" if pos['side'] == 'Buy' else "🔽"
-                    message += f"- {side_emoji} {pos['symbol']} ({pos['size']} unid.)\n  P/L: ${pnl:,.2f} ({pnl_percent:.2f}%)\n"
-                except (ValueError, TypeError):
-                    message += f"- {pos['symbol']}: dados de P/L inválidos.\n"
+                pnl_percent = float(pos.get('unrealisedPnl', '0')) / (float(pos.get('avgPrice', '1')) * float(pos.get('size', '1'))) * 100
+                side_emoji = "🔼" if pos['side'] == 'Buy' else "🔽"
+                message += f"- {side_emoji} {pos['symbol']}: {pos['size']} | P/L: ${float(pos.get('unrealisedPnl', '0')):,.2f} ({pnl_percent:.2f}%)\n"
         else:
-            message += "- Nenhuma posição aberta no momento.\n\n"
+            message += "- Nenhuma posição aberta no momento.\n"
 
-        # Seção de Monitoramentos
-        message += "\n<b>Alvos Monitorados pelo Bot:</b>\n"
-        if monitored_targets:
-            for target in monitored_targets:
-                if target.topic_id:
-                    message += f"- Tópico: {target.topic_name or target.topic_id}\n"
-                else:
-                    message += f"- Canal: {target.channel_name or target.channel_id}\n"
-        else:
-            message += "- Nenhum alvo sendo monitorado."
+        # --- NOVO AVISO USDT ---
+        message += "\n\n<i>*Este bot opera exclusivamente com pares USDT.</i>"
 
-        await query.edit_message_text(message, parse_mode='HTML', reply_markup=dashboard_menu_keyboard())
+        await query.edit_message_text(
+            message, 
+            parse_mode='HTML', 
+            reply_markup=dashboard_menu_keyboard()
+        )
 
     except Exception as e:
-        logger.error(f"Erro ao montar o painel: {e}", exc_info=True)
+        logger.error(f"Erro ao montar o painel do usuário: {e}", exc_info=True)
         await query.edit_message_text("Ocorreu um erro ao buscar os dados do seu painel.")
     finally:
         db.close()
@@ -317,6 +315,45 @@ async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
+        "Bem-vindo ao painel de administração.",
+        reply_markup=admin_menu_keyboard()
+    )
+
+
+async def admin_view_targets_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Busca e exibe a lista de todos os canais e tópicos sendo monitorados."""
+    query = update.callback_query
+    await query.answer()
+    
+    db = SessionLocal()
+    try:
+        targets = db.query(MonitoredTarget).all()
+        
+        message = "<b>👁️ Alvos Atualmente Monitorados</b>\n\n"
+        
+        if targets:
+            for target in targets:
+                if target.topic_name:
+                    message += f"- <b>Grupo:</b> {target.channel_name}\n  - <b>Tópico:</b> {target.topic_name}\n"
+                else:
+                    message += f"- <b>Canal:</b> {target.channel_name}\n"
+        else:
+            message += "Nenhum alvo sendo monitorado no momento."
+            
+        await query.edit_message_text(
+            text=message,
+            parse_mode='HTML',
+            reply_markup=view_targets_keyboard()
+        )
+    finally:
+        db.close()
+
+async def back_to_admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Retorna o usuário para o menu de administração principal."""
+    query = update.callback_query
+    await query.answer()
+    
+    await query.edit_message_text(
         "Bem-vindo ao painel de administração.",
         reply_markup=admin_menu_keyboard()
     )
@@ -785,5 +822,91 @@ async def manual_close_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 chat_id=user_id,
                 text=f"❌ Erro ao fechar a posição para {trade_to_close.symbol}: {error_msg}"
             )
+    finally:
+        db.close()
+
+async def bot_config_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Exibe o menu de configuração do bot com o modo de aprovação atual."""
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    
+    db = SessionLocal()
+    try:
+        user = get_user_by_id(user_id)
+        if user:
+            await query.edit_message_text(
+                "<b>🤖 Configuração do Bot</b>\n\n"
+                "Ajuste o comportamento geral do bot.",
+                parse_mode='HTML',
+                reply_markup=bot_config_keyboard(user)
+            )
+    finally:
+        db.close()
+
+async def toggle_approval_mode_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Alterna o modo de aprovação de ordens entre Manual e Automático."""
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+
+    db = SessionLocal()
+    try:
+        user = get_user_by_id(user_id)
+        if user:
+            # Lógica para alternar o modo
+            if user.approval_mode == 'AUTOMATIC':
+                user.approval_mode = 'MANUAL'
+            else:
+                user.approval_mode = 'AUTOMATIC'
+            
+            db.commit()
+            
+            # Edita a mensagem para refletir a mudança, redesenhando o teclado
+            await query.edit_message_text(
+                "<b>🤖 Configuração do Bot</b>\n\n"
+                "Ajuste o comportamento geral do bot.",
+                parse_mode='HTML',
+                reply_markup=bot_config_keyboard(user)
+            )
+    finally:
+        db.close()
+
+async def handle_signal_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Lida com a decisão do usuário (Aprovar/Rejeitar) para um sinal manual.
+    """
+    query = update.callback_query
+    await query.answer()
+
+    action, signal_id_str = query.data.split('_', 1)[-1].rsplit('_', 1)
+    signal_id = int(signal_id_str)
+    
+    db = SessionLocal()
+    try:
+        # Busca o sinal que está aguardando aprovação no banco de dados
+        signal_to_process = db.query(SignalForApproval).filter_by(id=signal_id).first()
+
+        if not signal_to_process:
+            await query.edit_message_text("Este sinal já foi processado ou expirou.")
+            return
+
+        if action == 'approve':
+            await query.edit_message_text("✅ **Entrada Aprovada!** Processando ordem...")
+            
+            user = get_user_by_id(signal_to_process.user_telegram_id)
+            signal_data = signal_to_process.signal_data
+            source_name = signal_to_process.source_name
+            
+            # Chama a função que executa o trade (que já criamos)
+            await _execute_trade(signal_data, user, context.application, db, source_name)
+            
+        elif action == 'reject':
+            await query.edit_message_text("❌ **Entrada Rejeitada.** O sinal foi descartado.")
+        
+        # Remove o sinal da tabela de aprovação em ambos os casos
+        db.delete(signal_to_process)
+        db.commit()
+    
     finally:
         db.close()

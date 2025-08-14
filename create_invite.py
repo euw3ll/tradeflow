@@ -1,16 +1,15 @@
-from database.session import SessionLocal
+import sys
+from database.session import SessionLocal, init_db
 from database.models import InviteCode
 
 def create_invite_code(code: str):
     db = SessionLocal()
     try:
-        # Verifica se o código já existe
         existing_code = db.query(InviteCode).filter(InviteCode.code == code).first()
         if existing_code:
             print(f"Código '{code}' já existe.")
             return
 
-        # Cria o novo código
         new_code = InviteCode(code=code)
         db.add(new_code)
         db.commit()
@@ -19,9 +18,10 @@ def create_invite_code(code: str):
         db.close()
 
 if __name__ == "__main__":
-    # Inicializa o banco e as tabelas caso não existam
-    from database.session import init_db
     init_db()
-
-    # Crie seu primeiro código aqui
-    create_invite_code("MEU-CODIGO-SECRETO")
+    # Agora ele lê o código a partir do seu comando no terminal
+    if len(sys.argv) > 1:
+        code_to_create = sys.argv[1]
+        create_invite_code(code_to_create)
+    else:
+        print("Erro: Por favor, forneça um código para criar. Exemplo: python create_invite.py MEU-CODIGO-NOVO")

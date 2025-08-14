@@ -1,5 +1,8 @@
+
+
 import logging
 import asyncio
+import os
 import re
 from telegram.ext import Application
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -14,9 +17,15 @@ from .signal_parser import parse_signal
 
 logger = logging.getLogger(__name__)
 
-# --- Objetos Globais do Serviço ---
-client = TelegramClient('tradeflow_user', API_ID, API_HASH)
-comm_queue = None # A Fila de comunicação será atribuída na inicialização
+# --- LÓGICA DE CAMINHO DINÂMICO ---
+if os.path.isdir('/data'):
+    SESSION_PATH = '/data/tradeflow_user'
+else:
+    SESSION_PATH = 'tradeflow_user'
+
+# --- DEFINIÇÃO ÚNICA E CORRETA DO CLIENTE ---
+client = TelegramClient(SESSION_PATH, API_ID, API_HASH)
+comm_queue = None
 
 # --- Funções de Busca (Helpers) ---
 
