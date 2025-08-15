@@ -172,3 +172,92 @@ async def get_daily_pnl(api_key: str, api_secret: str) -> dict:
     today_start = datetime.combine(datetime.today(), time.min)
     now = datetime.now()
     return await get_pnl_for_period(api_key, api_secret, today_start, now)
+
+
+# --- FUNÇÃO PARA ENVIAR ORDEM LIMITE ---
+async def place_limit_order(api_key: str, api_secret: str, signal_data: dict, user_settings: User, balance: float) -> dict:
+    """Envia uma nova ordem limite para a Bybit."""
+    def _sync_call():
+        try:
+            session = get_session(api_key, api_secret)
+            symbol = signal_data['coin']
+            side = "Buy" if signal_data['order_type'] == 'LONG' else "Sell"
+            leverage = str(user_settings.max_leverage)
+            entry_price = float(signal_data['entries'][0])
+            stop_loss_price = str(signal_data['stop_loss'])
+            take_profit_price = str(signal_data['targets'][0]) if signal_data.get('targets') else None
+
+            # Lógica de cálculo de tamanho da ordem (a mesma que já usamos)
+            entry_percent = user_settings.entry_size_percent
+            position_size_dollars = balance * (entry_percent / 100)
+            qty = round(position_size_dollars / entry_price, 3)
+            
+            logger.info(f"Calculando ORDEM LIMITE para {symbol}: Side={side}, Qty={qty}, Price={entry_price}")
+
+            session.set_leverage(category="linear", symbol=symbol, buyLeverage=leverage, sellLeverage=leverage)
+
+            response = session.place_order(
+                category="linear",
+                symbol=symbol,
+                side=side,
+                orderType="Limit", # <-- TIPO DE ORDEM
+                qty=str(qty),
+                price=str(entry_price), # <-- PREÇO DE ENTRADA
+                takeProfit=take_profit_price,
+                stopLoss=stop_loss_price,
+                isLeverage=1
+            )
+            if response.get('retCode') == 0:
+                return {"success": True, "data": response['result']}
+            else:
+                return {"success": False, "error": response.get('retMsg')}
+        except Exception as e:
+            logger.error(f"Exceção ao enviar ordem limite: {e}", exc_info=True)
+            return {"success": False, "error": str(e)}
+    return await asyncio.to_thread(_sync_call)
+
+
+# --- FUNÇÃO PARA VERIFICAR STATUS DE UMA ORDEM ---
+async def get_order_status(api_key: str, api_secret: str, order_id: str, symbol: str) -> dict:
+    """Verifica o status de uma ordem específica na Bybit."""
+    def _sync_call():
+        try:
+            session = get_session(api_key, api_secret)
+            response = session.get_order_history(
+                category="linear",
+                orderId=order_id,
+                # symbol=symbol # Opcional, mas ajuda a refinar a busca
+            )
+            if response.get('retCode') == 0:
+                order_list = response.get('result', {}).get('list', [])
+                if order_list:
+                    # Retorna o primeiro resultado, que deve ser nossa ordem
+                    return {"success": True, "data": order_list[0]}
+                return {"success": False, "error": "Ordem não encontrada no histórico."}
+            else:
+                return {"success": False, "error": response.get('retMsg')}
+        except Exception as e:
+            logger.error(f"Exceção ao verificar status da ordem: {e}", exc_info=True)
+            return {"success": False, "error": str(e)}
+    return await asyncio.to_thread(_sync_call)
+
+
+# --- FUNÇÃO PARA CANCELAR UMA ORDEM ---
+async def cancel_order(api_key: str, api_secret: str, order_id: str, symbol: str) -> dict:
+    """Cancela uma ordem limite pendente na Bybit."""
+    def _sync_call():
+        try:
+            session = get_session(api_key, api_secret)
+            response = session.cancel_order(
+                category="linear",
+                symbol=symbol,
+                orderId=order_id
+            )
+            if response.get('retCode') == 0:
+                return {"success": True, "data": response['result']}
+            else:
+                return {"success": False, "error": response.get('retMsg')}
+        except Exception as e:
+            logger.error(f"Exceção ao cancelar ordem: {e}", exc_info=True)
+            return {"success": False, "error": str(e)}
+    return await asyncio.to_thread(_sync_call)

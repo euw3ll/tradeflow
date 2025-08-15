@@ -55,6 +55,8 @@ class PendingSignal(Base):
     id = Column(Integer, primary_key=True)
     user_telegram_id = Column(BigInteger, nullable=False)
     symbol = Column(String, nullable=False, unique=True, index=True)
+    # Armazena o ID da ordem retornado pela Bybit para podermos gerenciá-la
+    order_id = Column(String, unique=True, nullable=False)
     signal_data = Column(JSON, nullable=False)
 
 class SignalForApproval(Base):
