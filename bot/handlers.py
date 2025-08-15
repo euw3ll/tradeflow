@@ -930,7 +930,7 @@ async def toggle_approval_mode_handler(update: Update, context: ContextTypes.DEF
 
 async def handle_signal_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Lida com a decisão do usuário (Aprovar/Rejeitar) para um sinal manual.
+    Lida com a decisão do admin (Aprovar/Rejeitar) e replica a ação para todos os usuários.
     """
     query = update.callback_query
     await query.answer()
@@ -940,22 +940,31 @@ async def handle_signal_approval(update: Update, context: ContextTypes.DEFAULT_T
     
     db = SessionLocal()
     try:
-        # Busca o sinal que está aguardando aprovação no banco de dados
         signal_to_process = db.query(SignalForApproval).filter_by(id=signal_id).first()
 
         if not signal_to_process:
             await query.edit_message_text("Este sinal já foi processado ou expirou.")
             return
 
+        # --- LÓGICA DE APROVAÇÃO MULTIUSUÁRIO ---
         if action == 'approve':
-            await query.edit_message_text("✅ **Entrada Aprovada!** Processando ordem...")
-            
-            user = get_user_by_id(signal_to_process.user_telegram_id)
             signal_data = signal_to_process.signal_data
             source_name = signal_to_process.source_name
             
-            # Chama a função que executa o trade (que já criamos)
-            await _execute_trade(signal_data, user, context.application, db, source_name)
+            # 1. Busca todos os usuários com API configurada
+            all_users_to_trade = db.query(User).filter(User.api_key_encrypted.isnot(None)).all()
+            
+            await query.edit_message_text(f"✅ **Entrada Aprovada!** Replicando a ordem para {len(all_users_to_trade)} usuário(s)...")
+            
+            # 2. Executa o trade para cada usuário
+            for user in all_users_to_trade:
+                logger.info(f"Processando trade manual para o usuário: {user.telegram_id}")
+                try:
+                    # Usamos a mesma função _execute_trade que já está preparada para multiusuário
+                    await _execute_trade(signal_data, user, context.application, db, source_name)
+                except Exception as e:
+                    logger.error(f"Erro ao executar trade manual para o usuário {user.telegram_id}: {e}", exc_info=True)
+                    await context.bot.send_message(chat_id=user.telegram_id, text=f"Ocorreu um erro inesperado ao processar o sinal para {signal_data.get('coin')}.")
             
         elif action == 'reject':
             await query.edit_message_text("❌ **Entrada Rejeitada.** O sinal foi descartado.")
@@ -1088,7 +1097,9 @@ async def performance_menu_handler(update: Update, context: ContextTypes.DEFAULT
     query = update.callback_query
     await query.answer()
 
-    # Determina o período com base no botão clicado
+    # --- CORREÇÃO APLICADA AQUI: Captura o ID do usuário que interagiu ---
+    user_id = query.from_user.id
+    
     callback_data = query.data
     now = datetime.now()
     start_dt, end_dt = None, None
@@ -1113,8 +1124,8 @@ async def performance_menu_handler(update: Update, context: ContextTypes.DEFAULT
             reply_markup=performance_menu_keyboard()
         )
         
-        # Chama o serviço para gerar o relatório
-        report_text = await generate_performance_report(start_dt, end_dt)
+        # --- CORREÇÃO APLICADA AQUI: Passa o user_id para o serviço ---
+        report_text = await generate_performance_report(user_id, start_dt, end_dt)
         
         await query.edit_message_text(
             text=report_text,
