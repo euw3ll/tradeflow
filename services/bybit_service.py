@@ -39,26 +39,23 @@ async def place_order(api_key: str, api_secret: str, signal_data: dict, user_set
             side = "Buy" if signal_data['order_type'] == 'LONG' else "Sell"
             leverage = str(user_settings.max_leverage)
             entry_price = signal_data['entries'][0]
-            stop_loss_price = float(signal_data['stop_loss'])
+            stop_loss_price = str(signal_data['stop_loss'])
             take_profit_price = str(signal_data['targets'][0]) if signal_data.get('targets') else None
             
-            risk_percent = user_settings.risk_per_trade_percent
-            dollar_amount_to_risk = balance * (risk_percent / 100)
+            # --- LÓGICA DE CÁLCULO DE TAMANHO DA ORDEM ATUALIZADA ---
+            entry_percent = user_settings.entry_size_percent
+            position_size_dollars = balance * (entry_percent / 100)
             
-            stop_loss_distance_percent = abs(entry_price - stop_loss_price) / entry_price
-            if stop_loss_distance_percent == 0:
-                return {"success": False, "error": "Distância do Stop Loss é zero."}
-
-            position_size_dollars = dollar_amount_to_risk / stop_loss_distance_percent
+            # Arredonda a quantidade para o número de casas decimais correto para a Bybit
             qty = round(position_size_dollars / entry_price, 3) 
             
-            logger.info(f"Calculando ordem para {symbol}: Side={side}, Qty={qty}, Leverage={leverage}")
+            logger.info(f"Calculando ordem para {symbol}: Side={side}, Qty={qty}, Leverage={leverage}, Size=${position_size_dollars:.2f}")
 
             session.set_leverage(category="linear", symbol=symbol, buyLeverage=leverage, sellLeverage=leverage)
 
             response = session.place_order(
                 category="linear", symbol=symbol, side=side, orderType="Market",
-                qty=str(qty), takeProfit=take_profit_price, stopLoss=str(stop_loss_price), isLeverage=1
+                qty=str(qty), takeProfit=take_profit_price, stopLoss=stop_loss_price, isLeverage=1
             )
             if response.get('retCode') == 0:
                 return {"success": True, "data": response['result']}

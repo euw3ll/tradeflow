@@ -56,15 +56,15 @@ def confirm_remove_keyboard():
 def settings_menu_keyboard(user_settings):
     """
     Retorna o teclado do menu de configurações, mostrando os valores atuais.
-    'user_settings' é o objeto User vindo do banco de dados.
     """
     # Pega os valores do objeto do usuário
-    risk_percent = user_settings.risk_per_trade_percent
+    entry_percent = user_settings.entry_size_percent # Campo atualizado
     max_leverage = user_settings.max_leverage
-    min_confidence = user_settings.min_confidence # <-- ESTA LINHA FALTAVA
+    min_confidence = user_settings.min_confidence
 
     keyboard = [
-        [InlineKeyboardButton(f"Risco por Trade: {risk_percent:.2f}%", callback_data='set_risk_percent')],
+        # --- BOTÃO ATUALIZADO ---
+        [InlineKeyboardButton(f"Tamanho da Entrada: {entry_percent:.2f}%", callback_data='set_entry_percent')],
         [InlineKeyboardButton(f"Alavancagem Máxima: {max_leverage}x", callback_data='set_max_leverage')],
         [InlineKeyboardButton(f"Confiança Mínima (IA): {min_confidence:.2f}%", callback_data='set_min_confidence')],
         [InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data='back_to_main_menu')]
@@ -78,9 +78,9 @@ def bot_config_keyboard(user_settings):
     # Botão de Modo de Aprovação (lógica existente)
     mode = user_settings.approval_mode
     if mode == 'AUTOMATIC':
-        approval_button_text = "Modo de Aprovação: Automático ⚡"
+        approval_button_text = "Entrada de Sinais: Automático ⚡"
     else:
-        approval_button_text = "Modo de Aprovação: Manual 👋"
+        approval_button_text = "Entrada de Sinais: Manual 👋"
 
     # --- NOVOS BOTÕES DE METAS ---
     # Formata a meta de lucro para exibição

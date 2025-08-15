@@ -11,7 +11,7 @@ class User(Base):
     first_name = Column(String)
     api_key_encrypted = Column(String)
     api_secret_encrypted = Column(String)
-    risk_per_trade_percent = Column(Float, default=1.0)
+    entry_size_percent = Column(Float, default=5.0) # Define 5% como padrão
     max_leverage = Column(Integer, default=10)
     min_confidence = Column(Float, default=0.0)
     approval_mode = Column(String, default='AUTOMATIC', nullable=False)

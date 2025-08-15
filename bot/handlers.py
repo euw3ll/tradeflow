@@ -15,7 +15,7 @@ from core.trade_manager import _execute_trade
 
 # Estados para as conversas
 (WAITING_CODE, WAITING_API_KEY, WAITING_API_SECRET, CONFIRM_REMOVE_API) = range(4)
-(ASKING_RISK_PERCENT, ASKING_MAX_LEVERAGE, ASKING_MIN_CONFIDENCE) = range(10, 13)
+(ASKING_ENTRY_PERCENT, ASKING_MAX_LEVERAGE, ASKING_MIN_CONFIDENCE) = range(10, 13)
 (ASKING_PROFIT_TARGET, ASKING_LOSS_LIMIT) = range(13, 15)
 
 logger = logging.getLogger(__name__)
@@ -634,42 +634,69 @@ async def user_settings_handler(update: Update, context: ContextTypes.DEFAULT_TY
     finally:
         db.close()
 
-async def ask_risk_percent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Pergunta ao usuário qual o novo percentual de risco."""
+async def ask_entry_percent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Pergunta ao usuário qual a nova porcentagem da banca por entrada."""
     query = update.callback_query
     await query.answer()
     
-    # Guarda o ID da mensagem para podermos editá-la ou apagá-la depois
     context.user_data['settings_message_id'] = query.message.message_id
     
     await query.edit_message_text(
-        "Por favor, envie o novo percentual de risco por trade.\n"
-        "Envie apenas o número (ex: `1.5` para 1.5%)."
+        "Envie a porcentagem da sua banca em USDT que você deseja usar para cada entrada.\n\n"
+        "Exemplo: se você tem $100 e define `10`, cada entrada terá o valor de $10.\n"
+        "Envie apenas o número (ex: `10` para 10%)."
     )
-    return ASKING_RISK_PERCENT
+    return ASKING_ENTRY_PERCENT
 
-async def receive_risk_percent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Recebe, valida e salva o novo percentual de risco."""
+async def receive_entry_percent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Recebe, valida e salva a nova porcentagem de entrada."""
     user_id = update.effective_user.id
     message_id_to_edit = context.user_data.get('settings_message_id')
+    
+    await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id)
 
     try:
-        risk_value = float(update.message.text.replace(',', '.'))
-        if not (0.1 <= risk_value <= 100):
-            raise ValueError("Valor fora do range permitido")
+        percent_value = float(update.message.text.replace(',', '.'))
+        if not (0.1 <= percent_value <= 100):
+            raise ValueError("Valor fora do range permitido (0.1 a 100)")
 
         db = SessionLocal()
         try:
             user = db.query(User).filter_by(telegram_id=user_id).first()
-            user.risk_per_trade_percent = risk_value
+            user.entry_size_percent = percent_value
             db.commit()
             
-            # Edita a mensagem original para mostrar o menu de configurações atualizado
+            # Busca o saldo atual para a mensagem de confirmação
+            api_key = decrypt_data(user.api_key_encrypted)
+            api_secret = decrypt_data(user.api_secret_encrypted)
+            account_info = await get_account_info(api_key, api_secret)
+            
+            usdt_balance = 0.0
+            if account_info.get("success"):
+                balances = account_info.get("data", [])
+                if balances:
+                    coin_list = balances[0].get('coin', [])
+                    for coin in coin_list:
+                        if coin.get('coin') == 'USDT':
+                            usdt_balance = float(coin.get('walletBalance', 0))
+                            break
+            
+            entry_value = usdt_balance * (percent_value / 100)
+            
+            feedback_text = (
+                f"✅ Tamanho da entrada atualizado para <b>{percent_value:.2f}%</b>.\n\n"
+                f"Com seu saldo atual, cada entrada será de aprox. <b>${entry_value:,.2f} USDT</b>."
+            )
+
+            # Adiciona o alerta de risco
+            if percent_value > 25:
+                feedback_text += "\n\n⚠️ <b>Atenção:</b> Uma porcentagem acima de 25% é considerada de altíssimo risco!"
+
             await context.bot.edit_message_text(
                 chat_id=update.effective_chat.id,
                 message_id=message_id_to_edit,
-                text=f"✅ Risco por trade atualizado para {risk_value:.2f}%.\n\n"
-                     "Selecione outra opção para editar ou volte.",
+                text=feedback_text,
+                parse_mode='HTML',
                 reply_markup=settings_menu_keyboard(user)
             )
         finally:
@@ -679,15 +706,11 @@ async def receive_risk_percent(update: Update, context: ContextTypes.DEFAULT_TYP
         await context.bot.edit_message_text(
             chat_id=update.effective_chat.id,
             message_id=message_id_to_edit,
-            text="❌ Valor inválido. Por favor, tente novamente com um número (ex: 1.5)."
+            text="❌ Valor inválido. Por favor, tente novamente com um número entre 0.1 e 100 (ex: 10)."
         )
-        # Permite que o usuário tente novamente sem sair da conversa
-        return ASKING_RISK_PERCENT
-    finally:
-        # Apaga a mensagem do usuário com o número
-        await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id)
+        return ASKING_ENTRY_PERCENT
 
-    return ConversationHandler.END # Finaliza a conversa
+    return ConversationHandler.END        
 
 async def ask_max_leverage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Pergunta ao usuário qual a nova alavancagem máxima."""

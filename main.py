@@ -11,7 +11,7 @@ from bot.handlers import (
     remove_api_prompt, remove_api_action, CONFIRM_REMOVE_API,
     my_positions_handler, user_dashboard_handler, user_settings_handler,
     back_to_main_menu_handler,
-    ask_risk_percent, receive_risk_percent, ASKING_RISK_PERCENT,
+    ask_entry_percent, receive_entry_percent, ASKING_ENTRY_PERCENT,
     ask_max_leverage, receive_max_leverage, ASKING_MAX_LEVERAGE,
     ask_min_confidence, receive_min_confidence, ASKING_MIN_CONFIDENCE,
     admin_menu, list_channels_handler, select_channel_to_monitor, select_topic_to_monitor,
@@ -68,9 +68,9 @@ async def main():
         states={ CONFIRM_REMOVE_API: [CallbackQueryHandler(remove_api_action, pattern='^remove_api_confirm|remove_api_cancel$')] },
         fallbacks=[CommandHandler("cancel", cancel)], per_message=False,
     )
-    settings_risk_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(ask_risk_percent, pattern='^set_risk_percent$')],
-        states={ ASKING_RISK_PERCENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_risk_percent)] },
+    settings_entry_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(ask_entry_percent, pattern='^set_entry_percent$')],
+        states={ ASKING_ENTRY_PERCENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_entry_percent)] },
         fallbacks=[CommandHandler("cancel", cancel)], per_message=False,
     )
     settings_leverage_conv = ConversationHandler(
@@ -98,7 +98,7 @@ async def main():
     application.add_handler(register_conv)
     application.add_handler(api_conv)
     application.add_handler(remove_api_conv)
-    application.add_handler(settings_risk_conv)
+    application.add_handler(settings_entry_conv)
     application.add_handler(settings_leverage_conv)
     application.add_handler(settings_confidence_conv)
     application.add_handler(profit_target_conv)
