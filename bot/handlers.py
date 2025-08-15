@@ -1,17 +1,21 @@
 import logging
 import asyncio
+from datetime import datetime, time, timedelta 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes, ConversationHandler
 from telegram.error import BadRequest
 from database.session import SessionLocal
 from database.models import User, InviteCode, MonitoredTarget, Trade, SignalForApproval
-from .keyboards import main_menu_keyboard, confirm_remove_keyboard, admin_menu_keyboard, dashboard_menu_keyboard, settings_menu_keyboard, view_targets_keyboard, bot_config_keyboard
+from .keyboards import (
+    main_menu_keyboard, confirm_remove_keyboard, admin_menu_keyboard, 
+    dashboard_menu_keyboard, settings_menu_keyboard, view_targets_keyboard, 
+    bot_config_keyboard, performance_menu_keyboard)
 from utils.security import encrypt_data, decrypt_data
 from services.bybit_service import get_open_positions, get_account_info, close_partial_position
 from utils.config import ADMIN_ID
-from core.report_service import generate_performance_report
 from database.crud import get_user_by_id
 from core.trade_manager import _execute_trade
+from core.performance_service import generate_performance_report
 
 # Estados para as conversas
 (WAITING_CODE, WAITING_API_KEY, WAITING_API_SECRET, CONFIRM_REMOVE_API) = range(4)
@@ -822,18 +826,6 @@ async def receive_min_confidence(update: Update, context: ContextTypes.DEFAULT_T
         # Mantém o usuário na mesma etapa para que ele possa tentar de novo
         return ASKING_MIN_CONFIDENCE
     
-async def report_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Envia o relatório de performance para o usuário."""
-    user_id = update.effective_user.id
-    
-    # Gera a mensagem do relatório chamando nossa nova função
-    report_text = generate_performance_report(user_id)
-    
-    await update.message.reply_text(
-        text=report_text,
-        parse_mode='HTML'
-    )
-
 async def manual_close_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Lida com o fechamento manual de uma posição pelo usuário."""
     query = update.callback_query
@@ -1088,3 +1080,44 @@ async def receive_loss_limit(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return ASKING_LOSS_LIMIT
 
     return ConversationHandler.END
+
+# --- MENU DE DESEMPENHO ---
+
+async def performance_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Exibe o painel de desempenho e lida com a seleção de período."""
+    query = update.callback_query
+    await query.answer()
+
+    # Determina o período com base no botão clicado
+    callback_data = query.data
+    now = datetime.now()
+    start_dt, end_dt = None, None
+
+    if callback_data == 'perf_today':
+        start_dt = datetime.combine(now.date(), time.min)
+        end_dt = now
+    elif callback_data == 'perf_yesterday':
+        yesterday = now.date() - timedelta(days=1)
+        start_dt = datetime.combine(yesterday, time.min)
+        end_dt = datetime.combine(yesterday, time.max)
+    elif callback_data == 'perf_7_days':
+        start_dt = datetime.combine(now.date() - timedelta(days=6), time.min)
+        end_dt = now
+    elif callback_data == 'perf_30_days':
+        start_dt = datetime.combine(now.date() - timedelta(days=29), time.min)
+        end_dt = now
+
+    if start_dt and end_dt:
+        await query.edit_message_text(
+            text="⏳ Calculando desempenho para o período selecionado...",
+            reply_markup=performance_menu_keyboard()
+        )
+        
+        # Chama o serviço para gerar o relatório
+        report_text = await generate_performance_report(start_dt, end_dt)
+        
+        await query.edit_message_text(
+            text=report_text,
+            parse_mode='HTML',
+            reply_markup=performance_menu_keyboard()
+        )

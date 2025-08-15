@@ -135,20 +135,20 @@ async def get_open_positions(api_key: str, api_secret: str) -> dict:
             return {"success": False, "data": [], "error": str(e)}
     return await asyncio.to_thread(_sync_call)
 
-async def get_daily_pnl(api_key: str, api_secret: str) -> dict:
-    """Busca o P/L (Lucro/Prejuízo) realizado para o dia atual."""
+async def get_pnl_for_period(api_key: str, api_secret: str, start_time: datetime, end_time: datetime) -> dict:
+    """Busca o P/L (Lucro/Prejuízo) realizado para um período de tempo específico."""
     def _sync_call():
         try:
             session = get_session(api_key, api_secret)
             
-            # Define o início do dia de hoje (meia-noite) em milissegundos
-            today_start_dt = datetime.combine(datetime.today(), time.min)
-            start_timestamp_ms = int(today_start_dt.timestamp() * 1000)
+            start_timestamp_ms = int(start_time.timestamp() * 1000)
+            end_timestamp_ms = int(end_time.timestamp() * 1000)
 
             response = session.get_closed_pnl(
                 category="linear",
                 startTime=start_timestamp_ms,
-                limit=100 # Limite de trades fechados para buscar
+                endTime=end_timestamp_ms,
+                limit=200 # Aumentar o limite para buscar mais trades em períodos longos
             )
 
             if response.get('retCode') == 0:
@@ -157,11 +157,18 @@ async def get_daily_pnl(api_key: str, api_secret: str) -> dict:
                 return {"success": True, "pnl": total_pnl}
             else:
                 error_msg = response.get('retMsg', 'Erro desconhecido ao buscar P/L.')
-                logger.error(f"Erro da API Bybit ao buscar P/L diário: {error_msg}")
+                logger.error(f"Erro da API Bybit ao buscar P/L: {error_msg}")
                 return {"success": False, "error": error_msg}
 
         except Exception as e:
-            logger.error(f"Exceção em get_daily_pnl: {e}", exc_info=True)
+            logger.error(f"Exceção em get_pnl_for_period: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
     return await asyncio.to_thread(_sync_call)
+
+
+async def get_daily_pnl(api_key: str, api_secret: str) -> dict:
+    """Busca o P/L realizado para o dia atual (agora usa a função genérica)."""
+    today_start = datetime.combine(datetime.today(), time.min)
+    now = datetime.now()
+    return await get_pnl_for_period(api_key, api_secret, today_start, now)

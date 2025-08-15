@@ -11,11 +11,14 @@ def main_menu_keyboard(telegram_id: int):
 
     keyboard = []
     if has_api_keys:
-        keyboard.append([InlineKeyboardButton("📊 Minhas Posições", callback_data='user_positions')])
-        keyboard.append([InlineKeyboardButton("⚙️ Configurações de Trade", callback_data='user_settings')])
-        # --- NOVO BOTÃO ---
-        keyboard.append([InlineKeyboardButton("🤖 Configuração do Bot", callback_data='bot_config')])
         keyboard.append([InlineKeyboardButton("ℹ️ Meu Painel", callback_data='user_dashboard')])
+        keyboard.append([InlineKeyboardButton("📊 Minhas Posições", callback_data='user_positions')])
+        
+        # --- BOTÃO ADICIONADO AQUI ---
+        keyboard.append([InlineKeyboardButton("📈 Desempenho", callback_data='perf_today')])
+        
+        keyboard.append([InlineKeyboardButton("⚙️ Configurações de Trade", callback_data='user_settings')])
+        keyboard.append([InlineKeyboardButton("🤖 Configuração do Bot", callback_data='bot_config')])
     else:
         keyboard.append([InlineKeyboardButton("⚙️ Configurar API Bybit", callback_data='config_api')])
 
@@ -109,5 +112,22 @@ def signal_approval_keyboard(signal_for_approval_id: int):
             InlineKeyboardButton("✅ Aprovar Entrada", callback_data=f'approve_signal_{signal_for_approval_id}'),
             InlineKeyboardButton("❌ Rejeitar", callback_data=f'reject_signal_{signal_for_approval_id}')
         ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def performance_menu_keyboard():
+    """
+    Retorna o teclado para o menu de análise de desempenho com filtros de período.
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("Hoje", callback_data='perf_today'),
+            InlineKeyboardButton("Ontem", callback_data='perf_yesterday')
+        ],
+        [
+            InlineKeyboardButton("Últimos 7 Dias", callback_data='perf_7_days'),
+            InlineKeyboardButton("Últimos 30 Dias", callback_data='perf_30_days')
+        ],
+        [InlineKeyboardButton("⬅️ Voltar ao Menu Principal", callback_data='back_to_main_menu')]
     ]
     return InlineKeyboardMarkup(keyboard)

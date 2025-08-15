@@ -15,10 +15,11 @@ from bot.handlers import (
     ask_max_leverage, receive_max_leverage, ASKING_MAX_LEVERAGE,
     ask_min_confidence, receive_min_confidence, ASKING_MIN_CONFIDENCE,
     admin_menu, list_channels_handler, select_channel_to_monitor, select_topic_to_monitor,
-    report_handler, manual_close_handler, admin_view_targets_handler, back_to_admin_menu_handler,
+    manual_close_handler, admin_view_targets_handler, back_to_admin_menu_handler,
     bot_config_handler, toggle_approval_mode_handler, handle_signal_approval, 
     ask_profit_target, receive_profit_target, ASKING_PROFIT_TARGET,
-    ask_loss_limit, receive_loss_limit, ASKING_LOSS_LIMIT
+    ask_loss_limit, receive_loss_limit, ASKING_LOSS_LIMIT, 
+    performance_menu_handler
 )
 from database.session import init_db
 from services.telethon_service import start_signal_monitor
@@ -112,13 +113,14 @@ async def main():
     application.add_handler(CallbackQueryHandler(back_to_admin_menu_handler, pattern='^back_to_admin_menu$'))
 
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("relatorio", report_handler))
     
     application.add_handler(CallbackQueryHandler(my_positions_handler, pattern='^user_positions$'))
     application.add_handler(CallbackQueryHandler(user_settings_handler, pattern='^user_settings$'))
     application.add_handler(CallbackQueryHandler(user_dashboard_handler, pattern='^user_dashboard$'))
     application.add_handler(CallbackQueryHandler(back_to_main_menu_handler, pattern='^back_to_main_menu$'))
     application.add_handler(CallbackQueryHandler(manual_close_handler, pattern='^manual_close_'))
+
+    application.add_handler(CallbackQueryHandler(performance_menu_handler, pattern='^perf_'))
 
     application.add_handler(CallbackQueryHandler(bot_config_handler, pattern='^bot_config$'))
     application.add_handler(CallbackQueryHandler(toggle_approval_mode_handler, pattern='^toggle_approval_mode$'))
