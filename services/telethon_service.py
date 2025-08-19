@@ -1,5 +1,3 @@
-
-
 import logging
 import asyncio
 import os
@@ -8,7 +6,7 @@ from telegram.ext import Application
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telethon.sync import TelegramClient
 from telethon import events
-from telethon.errors.rpcerrorlist import ChannelForumMissingError
+from telethon.errors.rpcerrorlist import ChannelForumMissingError, ChannelInvalidError
 from telethon.tl.functions.channels import GetForumTopicsRequest
 from utils.config import API_ID, API_HASH
 from database.session import SessionLocal
@@ -26,6 +24,9 @@ else:
 # --- DEFINIÇÃO ÚNICA E CORRETA DO CLIENTE ---
 client = TelegramClient(SESSION_PATH, API_ID, API_HASH)
 comm_queue = None
+# Cache em memória para armazenar os IDs das mensagens já processadas e evitar duplicidade.
+PROCESSED_MESSAGE_IDS = set()
+
 
 # --- Funções de Busca (Helpers) ---
 
@@ -45,7 +46,6 @@ async def list_channels():
     try:
         async for dialog in client.iter_dialogs():
             count += 1
-            # A cada 50 chats processados, ele vai imprimir um log de progresso
             if count % 50 == 0:
                 logger.info(f"[list_channels] ... processou {count} diálogos...")
             
@@ -68,16 +68,16 @@ async def list_channel_topics(channel_id: int):
         ))
         for topic in result.topics:
             topics.append((topic.title, topic.id))
-    except ChannelForumMissingError:
+            
+    except (ChannelForumMissingError, ChannelInvalidError):
         logger.warning(f"Canal {channel_id} não possui tópicos (não é um fórum).")
+        
     except Exception as e:
         logger.error(f"Exceção em list_channel_topics para o canal {channel_id}: {e}", exc_info=True)
+        
     return topics
 
 # --- Listener de Sinais ---
-# Um padrão regex para pré-filtrar mensagens. Ele só aciona o handler
-# se a mensagem contiver o emoji de diamante e a palavra "Moeda".
-# Isso reduz drasticamente o número de eventos que o bot precisa processar.
 SIGNAL_PATTERN = re.compile(r'💎\s*Moeda:', re.IGNORECASE)
 
 @client.on(events.NewMessage(pattern=SIGNAL_PATTERN))
@@ -89,16 +89,19 @@ async def signal_listener(event):
     """
     global comm_queue
     
-    # --- VERIFICAÇÃO FINAL E CORREÇÃO ---
-    # Garante que o evento é do tipo que contém uma mensagem de texto (Message).
-    # Isso ignora com segurança outros eventos como status de usuário, enquetes, etc.
     if not isinstance(event, (events.NewMessage.Event, events.MessageEdited.Event)):
         return
         
     if not event or not event.text or not comm_queue:
         return
 
-    # A partir daqui, o código está seguro, pois sabemos que 'event' é uma mensagem.
+    # Lógica para prevenir o processamento duplicado de sinais editados.
+    message_id = event.message.id
+    if message_id in PROCESSED_MESSAGE_IDS:
+        logger.info(f"Sinal com ID de mensagem {message_id} já processado (evento de edição/duplicado). Ignorando.")
+        return
+    PROCESSED_MESSAGE_IDS.add(message_id)
+
     monitored_targets = get_monitored_targets()
     if not monitored_targets:
         return
@@ -113,7 +116,7 @@ async def signal_listener(event):
     )
 
     if is_target:
-        logger.info(f"Potencial sinal detectado no alvo (Canal: {chat_id}). Adicionando à fila.")
+        logger.info(f"Potencial sinal detectado no alvo (Canal: {chat_id}, Msg ID: {message_id}). Adicionando à fila.")
         await comm_queue.put({
             "action": "process_signal",
             "signal_text": event.text
@@ -142,10 +145,12 @@ async def queue_processor(queue: asyncio.Queue, ptb_app: Application):
                 monitored_channels_ids = {target.channel_id for target in db.query(MonitoredTarget).all()}
                 db.close()
                 keyboard = []
+                
                 if channels:
                     for channel_name, channel_id in channels:
                         suffix = " ✅" if channel_id in monitored_channels_ids else ""
                         keyboard.append([InlineKeyboardButton(f"{channel_name}{suffix}", callback_data=f"monitor_channel_{channel_id}")])
+                
                 if keyboard:
                     await ptb_app.bot.edit_message_text(
                         chat_id=chat_id, message_id=message_id,
@@ -155,7 +160,6 @@ async def queue_processor(queue: asyncio.Queue, ptb_app: Application):
                 else:
                     await ptb_app.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="Nenhum canal ou supergrupo encontrado.")
 
-            # --- LÓGICA COMPLETA PARA LISTAR TÓPICOS ---
             elif action == "list_topics":
                 logger.info("[Queue Processor] ... Entrou no bloco de 'list_topics'.")
                 channel_id = request.get("channel_id")
@@ -166,43 +170,41 @@ async def queue_processor(queue: asyncio.Queue, ptb_app: Application):
                 topics = await list_channel_topics(channel_id)
                 db = SessionLocal()
                 
-                if topics:
-                    monitored_topic_ids = {t.topic_id for t in db.query(MonitoredTarget).filter_by(channel_id=channel_id).all() if t.topic_id}
-                    keyboard = [[InlineKeyboardButton("⬅️ Voltar para Grupos", callback_data="admin_list_channels")]]
-                    for name, topic_id in topics:
-                        suffix = " ✅" if topic_id in monitored_topic_ids else ""
-                        keyboard.append([InlineKeyboardButton(f"{name}{suffix}", callback_data=f"monitor_topic_{channel_id}_{topic_id}")])
-                    
-                    await ptb_app.bot.edit_message_text(
-                        chat_id=chat_id, message_id=message_id,
-                        text="Selecione o tópico para monitorar (✅ = já monitorado):",
-                        reply_markup=InlineKeyboardMarkup(keyboard)
-                    )
-                else:
-                    # Lógica para canais sem tópicos (adicionar/remover da lista de monitoramento)
-                    existing = db.query(MonitoredTarget).filter_by(channel_id=channel_id, topic_id=None).first()
-                    if existing:
-                        db.delete(existing)
-                        feedback_msg = f"❌ Canal '{channel_name}' removido da lista de monitoramento."
+                try:
+                    if topics:
+                        monitored_topic_ids = {t.topic_id for t in db.query(MonitoredTarget).filter_by(channel_id=channel_id).all() if t.topic_id}
+                        keyboard = [[InlineKeyboardButton("⬅️ Voltar para Grupos", callback_data="admin_list_channels")]]
+                        for name, topic_id in topics:
+                            suffix = " ✅" if topic_id in monitored_topic_ids else ""
+                            keyboard.append([InlineKeyboardButton(f"{name}{suffix}", callback_data=f"monitor_topic_{channel_id}_{topic_id}")])
+                        
+                        await ptb_app.bot.edit_message_text(
+                            chat_id=chat_id, message_id=message_id,
+                            text="Selecione o tópico para monitorar (✅ = já monitorado):",
+                            reply_markup=InlineKeyboardMarkup(keyboard)
+                        )
                     else:
-                        new_target = MonitoredTarget(channel_id=channel_id, channel_name=channel_name)
-                        db.add(new_target)
-                        feedback_msg = f"✅ Canal '{channel_name}' adicionado à lista de monitoramento."
-                    
-                    db.commit()
-                    await ptb_app.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=feedback_msg)
-                
-                db.close()
+                        existing = db.query(MonitoredTarget).filter_by(channel_id=channel_id, topic_id=None).first()
+                        if existing:
+                            db.delete(existing)
+                            feedback_msg = f"❌ Canal '{channel_name}' removido da lista de monitoramento."
+                        else:
+                            new_target = MonitoredTarget(channel_id=channel_id, channel_name=channel_name)
+                            db.add(new_target)
+                            feedback_msg = f"✅ Canal '{channel_name}' adicionado à lista de monitoramento."
+                        
+                        db.commit()
+                        await ptb_app.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=feedback_msg)
+                finally:
+                    db.close()
 
             elif action == "process_signal":
                 logger.info("[Queue Processor] ... Entrou no bloco de 'process_signal'.")
                 signal_text = request.get("signal_text")
-                # --- MUDANÇA: Pega o nome da fonte do pedido ---
                 source_name = request.get("source_name", "Fonte Desconhecida")
                 
                 signal_data = parse_signal(signal_text)
                 if signal_data:
-                    # Passa o nome da fonte para o processador de trades
                     await process_new_signal(signal_data, ptb_app, source_name)
                 else:
                     logger.info("Mensagem da fila não é um sinal válido.")
@@ -222,18 +224,14 @@ async def start_signal_monitor(queue: asyncio.Queue):
     """Inicia o cliente Telethon, o ouvinte de sinais e o processador da fila."""
     logger.info("Iniciando monitor de sinais com Telethon...")
     
-    # Adiciona o ouvinte de mensagens ao cliente
     client.add_event_handler(signal_listener)
     
-    # Conecta o cliente Telethon
     await client.start()
     
-    # Pega a instância da aplicação do bot que foi colocada na fila no main.py
     ptb_app = await queue.get()
 
     logger.info("✅ Monitor de sinais e processador de fila ativos.")
     
-    # Inicia o processador da fila como uma tarefa de fundo
     asyncio.create_task(queue_processor(queue, ptb_app))
     
     await client.run_until_disconnected()

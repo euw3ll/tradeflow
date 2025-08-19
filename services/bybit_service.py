@@ -3,6 +3,7 @@ import asyncio
 from typing import Dict
 from datetime import datetime, time
 from pybit.unified_trading import HTTP
+from pybit.exceptions import InvalidRequestError
 from database.models import User
 
 logger = logging.getLogger(__name__)
@@ -31,7 +32,7 @@ async def get_account_info(api_key: str, api_secret: str) -> dict:
     return await asyncio.to_thread(_sync_call)
 
 async def place_order(api_key: str, api_secret: str, signal_data: dict, user_settings: User, balance: float) -> dict:
-    """Abre uma nova posição de forma assíncrona."""
+    """Abre uma nova posição a mercado de forma assíncrona."""
     def _sync_call():
         try:
             session = get_session(api_key, api_secret)
@@ -42,16 +43,31 @@ async def place_order(api_key: str, api_secret: str, signal_data: dict, user_set
             stop_loss_price = str(signal_data['stop_loss'])
             take_profit_price = str(signal_data['targets'][0]) if signal_data.get('targets') else None
             
-            # --- LÓGICA DE CÁLCULO DE TAMANHO DA ORDEM ATUALIZADA ---
             entry_percent = user_settings.entry_size_percent
             position_size_dollars = balance * (entry_percent / 100)
-            
-            # Arredonda a quantidade para o número de casas decimais correto para a Bybit
-            qty = round(position_size_dollars / entry_price, 3) 
-            
-            logger.info(f"Calculando ordem para {symbol}: Side={side}, Qty={qty}, Leverage={leverage}, Size=${position_size_dollars:.2f}")
+            unrounded_qty = position_size_dollars / entry_price
 
-            session.set_leverage(category="linear", symbol=symbol, buyLeverage=leverage, sellLeverage=leverage)
+            # --- LÓGICA DE PRECISÃO DE QUANTIDADE ADICIONADA ---
+            # Para moedas de preço baixo (como XRP), a quantidade deve ser um número inteiro.
+            # Para moedas de preço alto (como BTC), precisamos de casas decimais.
+            if entry_price < 2.0: # Regra simples: se o preço for menor que $2, trata como inteiro
+                qty = int(unrounded_qty)
+            else:
+                qty = round(unrounded_qty, 5)
+
+            if qty == 0:
+                return {"success": False, "error": "Quantidade calculada é zero. Verifique o saldo ou a % de entrada."}
+
+            logger.info(f"Calculando ordem A MERCADO para {symbol}: Side={side}, Qty={qty}, Size=${position_size_dollars:.2f}")
+
+            try:
+                session.set_leverage(category="linear", symbol=symbol, buyLeverage=leverage, sellLeverage=leverage)
+            except InvalidRequestError as e:
+                if "leverage not modified" in str(e):
+                    logger.warning(f"Alavancagem para {symbol} já está correta. Continuando...")
+                    pass
+                else:
+                    raise e
 
             response = session.place_order(
                 category="linear", symbol=symbol, side=side, orderType="Market",
@@ -65,6 +81,7 @@ async def place_order(api_key: str, api_secret: str, signal_data: dict, user_set
             logger.error(f"Exceção ao abrir ordem: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
     return await asyncio.to_thread(_sync_call)
+
     
 async def get_market_price(symbol: str) -> dict:
     """Busca o preço de mercado atual de forma assíncrona."""
@@ -187,25 +204,34 @@ async def place_limit_order(api_key: str, api_secret: str, signal_data: dict, us
             stop_loss_price = str(signal_data['stop_loss'])
             take_profit_price = str(signal_data['targets'][0]) if signal_data.get('targets') else None
 
-            # Lógica de cálculo de tamanho da ordem (a mesma que já usamos)
             entry_percent = user_settings.entry_size_percent
             position_size_dollars = balance * (entry_percent / 100)
-            qty = round(position_size_dollars / entry_price, 3)
-            
+            unrounded_qty = position_size_dollars / entry_price
+
+            # --- LÓGICA DE PRECISÃO DE QUANTIDADE ADICIONADA ---
+            if entry_price < 2.0:
+                qty = int(unrounded_qty)
+            else:
+                qty = round(unrounded_qty, 5)
+
+            if qty == 0:
+                return {"success": False, "error": "Quantidade calculada é zero. Verifique o saldo ou a % de entrada."}
+
             logger.info(f"Calculando ORDEM LIMITE para {symbol}: Side={side}, Qty={qty}, Price={entry_price}")
 
-            session.set_leverage(category="linear", symbol=symbol, buyLeverage=leverage, sellLeverage=leverage)
+            try:
+                session.set_leverage(category="linear", symbol=symbol, buyLeverage=leverage, sellLeverage=leverage)
+            except InvalidRequestError as e:
+                if "leverage not modified" in str(e):
+                    logger.warning(f"Alavancagem para {symbol} já está correta. Continuando...")
+                    pass
+                else:
+                    raise e
 
             response = session.place_order(
-                category="linear",
-                symbol=symbol,
-                side=side,
-                orderType="Limit", # <-- TIPO DE ORDEM
-                qty=str(qty),
-                price=str(entry_price), # <-- PREÇO DE ENTRADA
-                takeProfit=take_profit_price,
-                stopLoss=stop_loss_price,
-                isLeverage=1
+                category="linear", symbol=symbol, side=side, orderType="Limit",
+                qty=str(qty), price=str(entry_price),
+                takeProfit=take_profit_price, stopLoss=stop_loss_price, isLeverage=1
             )
             if response.get('retCode') == 0:
                 return {"success": True, "data": response['result']}
@@ -216,24 +242,33 @@ async def place_limit_order(api_key: str, api_secret: str, signal_data: dict, us
             return {"success": False, "error": str(e)}
     return await asyncio.to_thread(_sync_call)
 
-
 # --- FUNÇÃO PARA VERIFICAR STATUS DE UMA ORDEM ---
 async def get_order_status(api_key: str, api_secret: str, order_id: str, symbol: str) -> dict:
-    """Verifica o status de uma ordem específica na Bybit."""
+    """Verifica o status de uma ordem específica na Bybit, procurando em ordens abertas."""
     def _sync_call():
         try:
             session = get_session(api_key, api_secret)
-            response = session.get_order_history(
+            # --- CORREÇÃO: MUDAMOS PARA get_open_orders ---
+            response = session.get_open_orders(
                 category="linear",
+                symbol=symbol,
                 orderId=order_id,
-                # symbol=symbol # Opcional, mas ajuda a refinar a busca
             )
             if response.get('retCode') == 0:
                 order_list = response.get('result', {}).get('list', [])
                 if order_list:
-                    # Retorna o primeiro resultado, que deve ser nossa ordem
+                    # A ordem foi encontrada na lista de ordens abertas
                     return {"success": True, "data": order_list[0]}
-                return {"success": False, "error": "Ordem não encontrada no histórico."}
+                else:
+                    # Se não está nas ordens abertas, pode já ter sido executada ou cancelada.
+                    # Por segurança, vamos verificar o histórico também.
+                    hist_response = session.get_order_history(category="linear", orderId=order_id)
+                    if hist_response.get('retCode') == 0:
+                        hist_list = hist_response.get('result', {}).get('list', [])
+                        if hist_list:
+                            return {"success": True, "data": hist_list[0]}
+                    
+                    return {"success": False, "error": "Ordem não encontrada nem nas abertas nem no histórico."}
             else:
                 return {"success": False, "error": response.get('retMsg')}
         except Exception as e:

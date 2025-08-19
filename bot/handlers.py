@@ -1,5 +1,7 @@
 import logging
 import asyncio
+from database.models import PendingSignal
+from services.bybit_service import place_limit_order, get_account_info
 from datetime import datetime, time, timedelta 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes, ConversationHandler
@@ -16,6 +18,7 @@ from utils.config import ADMIN_ID
 from database.crud import get_user_by_id
 from core.trade_manager import _execute_trade
 from core.performance_service import generate_performance_report
+from core.trade_manager import execute_signal_for_all_users
 
 # Estados para as conversas
 (WAITING_CODE, WAITING_API_KEY, WAITING_API_SECRET, CONFIRM_REMOVE_API) = range(4)
@@ -88,7 +91,6 @@ async def config_api(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         "   - <b>Contrato</b> (`Contract`): ✅ `Ordens` e ✅ `Posições`\n"
         "   - <b>Trading Unificado</b> (`UTA`): ✅ `Trade`\n\n"
         "5️⃣  🛡️ <b>MUITO IMPORTANTE:</b> Por segurança, <b>NÃO</b> marque a permissão de <i>'Saque' (Withdraw)</i>.\n\n"
-        # --- NOVA LINHA DE AVISO ---
         "⚠️ <b>Atenção:</b> Este bot opera exclusivamente com pares de trade terminados em **USDT**.\n\n"
         "6️⃣  Conclua a verificação de segurança e copie sua <b>API Key</b> e <b>API Secret</b>.\n\n"
         "-------------------------------------\n"
@@ -103,7 +105,6 @@ async def config_api(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def receive_api_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Recebe a API Key, apaga a mensagem do usuário e pede a API Secret."""
-    # Apaga a mensagem do usuário que contém a chave
     await context.bot.delete_message(
         chat_id=update.effective_chat.id,
         message_id=update.message.message_id
@@ -112,25 +113,21 @@ async def receive_api_key(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     api_key = update.message.text
     context.user_data['api_key'] = api_key
     
-    # Envia a próxima pergunta e guarda a mensagem para apagar depois
     prompt_message = await update.message.reply_text(
         "Chave API recebida com segurança. Agora, por favor, envie sua *API Secret*.",
         parse_mode='Markdown'
     )
-    # Guarda o ID da mensagem do bot para o próximo passo
     context.user_data['prompt_message_id'] = prompt_message.message_id
     
     return WAITING_API_SECRET
 
 async def receive_api_secret(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Recebe a API Secret, apaga as mensagens, criptografa e salva no banco."""
-    # Apaga a mensagem do usuário que contém o segredo
     await context.bot.delete_message(
         chat_id=update.effective_chat.id,
         message_id=update.message.message_id
     )
 
-    # Apaga a pergunta anterior do bot ("...envie sua API Secret")
     prompt_message_id = context.user_data.get('prompt_message_id')
     if prompt_message_id:
         await context.bot.delete_message(
@@ -142,7 +139,6 @@ async def receive_api_secret(update: Update, context: ContextTypes.DEFAULT_TYPE)
     api_key = context.user_data.get('api_key')
     telegram_id = update.effective_user.id
 
-    # Criptografa e salva as chaves no banco (lógica existente)
     encrypted_key = encrypt_data(api_key)
     encrypted_secret = encrypt_data(api_secret)
 
@@ -154,13 +150,11 @@ async def receive_api_secret(update: Update, context: ContextTypes.DEFAULT_TYPE)
             user_to_update.api_secret_encrypted = encrypted_secret
             db.commit()
             
-            # Edita a mensagem original do menu para a confirmação final
             await context.bot.edit_message_text(
                 chat_id=update.effective_chat.id,
-                message_id=context.user_data['entry_message_id'], # ID da mensagem do menu
+                message_id=context.user_data['entry_message_id'],
                 text="✅ Suas chaves de API foram salvas com sucesso!",
             )
-            # Envia um novo menu principal
             await context.bot.send_message(
                 chat_id=telegram_id,
                 text="Menu Principal:",
@@ -203,7 +197,6 @@ async def remove_api_action(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     else: # Cancelou
         await query.edit_message_text("Operação cancelada.")
 
-    # Envia um novo menu principal atualizado
     await context.bot.send_message(
         chat_id=telegram_id,
         text="Menu Principal:",
@@ -269,7 +262,6 @@ async def user_dashboard_handler(update: Update, context: ContextTypes.DEFAULT_T
         
         message = "<b>ℹ️ Seu Painel de Controle</b>\n\n"
         
-        # --- MELHORIA DE LAYOUT APLICADA AQUI ---
         message += "<b>Saldos na Carteira:</b>\n"
         
         if account_info.get("success"):
@@ -308,8 +300,7 @@ async def user_dashboard_handler(update: Update, context: ContextTypes.DEFAULT_T
         else:
             message += f"Erro ao buscar saldo: {account_info.get('error')}\n"
         
-        # --- MELHORIA DE LAYOUT APLICADA AQUI ---
-        message += "\n\n" # Adiciona espaço extra antes da próxima seção
+        message += "\n\n"
         
         message += "<b>Posições Abertas:</b>\n"
         if positions_info.get("success") and positions_info.get("data"):
@@ -413,7 +404,6 @@ async def list_channels_handler(update: Update, context: ContextTypes.DEFAULT_TY
     
     await comm_queue.put(request_data)
     
-    # --- MENSAGEM MODIFICADA ---
     await query.edit_message_text("Buscando sua lista de canais... Se você tiver muitos grupos, isso pode levar até um minuto. Por favor, aguarde.")
     
 async def select_channel_to_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -428,7 +418,6 @@ async def select_channel_to_monitor(update: Update, context: ContextTypes.DEFAUL
 
     channel_id = int(query.data.split('_')[-1])
     
-    # Encontra o nome do canal a partir do botão clicado
     channel_name = ""
     for row in query.message.reply_markup.inline_keyboard:
         for button in row:
@@ -441,7 +430,7 @@ async def select_channel_to_monitor(update: Update, context: ContextTypes.DEFAUL
         "chat_id": query.message.chat_id,
         "message_id": query.message.message_id,
         "channel_id": channel_id,
-        "channel_name": channel_name # --- Enviando o nome do canal ---
+        "channel_name": channel_name
     }
     
     await comm_queue.put(request_data)
@@ -450,7 +439,7 @@ async def select_channel_to_monitor(update: Update, context: ContextTypes.DEFAUL
 async def select_topic_to_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Salva/remove o tópico e pede para a fila recarregar o menu de tópicos."""
     query = update.callback_query
-    await query.answer() # Responde ao clique imediatamente para o ícone de 'carregando' sumir
+    await query.answer() 
 
     comm_queue = context.application.bot_data.get('comm_queue')
     if not comm_queue:
@@ -460,7 +449,6 @@ async def select_topic_to_monitor(update: Update, context: ContextTypes.DEFAULT_
     user_id = update.effective_user.id
     if user_id != ADMIN_ID: return
 
-    # Extrai os IDs do callback_data
     _, _, channel_id_str, topic_id_str = query.data.split('_')
     channel_id = int(channel_id_str)
     topic_id = int(topic_id_str)
@@ -470,10 +458,8 @@ async def select_topic_to_monitor(update: Update, context: ContextTypes.DEFAULT_
         existing_target = db.query(MonitoredTarget).filter_by(channel_id=channel_id, topic_id=topic_id).first()
         
         if existing_target:
-            # Se já existe, remove da lista
             db.delete(existing_target)
         else:
-            # Se não existe, adiciona na lista
             topic_name = ""
             for row in query.message.reply_markup.inline_keyboard:
                 for button in row:
@@ -487,137 +473,22 @@ async def select_topic_to_monitor(update: Update, context: ContextTypes.DEFAULT_
     finally:
         db.close()
 
-    # --- LÓGICA DE RECARREGAMENTO ---
-    # Cria um novo "pedido" para a fila, para listar os tópicos do mesmo canal novamente.
-    # O processador da fila vai receber isso e redesenhar o menu.
     request_data = {
         "action": "list_topics",
         "chat_id": query.message.chat_id,
         "message_id": query.message.message_id,
         "channel_id": channel_id,
-        "channel_name": "" # Não é necessário aqui, pois estamos apenas listando tópicos
+        "channel_name": ""
     }
     await comm_queue.put(request_data)
 
 async def back_to_channels_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Retorna o usuário para a lista de canais/grupos."""
-    # Simplesmente chama a função que já lista os canais
     await list_channels_handler(update, context)
 
-    async def my_dashboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Exibe um painel completo com informações da conta, posições e monitoramentos."""
-        query = update.callback_query
-        await query.answer()
-        await query.edit_message_text("Buscando informações do seu painel, aguarde...")
-
-        user_id = update.effective_user.id
-        db = SessionLocal()
-        
-        try:
-            user = db.query(User).filter_by(telegram_id=user_id).first()
-            if not user or not user.api_key_encrypted:
-                await query.edit_message_text("Você precisa configurar suas chaves de API primeiro.", reply_markup=main_menu_keyboard(user_id))
-                return
-
-            api_key = decrypt_data(user.api_key_encrypted)
-            api_secret = decrypt_data(user.api_secret_encrypted)
-
-            # 1. Buscar Saldo da Conta
-            account_info = get_account_info(api_key, api_secret)
-            
-            # 2. Buscar Posições Abertas na Bybit
-            positions_info = get_open_positions(api_key, api_secret)
-            
-            # 3. Buscar Alvos Monitorados no nosso DB
-            monitored_targets = db.query(MonitoredTarget).all()
-
-            # --- Montagem da Mensagem ---
-            message = "<b>Seu Painel de Controle</b>\n\n"
-
-            # Seção de Saldo
-            if account_info.get("success"):
-                balance = float(account_info['data']['totalEquity'])
-                message += f"<b>Conta Bybit:</b>\n- Saldo Total: ${balance:,.2f}\n\n"
-            else:
-                message += "<b>Conta Bybit:</b>\n- Erro ao buscar saldo.\n\n"
-
-            # Seção de Posições Abertas
-            message += "<b>Posições Abertas:</b>\n"
-            if positions_info.get("success") and positions_info.get("data"):
-                for pos in positions_info["data"]:
-                    pnl_percent = float(pos.get('unrealisedPnl', '0')) / (float(pos.get('avgPrice', '1')) * float(pos.get('size', '1'))) * 100 if pos.get('avgPrice') and pos.get('size') else 0
-                    message += f"- {pos['symbol']} ({pos['side']}): {pos['size']} | P/L: ${float(pos.get('unrealisedPnl', '0')):,.2f} ({pnl_percent:.2f}%)\n"
-            else:
-                message += "- Nenhuma posição aberta no momento.\n\n"
-
-            # Seção de Monitoramentos
-            message += "<b>Alvos Monitorados:</b>\n"
-            if monitored_targets:
-                for target in monitored_targets:
-                    if target.topic_id:
-                        message += f"- {target.channel_name or 'Grupo'} | Tópico: {target.topic_name}\n"
-                    else:
-                        message += f"- Canal/Grupo: {target.channel_name}\n"
-            else:
-                message += "- Nenhum alvo sendo monitorado."
-
-            await query.edit_message_text(message, parse_mode='HTML')
-
-        except Exception as e:
-            logger.error(f"Erro ao montar o painel: {e}")
-            await query.edit_message_text("Ocorreu um erro ao buscar os dados do seu painel.")
-        finally:
-            db.close()
-
-async def my_positions_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Exibe as posições ativas com botões para gerenciamento manual."""
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text("Buscando suas posições gerenciadas...")
-
-    user_id = update.effective_user.id
-    db = SessionLocal()
-    try:
-        # Busca os trades que o bot abriu e que não estão fechados
-        active_trades = db.query(Trade).filter(
-            Trade.user_telegram_id == user_id, 
-            ~Trade.status.like('%CLOSED%')
-        ).all()
-        
-        message = "<b>📊 Suas Posições Ativas (Gerenciadas pelo Bot)</b>\n\n"
-        keyboard = [] # Vamos construir o teclado dinamicamente
-
-        if active_trades:
-            for trade in active_trades:
-                side_emoji = "🔼" if trade.side == 'LONG' else "🔽"
-                message += f"- {side_emoji} {trade.symbol} ({trade.qty} unid.)\n"
-                message += f"  Entrada: ${trade.entry_price:,.4f} | Status: {trade.status}\n\n"
-                
-                # Adiciona um botão para cada trade, passando o ID do trade no callback
-                keyboard.append([
-                    InlineKeyboardButton(f"Fechar {trade.symbol} ❌", callback_data=f"manual_close_{trade.id}")
-                ])
-        else:
-            message += "Nenhuma posição sendo gerenciada no momento."
-        
-        # Adiciona o botão de voltar ao menu principal
-        keyboard.append([InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data='back_to_main_menu')])
-        
-        reply_markup=main_menu_keyboard(telegram_id=user_id)
-        await query.edit_message_text(message, parse_mode='HTML', reply_markup=reply_markup)
-    finally:
-        db.close()
-
-async def back_to_main_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Retorna o usuário para o menu principal."""
-    query = update.callback_query
-    await query.answer()
-    user_id = update.effective_user.id
-    # Simplesmente edita a mensagem para mostrar o menu principal correto
-    await query.edit_message_text(
-        "Menu Principal:",
-        reply_markup=main_menu_keyboard(telegram_id=user_id)
-    )
+# --- FUNÇÕES DUPLICADAS REMOVIDAS PARA LIMPEZA ---
+# my_dashboard_handler, my_positions_handler, back_to_main_menu_handler
+# já estavam definidas acima.
 
 async def user_settings_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Exibe o menu de configurações de trade com os valores atuais do usuário."""
@@ -670,7 +541,6 @@ async def receive_entry_percent(update: Update, context: ContextTypes.DEFAULT_TY
             user.entry_size_percent = percent_value
             db.commit()
             
-            # Busca o saldo atual para a mensagem de confirmação
             api_key = decrypt_data(user.api_key_encrypted)
             api_secret = decrypt_data(user.api_secret_encrypted)
             account_info = await get_account_info(api_key, api_secret)
@@ -692,7 +562,6 @@ async def receive_entry_percent(update: Update, context: ContextTypes.DEFAULT_TY
                 f"Com seu saldo atual, cada entrada será de aprox. <b>${entry_value:,.2f} USDT</b>."
             )
 
-            # Adiciona o alerta de risco
             if percent_value > 25:
                 feedback_text += "\n\n⚠️ <b>Atenção:</b> Uma porcentagem acima de 25% é considerada de altíssimo risco!"
 
@@ -735,9 +604,7 @@ async def receive_max_leverage(update: Update, context: ContextTypes.DEFAULT_TYP
     message_id_to_edit = context.user_data.get('settings_message_id')
 
     try:
-        # Tenta converter o texto para um número inteiro
         leverage_value = int(update.message.text)
-        # Limites da Bybit, por segurança
         if not (1 <= leverage_value <= 125):
             raise ValueError("Alavancagem fora do limite (1-125)")
 
@@ -747,7 +614,6 @@ async def receive_max_leverage(update: Update, context: ContextTypes.DEFAULT_TYP
             user.max_leverage = leverage_value
             db.commit()
             
-            # Edita a mensagem original para mostrar o menu de configurações atualizado
             await context.bot.edit_message_text(
                 chat_id=update.effective_chat.id,
                 message_id=message_id_to_edit,
@@ -766,7 +632,6 @@ async def receive_max_leverage(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return ASKING_MAX_LEVERAGE
     finally:
-        # Apaga a mensagem do usuário com o número
         await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id)
 
     return ConversationHandler.END
@@ -784,7 +649,6 @@ async def receive_min_confidence(update: Update, context: ContextTypes.DEFAULT_T
     user_id = update.effective_user.id
     message_id_to_edit = context.user_data.get('settings_message_id')
     
-    # Apaga a mensagem do usuário (seja ela válida ou não) para manter o chat limpo
     await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id)
 
     try:
@@ -798,7 +662,6 @@ async def receive_min_confidence(update: Update, context: ContextTypes.DEFAULT_T
             user.min_confidence = confidence_value
             db.commit()
             
-            # Edita a mensagem do bot para mostrar o menu de configurações atualizado
             await context.bot.edit_message_text(
                 chat_id=update.effective_chat.id,
                 message_id=message_id_to_edit,
@@ -809,13 +672,11 @@ async def receive_min_confidence(update: Update, context: ContextTypes.DEFAULT_T
         finally:
             db.close()
 
-        return ConversationHandler.END # Finaliza a conversa APENAS se deu tudo certo
+        return ConversationHandler.END
 
     except (ValueError, TypeError):
-        # --- LÓGICA DE TRATAMENTO DE ERRO ---
         logger.warning(f"Usuário {user_id} enviou um valor inválido para confiança: {update.message.text}")
         
-        # Edita a mensagem do bot para avisar do erro e pedir para tentar de novo
         await context.bot.edit_message_text(
             chat_id=update.effective_chat.id,
             message_id=message_id_to_edit,
@@ -823,7 +684,6 @@ async def receive_min_confidence(update: Update, context: ContextTypes.DEFAULT_T
             parse_mode='HTML'
         )
         
-        # Mantém o usuário na mesma etapa para que ele possa tentar de novo
         return ASKING_MIN_CONFIDENCE
     
 async def manual_close_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -831,25 +691,21 @@ async def manual_close_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     await query.answer("Processando fechamento...")
 
-    # Extrai o ID do trade do callback_data (ex: "manual_close_12")
     trade_id = int(query.data.split('_')[-1])
     user_id = update.effective_user.id
 
     db = SessionLocal()
     try:
-        # Busca o trade específico no banco de dados
         trade_to_close = db.query(Trade).filter_by(id=trade_id, user_telegram_id=user_id).first()
 
         if not trade_to_close:
             await query.edit_message_text("Erro: Trade não encontrado ou já fechado.")
             return
 
-        # Pega as credenciais do usuário
         user = db.query(User).filter_by(telegram_id=user_id).first()
         api_key = decrypt_data(user.api_key_encrypted)
         api_secret = decrypt_data(user.api_secret_encrypted)
 
-        # Chama a função para fechar a quantidade restante da posição
         close_result = close_partial_position(
             api_key, 
             api_secret, 
@@ -862,7 +718,6 @@ async def manual_close_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             trade_to_close.status = 'CLOSED_MANUAL'
             db.commit()
             await query.edit_message_text(f"✅ Posição para {trade_to_close.symbol} fechada manualmente com sucesso!")
-            # Opcional: Recarregar o menu de posições para mostrar a lista atualizada
             await my_positions_handler(update, context)
         else:
             error_msg = close_result.get('error')
@@ -900,18 +755,15 @@ async def toggle_approval_mode_handler(update: Update, context: ContextTypes.DEF
 
     db = SessionLocal()
     try:
-        # --- CORREÇÃO APLICADA AQUI ---
-        # Busca o usuário usando a sessão local da função, em vez de get_user_by_id
         user = db.query(User).filter(User.telegram_id == user_id).first()
         
         if user:
-            # Lógica para alternar o modo
             if user.approval_mode == 'AUTOMATIC':
                 user.approval_mode = 'MANUAL'
             else:
                 user.approval_mode = 'AUTOMATIC'
             
-            db.commit() # Agora o commit salvará o objeto 'user' que pertence a esta sessão 'db'
+            db.commit() 
             
             try:
                 await query.edit_message_text(
@@ -929,50 +781,40 @@ async def toggle_approval_mode_handler(update: Update, context: ContextTypes.DEF
         db.close()
 
 async def handle_signal_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Lida com a decisão do admin (Aprovar/Rejeitar) e replica a ação para todos os usuários.
-    """
     query = update.callback_query
     await query.answer()
 
-    action, signal_id_str = query.data.split('_', 1)[-1].rsplit('_', 1)
+    ### ALTERAÇÃO INICIADA ###
+    # A linha abaixo estava incorreta e não extraía a ação ('approve') corretamente.
+    # A nova linha usa `partition` para dividir a string de forma mais confiável.
+    # Ex: 'approve_signal_123' se torna ('approve', '_signal_', '123')
+    action, _, signal_id_str = query.data.partition('_signal_')
+    ### ALTERAÇÃO FINALIZADA ###
+
     signal_id = int(signal_id_str)
     
     db = SessionLocal()
     try:
         signal_to_process = db.query(SignalForApproval).filter_by(id=signal_id).first()
-
         if not signal_to_process:
             await query.edit_message_text("Este sinal já foi processado ou expirou.")
             return
 
-        # --- LÓGICA DE APROVAÇÃO MULTIUSUÁRIO ---
         if action == 'approve':
-            signal_data = signal_to_process.signal_data
-            source_name = signal_to_process.source_name
+            await query.edit_message_text("✅ **Entrada Aprovada!** Replicando a ordem para todos os usuários...")
             
-            # 1. Busca todos os usuários com API configurada
-            all_users_to_trade = db.query(User).filter(User.api_key_encrypted.isnot(None)).all()
-            
-            await query.edit_message_text(f"✅ **Entrada Aprovada!** Replicando a ordem para {len(all_users_to_trade)} usuário(s)...")
-            
-            # 2. Executa o trade para cada usuário
-            for user in all_users_to_trade:
-                logger.info(f"Processando trade manual para o usuário: {user.telegram_id}")
-                try:
-                    # Usamos a mesma função _execute_trade que já está preparada para multiusuário
-                    await _execute_trade(signal_data, user, context.application, db, source_name)
-                except Exception as e:
-                    logger.error(f"Erro ao executar trade manual para o usuário {user.telegram_id}: {e}", exc_info=True)
-                    await context.bot.send_message(chat_id=user.telegram_id, text=f"Ocorreu um erro inesperado ao processar o sinal para {signal_data.get('coin')}.")
+            await execute_signal_for_all_users(
+                signal_data=signal_to_process.signal_data,
+                application=context.application,
+                db=db,
+                source_name=signal_to_process.source_name
+            )
             
         elif action == 'reject':
             await query.edit_message_text("❌ **Entrada Rejeitada.** O sinal foi descartado.")
         
-        # Remove o sinal da tabela de aprovação em ambos os casos
         db.delete(signal_to_process)
         db.commit()
-    
     finally:
         db.close()
 
@@ -997,7 +839,7 @@ async def receive_profit_target(update: Update, context: ContextTypes.DEFAULT_TY
     """Recebe, valida e salva a nova meta de lucro."""
     user_id = update.effective_user.id
     message_id_to_edit = context.user_data.get('settings_message_id')
-    
+
     await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id)
 
     try:
@@ -1097,7 +939,6 @@ async def performance_menu_handler(update: Update, context: ContextTypes.DEFAULT
     query = update.callback_query
     await query.answer()
 
-    # --- CORREÇÃO APLICADA AQUI: Captura o ID do usuário que interagiu ---
     user_id = query.from_user.id
     
     callback_data = query.data
@@ -1124,7 +965,6 @@ async def performance_menu_handler(update: Update, context: ContextTypes.DEFAULT
             reply_markup=performance_menu_keyboard()
         )
         
-        # --- CORREÇÃO APLICADA AQUI: Passa o user_id para o serviço ---
         report_text = await generate_performance_report(user_id, start_dt, end_dt)
         
         await query.edit_message_text(

@@ -1,4 +1,4 @@
-from sqlalchemy import (Column, Integer, String, BigInteger, Boolean, Float, JSON, DateTime)
+from sqlalchemy import (Column, Integer, String, BigInteger, Boolean, Float, JSON, DateTime, UniqueConstraint)
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.sql import func
 
@@ -53,11 +53,17 @@ class Trade(Base):
 class PendingSignal(Base):
     __tablename__ = 'pending_signals'
     id = Column(Integer, primary_key=True)
-    user_telegram_id = Column(BigInteger, nullable=False)
-    symbol = Column(String, nullable=False, unique=True, index=True)
-    # Armazena o ID da ordem retornado pela Bybit para podermos gerenciá-la
+    user_telegram_id = Column(BigInteger, nullable=False, index=True)
+    
+    # --- MUDANÇA APLICADA AQUI ---
+    # Removemos o unique=True do symbol
+    symbol = Column(String, nullable=False, index=True) 
+    
     order_id = Column(String, unique=True, nullable=False)
     signal_data = Column(JSON, nullable=False)
+
+    # Adicionamos uma restrição de unicidade composta
+    __table_args__ = (UniqueConstraint('user_telegram_id', 'symbol', name='_user_symbol_uc'),)
 
 class SignalForApproval(Base):
     __tablename__ = 'signals_for_approval'
