@@ -9,6 +9,9 @@ sleep 2
 # Conecta à rede Tailscale usando a chave de autenticação
 /usr/bin/tailscale up --authkey=${TAILSCALE_AUTHKEY} --hostname="tradeflow-bot"
 
+# Executa migrações pendentes
+alembic upgrade head
+
 # Inicia a aplicação principal do bot
 echo "Iniciando o bot TradeFlow..."
 python main.py
