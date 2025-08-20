@@ -4,7 +4,6 @@ from database.session import SessionLocal
 from database.models import Trade, User
 from services.bybit_service import get_pnl_for_period
 from utils.security import decrypt_data
-from utils.config import ADMIN_ID
 
 logger = logging.getLogger(__name__)
 

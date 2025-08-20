@@ -2,7 +2,7 @@ import logging
 import asyncio
 from database.models import PendingSignal
 from services.bybit_service import place_limit_order, get_account_info
-from datetime import datetime, time, timedelta 
+from datetime import datetime, time, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes, ConversationHandler
 from telegram.error import BadRequest
@@ -12,7 +12,7 @@ from .keyboards import (
     main_menu_keyboard, confirm_remove_keyboard, admin_menu_keyboard, 
     dashboard_menu_keyboard, settings_menu_keyboard, view_targets_keyboard, 
     bot_config_keyboard, performance_menu_keyboard)
-from utils.security import encrypt_data, decrypt_data
+from utils.security import encrypt_data, decrypt_data, verify_invite_code
 from services.bybit_service import get_open_positions, get_account_info, close_partial_position
 from utils.config import ADMIN_ID
 from database.crud import get_user_by_id
@@ -26,6 +26,11 @@ from core.trade_manager import execute_signal_for_all_users
 (ASKING_PROFIT_TARGET, ASKING_LOSS_LIMIT) = range(13, 15)
 
 logger = logging.getLogger(__name__)
+
+
+def _user_is_admin(telegram_id: int) -> bool:
+    user = get_user_by_id(telegram_id)
+    return bool(user and user.role == 'ADMIN')
 
 # --- FLUXO DE USUÁRIO (START, CADASTRO, MENUS) ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -44,24 +49,37 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return WAITING_CODE
 
 async def receive_invite_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    code_text = update.message.text
+    code_text = update.message.text.strip()
     telegram_user = update.effective_user
     db = SessionLocal()
     try:
-        invite_code = db.query(InviteCode).filter(InviteCode.code == code_text, InviteCode.is_used == False).first()
-        if invite_code:
-            new_user = User(telegram_id=telegram_user.id, first_name=telegram_user.first_name)
+        now = datetime.utcnow()
+        valid_codes = db.query(InviteCode).filter(
+            InviteCode.is_used == False,
+            InviteCode.expires_at > now
+        ).all()
+        matched_code = None
+        for code in valid_codes:
+            if verify_invite_code(code_text, code.code_hash):
+                matched_code = code
+                break
+
+        if matched_code:
+            role = 'ADMIN' if telegram_user.id == ADMIN_ID else 'USER'
+            new_user = User(telegram_id=telegram_user.id, first_name=telegram_user.first_name, role=role)
             db.add(new_user)
-            invite_code.is_used = True
+            matched_code.is_used = True
+            matched_code.used_at = now
+            matched_code.used_by = telegram_user.id
             db.commit()
             await update.message.reply_text(
                 "✅ Cadastro realizado com sucesso! O próximo passo é configurar sua API.",
                 reply_markup=main_menu_keyboard(telegram_id=telegram_user.id)
             )
             return ConversationHandler.END
-        else:
-            await update.message.reply_text("❌ Código de convite inválido ou já utilizado. Tente novamente.")
-            return WAITING_CODE
+
+        await update.message.reply_text("❌ Código de convite inválido ou expirado. Tente novamente.")
+        return WAITING_CODE
     finally:
         db.close()
 
@@ -338,7 +356,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Mostra o menu de administrador, se o usuário for o admin."""
     user_id = update.effective_user.id
-    if user_id != ADMIN_ID:
+    if not _user_is_admin(user_id):
         await update.message.reply_text("Você não tem permissão para usar este comando.")
         return
 
@@ -352,7 +370,10 @@ async def admin_view_targets_handler(update: Update, context: ContextTypes.DEFAU
     """Busca e exibe a lista de todos os canais e tópicos sendo monitorados."""
     query = update.callback_query
     await query.answer()
-    
+    if not _user_is_admin(update.effective_user.id):
+        await query.edit_message_text("Você não tem permissão para esta ação.")
+        return
+
     db = SessionLocal()
     try:
         targets = db.query(MonitoredTarget).all()
@@ -380,7 +401,10 @@ async def back_to_admin_menu_handler(update: Update, context: ContextTypes.DEFAU
     """Retorna o usuário para o menu de administração principal."""
     query = update.callback_query
     await query.answer()
-    
+    if not _user_is_admin(update.effective_user.id):
+        await query.edit_message_text("Você não tem permissão para esta ação.")
+        return
+
     await query.edit_message_text(
         "Bem-vindo ao painel de administração.",
         reply_markup=admin_menu_keyboard()
@@ -390,7 +414,10 @@ async def list_channels_handler(update: Update, context: ContextTypes.DEFAULT_TY
     """Coloca um pedido na fila para listar os grupos e canais do usuário."""
     query = update.callback_query
     await query.answer()
-    
+    if not _user_is_admin(update.effective_user.id):
+        await query.edit_message_text("Você não tem permissão para esta ação.")
+        return
+
     comm_queue = context.application.bot_data.get('comm_queue')
     if not comm_queue:
         await query.edit_message_text("Erro: Fila de comunicação não encontrada.")
@@ -410,11 +437,12 @@ async def select_channel_to_monitor(update: Update, context: ContextTypes.DEFAUL
     """Coloca um pedido na fila para listar tópicos (ou gerenciar um canal plano)."""
     query = update.callback_query
     await query.answer()
-    comm_queue = context.application.bot_data.get('comm_queue')
-    if not comm_queue: return
+    if not _user_is_admin(update.effective_user.id):
+        return
 
-    user_id = update.effective_user.id
-    if user_id != ADMIN_ID: return
+    comm_queue = context.application.bot_data.get('comm_queue')
+    if not comm_queue:
+        return
 
     channel_id = int(query.data.split('_')[-1])
     
@@ -439,15 +467,14 @@ async def select_channel_to_monitor(update: Update, context: ContextTypes.DEFAUL
 async def select_topic_to_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Salva/remove o tópico e pede para a fila recarregar o menu de tópicos."""
     query = update.callback_query
-    await query.answer() 
+    await query.answer()
+    if not _user_is_admin(update.effective_user.id):
+        return
 
     comm_queue = context.application.bot_data.get('comm_queue')
     if not comm_queue:
         logger.error("Fila de comunicação não encontrada no contexto do bot.")
         return
-
-    user_id = update.effective_user.id
-    if user_id != ADMIN_ID: return
 
     _, _, channel_id_str, topic_id_str = query.data.split('_')
     channel_id = int(channel_id_str)
@@ -733,7 +760,10 @@ async def bot_config_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
-    
+    if not _user_is_admin(user_id):
+        await query.edit_message_text("Você não tem permissão para esta ação.")
+        return
+
     db = SessionLocal()
     try:
         user = get_user_by_id(user_id)
@@ -752,19 +782,22 @@ async def toggle_approval_mode_handler(update: Update, context: ContextTypes.DEF
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
+    if not _user_is_admin(user_id):
+        await query.edit_message_text("Você não tem permissão para esta ação.")
+        return
 
     db = SessionLocal()
     try:
         user = db.query(User).filter(User.telegram_id == user_id).first()
-        
+
         if user:
             if user.approval_mode == 'AUTOMATIC':
                 user.approval_mode = 'MANUAL'
             else:
                 user.approval_mode = 'AUTOMATIC'
-            
-            db.commit() 
-            
+
+            db.commit()
+
             try:
                 await query.edit_message_text(
                     "<b>🤖 Configuração do Bot</b>\n\n"
@@ -783,6 +816,9 @@ async def toggle_approval_mode_handler(update: Update, context: ContextTypes.DEF
 async def handle_signal_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    if not _user_is_admin(update.effective_user.id):
+        await query.edit_message_text("Você não tem permissão para esta ação.")
+        return
 
     ### ALTERAÇÃO INICIADA ###
     # A linha abaixo estava incorreta e não extraía a ação ('approve') corretamente.

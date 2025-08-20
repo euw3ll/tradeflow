@@ -1,4 +1,5 @@
 from cryptography.fernet import Fernet
+import bcrypt
 from .config import ENCRYPTION_KEY
 
 # Inicializa o 'cofre' com a sua chave
@@ -17,3 +18,17 @@ def decrypt_data(encrypted_data: str) -> str:
         return None
     decrypted_bytes = cipher_suite.decrypt(encrypted_data.encode())
     return decrypted_bytes.decode()
+
+
+def hash_invite_code(code: str) -> str:
+    """Gera um hash seguro para o código de convite usando bcrypt."""
+    salt = bcrypt.gensalt()
+    return bcrypt.hashpw(code.encode(), salt).decode()
+
+
+def verify_invite_code(code: str, hashed: str) -> bool:
+    """Verifica se um código corresponde ao hash armazenado."""
+    try:
+        return bcrypt.checkpw(code.encode(), hashed.encode())
+    except ValueError:
+        return False

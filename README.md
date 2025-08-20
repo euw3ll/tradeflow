@@ -49,3 +49,12 @@ psql $DATABASE_URL < backup.sql
 ```
 O script executa as migrations pendentes (`alembic upgrade head`) e inicia o bot.
 
+## Códigos de Convite
+Gere códigos com expiração usando o script:
+
+```bash
+python scripts/create_invite.py MEU-CODIGO 30  # 30 dias de validade
+```
+
+Os códigos são armazenados de forma criptográfica e expiram automaticamente.
+

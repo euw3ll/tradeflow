@@ -6,3 +6,4 @@ pybit==5.3.1
 telethon==1.33.1
 alembic==1.13.1
 psycopg[binary]==3.1.19
+bcrypt==4.1.2

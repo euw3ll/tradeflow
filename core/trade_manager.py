@@ -11,7 +11,6 @@ from services.bybit_service import (
 )
 from services.notification_service import send_notification
 from utils.security import decrypt_data
-from utils.config import ADMIN_ID
 from bot.keyboards import signal_approval_keyboard
 # Importa a nova classe de tipos de sinal do parser refatorado
 from services.signal_parser import SignalType
@@ -110,7 +109,7 @@ async def process_new_signal(signal_data: dict, application: Application, source
     symbol = signal_data.get("coin")
     db = SessionLocal()
     try:
-        admin_user = db.query(User).filter_by(telegram_id=ADMIN_ID).first()
+        admin_user = db.query(User).filter(User.role == 'ADMIN').first()
         if not admin_user or not admin_user.api_key_encrypted:
             logger.error("Admin não configurado, não é possível processar sinais.")
             return
@@ -180,7 +179,7 @@ async def process_new_signal(signal_data: dict, application: Application, source
             logger.info(f"Modo MANUAL. Enviando sinal ({signal_type}) para aprovação do Admin.")
             
             new_signal_for_approval = SignalForApproval(
-                user_telegram_id=ADMIN_ID, symbol=symbol,
+                user_telegram_id=admin_user.telegram_id, symbol=symbol,
                 source_name=source_name, signal_data=signal_data
             )
             db.add(new_signal_for_approval)
@@ -193,7 +192,9 @@ async def process_new_signal(signal_data: dict, application: Application, source
                 f"O sinal passou nos seus filtros. Você aprova a entrada?"
             )
             sent_message = await application.bot.send_message(
-                chat_id=ADMIN_ID, text=signal_details, parse_mode='HTML',
+                chat_id=admin_user.telegram_id,
+                text=signal_details,
+                parse_mode='HTML',
                 reply_markup=signal_approval_keyboard(new_signal_for_approval.id)
             )
             new_signal_for_approval.approval_message_id = sent_message.message_id

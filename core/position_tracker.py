@@ -9,7 +9,6 @@ from services.bybit_service import (
     modify_position_stop_loss, get_order_status
 )
 from services.notification_service import send_notification # Vamos trocar para notificações individuais
-from utils.config import ADMIN_ID
 from utils.security import decrypt_data
 
 logger = logging.getLogger(__name__)

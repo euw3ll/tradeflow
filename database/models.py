@@ -19,12 +19,16 @@ class User(Base):
     daily_profit_target = Column(Float, default=0.0, nullable=False)
     # Limite de perda diário (valor positivo). 0.0 significa desativado.
     daily_loss_limit = Column(Float, default=0.0, nullable=False)
+    role = Column(String, default='USER', nullable=False)
 
 class InviteCode(Base):
     __tablename__ = 'invite_codes'
     id = Column(Integer, primary_key=True)
-    code = Column(String, unique=True, nullable=False)
+    code_hash = Column(String, unique=True, nullable=False)
     is_used = Column(Boolean, default=False)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    used_at = Column(DateTime(timezone=True))
+    used_by = Column(BigInteger)
 
 class MonitoredTarget(Base):
     __tablename__ = 'monitored_targets'
