@@ -78,7 +78,12 @@ async def list_channel_topics(channel_id: int):
     return topics
 
 # --- Listener de Sinais ---
-SIGNAL_PATTERN = re.compile(r'💎\s*Moeda:', re.IGNORECASE)
+# Captura tanto mensagens de novos sinais quanto cancelamentos,
+# aceitando variações sem o emoji 💎 e sinônimos para "Moeda"
+SIGNAL_PATTERN = re.compile(
+    r'((?:💎\s*)?(?:Moeda|Coin|Pair):|Tipo:|Zona\s*de\s*Entrada:|Stop\s*Loss:|Sinal\s*Cancelad[oa])',
+    re.IGNORECASE,
+)
 
 @client.on(events.NewMessage(pattern=SIGNAL_PATTERN))
 @client.on(events.MessageEdited(pattern=SIGNAL_PATTERN))

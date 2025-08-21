@@ -15,12 +15,16 @@ class SignalType:
 SIGNAL_PATTERNS = [
     {
         "type": SignalType.CANCELAR,
-        "pattern": re.compile(r'⚠️\s*(\w+)\s*Sinal\s*Cancelado', re.IGNORECASE),
+        # Aceita variações como "⚠️ BTC - Sinal Cancelado" ou "⚠️ BTC Sinal Cancelada"
+        "pattern": re.compile(r'⚠️\s*(\w+)[^\n]*sinal\s*cancelad[oa]', re.IGNORECASE),
         "extractor": lambda m: {"coin": m.group(1)}
     },
     {
         "type": "FULL_SIGNAL", # Padrão para sinais completos (Ordem Limite ou a Mercado)
-        "pattern": re.compile(r'(?=.*Moeda:)(?=.*Tipo:)(?=.*Stop Loss:)', re.IGNORECASE | re.DOTALL),
+        "pattern": re.compile(
+            r'(?=.*(?:Moeda|Coin|Pair):)(?=.*Tipo:)(?=.*Stop\s*Loss:)',
+            re.IGNORECASE | re.DOTALL,
+        ),
         "extractor": "full_signal_extractor"
     }
 ]
@@ -44,7 +48,7 @@ def _full_signal_extractor(message_text: str) -> Optional[Dict[str, Any]]:
     elif 'ordem à mercado' in text_lower or 'sinal entrou no preço' in text_lower:
         signal_type = SignalType.MARKET
 
-    coin = find_single_value(r'💎\s*Moeda:\s*(\w+)', message_text)
+    coin = find_single_value(r'(?:💎\s*)?(?:Moeda|Coin|Pair):\s*(\w+)', message_text)
     order_type = find_single_value(r'Tipo:\s*(LONG|SHORT)', message_text)
     entry_zone_str = find_single_value(r'Zona\s*de\s*Entrada:\s*([\d\.\,\s-]+)', message_text)
     stop_loss_str = find_single_value(r'Stop\s*Loss:\s*([\d\.\,]+)', message_text)
