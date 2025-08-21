@@ -1,0 +1,11 @@
+version: "3.8"
+
+services:
+  tradeflow-bot:
+    image: tradeflow
+    restart: always
+    container_name: tradeflow-bot
+    env_file:
+      - .env
+    volumes:
+      - ./data:/data
