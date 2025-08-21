@@ -1,0 +1,43 @@
+# Nome do Workflow que aparecerá na aba "Actions" do GitHub
+name: Deploy Tradeflow to VPS
+
+# Gatilho: Este workflow roda a cada push na branch 'main'
+on:
+  push:
+    branches:
+      - main
+
+# Tarefas que o workflow irá executar
+jobs:
+  deploy:
+    # O sistema operacional que o robô do GitHub usará
+    runs-on: ubuntu-latest
+
+    # Passos a serem executados
+    steps:
+      - name: Deploy to VPS via SSH
+        # Usa uma Action pronta da comunidade para SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          # Usa os segredos que você configurou
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_PRIVATE_KEY }}
+
+          # Script com os comandos a serem executados na VPS
+          script: |
+            # Navega para a pasta da aplicação
+            cd /srv/apps/tradeflow
+
+            echo "Atualizando o código-fonte..."
+            git fetch origin
+            git reset --hard origin/main
+
+            echo "Parando containers antigos..."
+            sudo docker-compose down
+
+            echo "Reconstruindo e iniciando novos containers..."
+            sudo docker-compose up -d --build
+
+            echo "Limpando imagens Docker antigas..."
+            sudo docker image prune -af
