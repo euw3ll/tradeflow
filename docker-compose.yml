@@ -2,6 +2,7 @@ version: "3.8"
 
 services:
   tradeflow-bot:
+    build: .
     image: tradeflow
     restart: always
     container_name: tradeflow-bot

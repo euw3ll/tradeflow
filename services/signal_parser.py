@@ -4,57 +4,30 @@ from typing import Dict, Any, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# --- DEFINIÇÃO CENTRALIZADA DOS TIPOS DE SINAL ---
+# --- DEFINIÇÃO CENTRALIZADA E SIMPLIFICADA DOS TIPOS DE SINAL ---
 class SignalType:
     MARKET = 'MARKET'
     LIMIT = 'LIMIT'
     CANCELAR = 'CANCELAR'
-    FECHAR_PARCIAL = 'FECHAR_PARCIAL'
-    MOVER_STOP_ENTRADA = 'MOVER_STOP_ENTRADA'
 
-# --- ESTRUTURA DE PADRÕES DE REGEX ---
-# Uma lista de dicionários onde cada um representa um padrão de sinal a ser detectado.
-# A ordem é importante: os padrões mais específicos devem vir antes dos mais genéricos.
+# --- ESTRUTURA DE PADRÕES DE REGEX (VERSÃO AUTÔNOMA) ---
+# A ordem é importante: o padrão mais específico (cancelamento) vem antes.
 SIGNAL_PATTERNS = [
-    # --- Padrões de Gerenciamento ---
-    {
-        "type": SignalType.FECHAR_PARCIAL,
-        "pattern": re.compile(r'(?:fechar|realizar)\s+(?:parcial|50%)\s+de\s+([\w]+)', re.IGNORECASE),
-        "extractor": lambda m: {"coin": m.group(1)}
-    },
-    {
-        "type": SignalType.MOVER_STOP_ENTRADA,
-        "pattern": re.compile(r'mover\s+stop\s+(?:de\s+)?([\w]+)\s+para\s+a\s+entrada', re.IGNORECASE),
-        "extractor": lambda m: {"coin": m.group(1)}
-    },
-    {
-        "type": SignalType.MOVER_STOP_ENTRADA,
-        "pattern": re.compile(r'stop\s+([\w]+)\s+no\s+(?:pre[çc]o\s+de\s+)?entrada', re.IGNORECASE),
-        "extractor": lambda m: {"coin": m.group(1)}
-    },
-    # --- Padrões de Cancelamento (mais flexíveis) ---
     {
         "type": SignalType.CANCELAR,
-        "pattern": re.compile(r'([\w]+)\s+Sinal\s+Cancelado', re.IGNORECASE),
+        "pattern": re.compile(r'⚠️\s*(\w+)\s*Sinal\s*Cancelado', re.IGNORECASE),
         "extractor": lambda m: {"coin": m.group(1)}
     },
     {
-        "type": SignalType.CANCELAR,
-        "pattern": re.compile(r'sinal\s+cancelado\s+para\s+([\w]+)', re.IGNORECASE),
-        "extractor": lambda m: {"coin": m.group(1)}
-    },
-    # --- Padrão de Sinal Completo (Market ou Limit) ---
-    {
-        "type": "FULL_SIGNAL", # Tipo genérico para ser detalhado depois
-        "pattern": re.compile(r'💎\s*Moeda:\s*(\w+)', re.IGNORECASE),
-        "extractor": "full_signal_extractor" # Usa uma função dedicada
+        "type": "FULL_SIGNAL", # Padrão para sinais completos (Ordem Limite ou a Mercado)
+        "pattern": re.compile(r'(?=.*Moeda:)(?=.*Tipo:)(?=.*Stop Loss:)', re.IGNORECASE | re.DOTALL),
+        "extractor": "full_signal_extractor"
     }
 ]
 
 def _full_signal_extractor(message_text: str) -> Optional[Dict[str, Any]]:
     """
-    Função dedicada para extrair todos os detalhes de um sinal de entrada
-    (Market ou Limit), que é mais complexo.
+    Função dedicada para extrair todos os detalhes de um sinal de entrada completo.
     """
     def find_single_value(pattern: str, text: str) -> Optional[str]:
         match = re.search(pattern, text, re.IGNORECASE)
@@ -62,7 +35,6 @@ def _full_signal_extractor(message_text: str) -> Optional[Dict[str, Any]]:
 
     def find_multiple_values(pattern: str, text: str) -> List[float]:
         matches = re.findall(pattern, text, re.IGNORECASE)
-        # Garante que mesmo com vírgula, o número seja convertido corretamente
         return [float(v.replace(',', '.')) for v in matches]
 
     text_lower = message_text.lower()
@@ -74,30 +46,29 @@ def _full_signal_extractor(message_text: str) -> Optional[Dict[str, Any]]:
 
     coin = find_single_value(r'💎\s*Moeda:\s*(\w+)', message_text)
     order_type = find_single_value(r'Tipo:\s*(LONG|SHORT)', message_text)
-    leverage_str = find_single_value(r'Alavancagem:\s*(\d+)x', message_text)
-    entry_zone_str = find_single_value(r'Zona de Entrada:\s*([\d\.\,\s-]+)', message_text)
-    stop_loss_str = find_single_value(r'Stop Loss:\s*([\d\.\,]+)', message_text)
+    entry_zone_str = find_single_value(r'Zona\s*de\s*Entrada:\s*([\d\.\,\s-]+)', message_text)
+    stop_loss_str = find_single_value(r'Stop\s*Loss:\s*([\d\.\,]+)', message_text)
     targets = find_multiple_values(r'T\d+:\s*([\d\.\,]+)', message_text)
     confidence_str = find_single_value(r'Confiança:\s*([\d\.\,]+)%', message_text)
 
+    # Validação essencial: Se não for um sinal de entrada completo, retorna None
     if not all([signal_type, coin, order_type, entry_zone_str, stop_loss_str]):
-        logger.warning("[Parser] Sinal completo detectado, mas faltam campos essenciais (Tipo, Moeda, Entrada, Stop).")
+        logger.debug("[Parser] Mensagem não corresponde a um sinal de entrada completo. Ignorando.")
         return None
 
     entries = [float(val.replace(',', '.')) for val in re.findall(r'([\d\.\,]+)', entry_zone_str)]
     if not entries:
-        logger.warning("[Parser] Nenhum preço numérico encontrado na 'Zona de Entrada'.")
+        logger.warning("[Parser] Nenhum preço numérico encontrado na 'Zona de Entrada' de um sinal completo.")
         return None
 
     return {
         "type": signal_type,
         "coin": coin,
         "order_type": order_type.upper(),
-        "leverage": int(leverage_str) if leverage_str else 10,
         "entries": entries,
         "stop_loss": float(stop_loss_str.replace(',', '.')),
         "targets": targets,
-        "confidence": float(confidence_str.replace(',', '.')) if confidence_str else None
+        "confidence": float(confidence_str.replace(',', '.')) if confidence_str else 0.0
     }
 
 
@@ -113,22 +84,23 @@ def parse_signal(message_text: str) -> Optional[Dict[str, Any]]:
 
         logger.info(f"[Parser] Padrão '{item['type']}' correspondido.")
         
-        # Se o extrator for uma função dedicada
         if item["extractor"] == "full_signal_extractor":
             extracted_data = _full_signal_extractor(message_text)
-        # Se for uma função lambda simples
         else:
             extracted_data = item["extractor"](match)
         
         if not extracted_data:
             continue
-            
-        # Adiciona o tipo de sinal e formata a moeda com sufixo USDT
-        final_data = {"type": item["type"], **extracted_data}
-        if 'coin' in final_data:
-            final_data['coin'] = f"{final_data['coin'].upper()}USDT"
         
-        return final_data
+        # O tipo do sinal vem do padrão, não do extrator (exceto para FULL_SIGNAL)
+        if item["type"] != "FULL_SIGNAL":
+             extracted_data['type'] = item['type']
+
+        # Adiciona o sufixo USDT à moeda, se existir
+        if 'coin' in extracted_data and extracted_data['coin']:
+            extracted_data['coin'] = f"{extracted_data['coin'].upper()}USDT"
+        
+        return extracted_data
 
     logger.info("[Parser] Nenhum padrão de sinal conhecido foi encontrado na mensagem.")
     return None
