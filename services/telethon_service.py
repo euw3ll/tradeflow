@@ -78,54 +78,81 @@ async def list_channel_topics(channel_id: int):
     return topics
 
 # --- Listener de Sinais ---
-# Captura tanto mensagens de novos sinais quanto cancelamentos,
-# aceitando variações sem o emoji 💎 e sinônimos para "Moeda"
-SIGNAL_PATTERN = re.compile(
-    r'((?:💎\s*)?(?:Moeda|Coin|Pair):|Tipo:|Zona\s*de\s*Entrada:|Stop\s*Loss:|Sinal\s*Cancelad[oa])',
-    re.IGNORECASE,
-)
+# Em vez de filtrar por regex no decorator, ouvimos TUDO e deixamos o parser decidir.
+from telethon import events
 
-@client.on(events.NewMessage(pattern=SIGNAL_PATTERN))
-@client.on(events.MessageEdited(pattern=SIGNAL_PATTERN))
+@client.on(events.NewMessage)          # novas mensagens
+@client.on(events.MessageEdited)       # mensagens editadas (muitos canais editam depois)
 async def signal_listener(event):
     """
-    Ouve mensagens que correspondem ao padrão e faz uma verificação final
-    para garantir que é um evento de mensagem válido antes de processar.
+    Ouve TODAS as mensagens nos canais/grupos e:
+      - loga que chegou
+      - decide se é alvo monitorado
+      - tenta parsear
+      - loga 'é sinal' ou 'não é sinal'
+      - se for sinal, coloca na fila para processamento
     """
     global comm_queue
-    
+
+    # sanity checks
     if not isinstance(event, (events.NewMessage.Event, events.MessageEdited.Event)):
         return
-        
-    if not event or not event.text or not comm_queue:
+    if not comm_queue:
         return
 
-    # Lógica para prevenir o processamento duplicado de sinais editados.
-    message_id = event.message.id
-    if message_id in PROCESSED_MESSAGE_IDS:
-        logger.info(f"Sinal com ID de mensagem {message_id} já processado (evento de edição/duplicado). Ignorando.")
-        return
-    PROCESSED_MESSAGE_IDS.add(message_id)
+    # texto bruto (mais robusto do que event.text em alguns casos)
+    text = (getattr(event, "raw_text", None)
+            or getattr(getattr(event, "message", None), "message", None)
+            or "")
+    chat_id = getattr(event, "chat_id", None)
+    message_id = getattr(getattr(event, "message", None), "id", None)
+    topic_id = event.reply_to.reply_to_msg_id if getattr(event, "reply_to", None) else None
 
+    # LOG: sempre que chega algo
+    preview = text.replace("\n", " ")[:120]
+    logger.info(f"📨 [Telethon] Mensagem recebida | chat_id={chat_id} | msg_id={message_id} | preview={preview!r}")
+
+    # Verifica se é um alvo monitorado (canal/tópico)
     monitored_targets = get_monitored_targets()
     if not monitored_targets:
+        logger.info("⏭️ [Telethon] Não há alvos monitorados configurados.")
         return
 
-    chat_id = event.chat_id
-    topic_id = event.reply_to.reply_to_msg_id if event.reply_to else None
-
     is_target = any(
-        (target.channel_id == chat_id and (target.topic_id is None and topic_id is None)) or
-        (target.channel_id == chat_id and target.topic_id == topic_id)
-        for target in monitored_targets
+        (t.channel_id == chat_id and ((t.topic_id is None and topic_id is None) or t.topic_id == topic_id))
+        for t in monitored_targets
     )
+    if not is_target:
+        logger.info(f"⏭️ [Telethon] Mensagem fora dos alvos monitorados (chat_id={chat_id}, topic_id={topic_id}).")
+        return
 
-    if is_target:
-        logger.info(f"Potencial sinal detectado no alvo (Canal: {chat_id}, Msg ID: {message_id}). Adicionando à fila.")
+    # Evita duplicidade apenas quando JÁ identificamos como sinal
+    if message_id in PROCESSED_MESSAGE_IDS:
+        logger.info(f"⏭️ [Telethon] Mensagem {message_id} já processada anteriormente. Ignorando duplicata/edição.")
+        return
+
+    # Tenta parsear
+    from services.signal_parser import parse_signal  # import local p/ evitar ciclos
+    parsed = parse_signal(text)
+
+    if parsed:
+        logger.info(
+            "✅ [Telethon] É sinal! "
+            f"type={parsed.get('type')} coin={parsed.get('coin')} "
+            f"order={parsed.get('order_type')} entries={parsed.get('entries')} sl={parsed.get('stop_loss')}"
+        )
+        # marca como processado só quando for SINAL
+        if message_id is not None:
+            PROCESSED_MESSAGE_IDS.add(message_id)
+
+        # Enfileira para o processador com um source_name informativo
         await comm_queue.put({
             "action": "process_signal",
-            "signal_text": event.text
+            "signal_text": text,
+            "source_name": f"telegram:{chat_id}"
         })
+    else:
+        logger.info("⏭️ [Telethon] Chegou mensagem aqui - não é sinal.")
 
 # --- Processador da Fila ---
 
@@ -228,8 +255,6 @@ async def queue_processor(queue: asyncio.Queue, ptb_app: Application):
 async def start_signal_monitor(queue: asyncio.Queue):
     """Inicia o cliente Telethon, o ouvinte de sinais e o processador da fila."""
     logger.info("Iniciando monitor de sinais com Telethon...")
-    
-    client.add_event_handler(signal_listener)
     
     await client.start()
     
