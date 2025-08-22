@@ -34,11 +34,14 @@ def _full_signal_extractor(message_text: str) -> Optional[Dict[str, Any]]:
     Função dedicada para extrair todos os detalhes de um sinal de entrada completo.
     """
     def find_single_value(pattern: str, text: str) -> Optional[str]:
-        match = re.search(pattern, text, re.IGNORECASE)
+        # A nova regex usa '.*?' para pular qualquer caractere (como emojis)
+        # entre o início da linha (ou a keyword) e o valor que queremos capturar.
+        match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
         return match.group(1).strip() if match else None
 
     def find_multiple_values(pattern: str, text: str) -> List[float]:
-        matches = re.findall(pattern, text, re.IGNORECASE)
+        # Adicionamos '.*?' aqui também para maior robustez.
+        matches = re.findall(pattern, text, re.IGNORECASE | re.MULTILINE)
         return [float(v.replace(',', '.')) for v in matches]
 
     text_lower = message_text.lower()
@@ -48,16 +51,22 @@ def _full_signal_extractor(message_text: str) -> Optional[Dict[str, Any]]:
     elif 'ordem à mercado' in text_lower or 'sinal entrou no preço' in text_lower:
         signal_type = SignalType.MARKET
 
-    coin = find_single_value(r'(?:💎\s*)?(?:Moeda|Coin|Pair):\s*(\w+)', message_text)
-    order_type = find_single_value(r'Tipo:\s*(LONG|SHORT)', message_text)
-    entry_zone_str = find_single_value(r'Zona\s*de\s*Entrada:\s*([\d\.\,\s-]+)', message_text)
-    stop_loss_str = find_single_value(r'Stop\s*Loss:\s*([\d\.\,]+)', message_text)
+    # Regex atualizadas para serem mais tolerantes, buscando do início da linha (^)
+    # e ignorando emojis ou texto inicial com (?:.*\s)?
+    coin = find_single_value(r'^(?:.*\s)?(?:Moeda|Coin|Pair):\s*(\w+)', message_text)
+    order_type = find_single_value(r'^(?:.*\s)?Tipo:\s*(LONG|SHORT)', message_text)
+    entry_zone_str = find_single_value(r'^(?:.*\s)?Zona\s*de\s*Entrada:\s*([\d\.\,\s-]+)', message_text)
+    stop_loss_str = find_single_value(r'^(?:.*\s)?Stop\s*Loss:\s*([\d\.\,]+)', message_text)
     targets = find_multiple_values(r'T\d+:\s*([\d\.\,]+)', message_text)
-    confidence_str = find_single_value(r'Confiança:\s*([\d\.\,]+)%', message_text)
+    confidence_str = find_single_value(r'^(?:.*\s)?Confiança:\s*([\d\.\,]+)%', message_text)
+
 
     # Validação essencial: Se não for um sinal de entrada completo, retorna None
     if not all([signal_type, coin, order_type, entry_zone_str, stop_loss_str]):
-        logger.debug("[Parser] Mensagem não corresponde a um sinal de entrada completo. Ignorando.")
+        # Adiciona log para depuração em caso de falha
+        logger.warning(f"[Parser] Mensagem não correspondeu a um sinal completo. Detalhes:\n"
+                     f"- signal_type: {signal_type}\n- coin: {coin}\n- order_type: {order_type}\n"
+                     f"- entry_zone_str: {entry_zone_str}\n- stop_loss_str: {stop_loss_str}")
         return None
 
     entries = [float(val.replace(',', '.')) for val in re.findall(r'([\d\.\,]+)', entry_zone_str)]
