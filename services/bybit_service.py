@@ -88,7 +88,6 @@ async def get_account_info(api_key: str, api_secret: str) -> dict:
 async def place_order(api_key: str, api_secret: str, signal_data: dict, user_settings: User, balance: float) -> dict:
     """Abre uma nova posição a mercado (Market) com validação completa."""
     async def pre_flight_checks():
-        # Garante que as regras do instrumento estão no cache antes de ir para a thread
         symbol = signal_data['coin']
         if symbol not in INSTRUMENT_INFO_CACHE:
             await get_instrument_info(symbol)
@@ -98,19 +97,15 @@ async def place_order(api_key: str, api_secret: str, signal_data: dict, user_set
         try:
             symbol = signal_data['coin']
 
-            # 1. VALIDAÇÃO DAS REGRAS (JÁ BUSCADAS)
             if not instrument_rules or not instrument_rules.get("success"):
-                 return instrument_rules or {"success": False, "error": f"Regras para {symbol} não encontradas."}
-
+                return instrument_rules or {"success": False, "error": f"Regras para {symbol} não encontradas."}
             if instrument_rules["status"] != "Trading":
                 return {"success": False, "error": f"O símbolo {symbol} não está ativo para negociação ({instrument_rules['status']})."}
 
-            # 2. CÁLCULO DE QUANTIDADE (Com Alavancagem)
             session = get_session(api_key, api_secret)
             side = "Buy" if (signal_data.get('order_type') or '').upper() == 'LONG' else "Sell"
             leverage = Decimal(str(user_settings.max_leverage))
             entry_price = Decimal(str(signal_data['entries'][0]))
-            
             margin_in_dollars = Decimal(str(balance)) * (Decimal(str(user_settings.entry_size_percent)) / Decimal("100"))
             notional_value = margin_in_dollars * leverage
             
@@ -119,7 +114,6 @@ async def place_order(api_key: str, api_secret: str, signal_data: dict, user_set
             qty_raw = notional_value / entry_price
             qty_adj = _round_down_to_step(qty_raw, instrument_rules["qtyStep"])
 
-            # 3. VALIDAÇÃO DA ORDEM
             if qty_adj < instrument_rules["minOrderQty"]:
                 return {"success": False, "error": f"Qtd. ajustada ({qty_adj:f}) é menor que a mínima permitida ({instrument_rules['minOrderQty']:f}) para {symbol}."}
             
@@ -127,37 +121,36 @@ async def place_order(api_key: str, api_secret: str, signal_data: dict, user_set
             if final_notional_value < instrument_rules["minNotionalValue"]:
                 return {"success": False, "error": f"Valor total da ordem (${final_notional_value:.2f}) é menor que o mínimo permitido de ${instrument_rules['minNotionalValue']:.2f}."}
 
-            # 4. EXECUÇÃO
-            session.set_leverage(category="linear", symbol=symbol, buyLeverage=str(leverage), sellLeverage=str(leverage))
-            
+            # --- LÓGICA CORRIGIDA ---
             payload = {
                 "category": "linear", "symbol": symbol, "side": side,
-                "orderType": "Market", "qty": str(qty_adj), "isLeverage": 1,
+                "orderType": "Market", "qty": str(qty_adj),
                 "takeProfit": str((signal_data.get('targets') or [None])[0]),
                 "stopLoss": str(signal_data.get('stop_loss')),
             }
-            response = session.place_order(**{k: v for k, v in payload.items() if v is not None})
 
+            try:
+                session.set_leverage(category="linear", symbol=symbol, buyLeverage=str(leverage), sellLeverage=str(leverage))
+            except InvalidRequestError as e:
+                if "leverage not modified" in str(e).lower():
+                    logger.warning(f"Alavancagem para {symbol} já está correta. Continuando...")
+                else:
+                    return {"success": False, "error": str(e)} # Retorna outros erros de alavancagem
+
+            response = session.place_order(**{k: v for k, v in payload.items() if v is not None})
             if response.get('retCode') == 0:
                 return {"success": True, "data": response['result']}
             return {"success": False, "error": response.get('retMsg')}
-
-        except InvalidRequestError as e:
-            if "leverage not modified" in str(e).lower(): logger.warning(f"Alavancagem para {symbol} já está correta. Continuando...")
-            else: raise e # Re-levanta a exceção para ser tratada abaixo
         
-        # O bloco de execução da ordem é repetido aqui para tratar o 'leverage not modified'
-        # sem chamar set_leverage novamente.
-        payload['qty'] = str(qty_adj) # Garante que a qty correta seja usada
-        response_retry = session.place_order(**{k: v for k, v in payload.items() if v is not None})
-        if response_retry.get('retCode') == 0: return {"success": True, "data": response_retry['result']}
-        return {"success": False, "error": response_retry.get('retMsg')}
+        except Exception as e:
+            logger.error(f"Exceção ao abrir ordem (Market): {e}", exc_info=True)
+            return {"success": False, "error": str(e)}
 
     try:
         rules = await pre_flight_checks()
         return await asyncio.to_thread(_sync_call, rules)
     except Exception as e:
-        logger.error(f"Exceção ao abrir ordem (Market): {e}", exc_info=True)
+        logger.error(f"Exceção em place_order (async): {e}", exc_info=True)
         return {"success": False, "error": str(e)}
 
 
@@ -299,21 +292,16 @@ async def place_limit_order(api_key: str, api_secret: str, signal_data: dict, us
         try:
             symbol = signal_data['coin']
             
-            # 1. VALIDAÇÃO DAS REGRAS
             if not instrument_rules or not instrument_rules.get("success"):
                 return instrument_rules or {"success": False, "error": f"Regras para {symbol} não encontradas."}
-
             if instrument_rules["status"] != "Trading":
                 return {"success": False, "error": f"O símbolo {symbol} não está ativo para negociação ({instrument_rules['status']})."}
 
-            # 2. CÁLCULO DE PREÇO E QUANTIDADE
             session = get_session(api_key, api_secret)
             side = "Buy" if (signal_data.get('order_type') or '').upper() == 'LONG' else "Sell"
             leverage = Decimal(str(user_settings.max_leverage))
             price = Decimal(str(signal_data.get('limit_price')))
-            
             price_adj = (price // instrument_rules["tickSize"]) * instrument_rules["tickSize"]
-
             margin_in_dollars = Decimal(str(balance)) * (Decimal(str(user_settings.entry_size_percent)) / Decimal("100"))
             notional_value = margin_in_dollars * leverage
 
@@ -322,43 +310,42 @@ async def place_limit_order(api_key: str, api_secret: str, signal_data: dict, us
             qty_raw = notional_value / price_adj
             qty_adj = _round_down_to_step(qty_raw, instrument_rules["qtyStep"])
             
-            # 3. VALIDAÇÃO DA ORDEM
             if qty_adj < instrument_rules["minOrderQty"]:
                 return {"success": False, "error": f"Qtd. ajustada ({qty_adj:f}) é menor que a mínima permitida ({instrument_rules['minOrderQty']:f}) para {symbol}."}
-
             final_notional_value = qty_adj * price_adj
             if final_notional_value < instrument_rules["minNotionalValue"]:
                 return {"success": False, "error": f"Valor total da ordem (${final_notional_value:.2f}) é menor que o mínimo permitido de ${instrument_rules['minNotionalValue']:.2f}."}
 
-            # 4. EXECUÇÃO
-            session.set_leverage(category="linear", symbol=symbol, buyLeverage=str(leverage), sellLeverage=str(leverage))
-
+            # --- LÓGICA CORRIGIDA ---
             payload = {
                 "category": "linear", "symbol": symbol, "side": side,
-                "orderType": "Limit", "qty": str(qty_adj), "price": str(price_adj), "isLeverage": 1,
+                "orderType": "Limit", "qty": str(qty_adj), "price": str(price_adj),
                 "takeProfit": str((signal_data.get('targets') or [None])[0]),
                 "stopLoss": str(signal_data.get('stop_loss')),
             }
+
+            try:
+                session.set_leverage(category="linear", symbol=symbol, buyLeverage=str(leverage), sellLeverage=str(leverage))
+            except InvalidRequestError as e:
+                if "leverage not modified" in str(e).lower():
+                    logger.warning(f"Alavancagem para {symbol} já está correta. Continuando...")
+                else:
+                    return {"success": False, "error": str(e)}
+
             response = session.place_order(**{k: v for k, v in payload.items() if v is not None})
-            
             if response.get('retCode') == 0:
                 return {"success": True, "data": response['result']}
             return {"success": False, "error": response.get('retMsg')}
-        
-        except InvalidRequestError as e:
-            if "leverage not modified" in str(e).lower(): logger.warning(f"Alavancagem para {symbol} já está correta. Retentando a ordem...")
-            else: raise e
 
-            payload['qty'] = str(qty_adj)
-            response_retry = session.place_order(**{k: v for k, v in payload.items() if v is not None})
-            if response_retry.get('retCode') == 0: return {"success": True, "data": response_retry['result']}
-            return {"success": False, "error": response_retry.get('retMsg')}
+        except Exception as e:
+            logger.error(f"Exceção ao abrir ordem (Limit): {e}", exc_info=True)
+            return {"success": False, "error": str(e)}
 
     try:
         rules = await pre_flight_checks()
         return await asyncio.to_thread(_sync_call, rules)
     except Exception as e:
-        logger.error(f"Exceção ao abrir ordem (Limit): {e}", exc_info=True)
+        logger.error(f"Exceção em place_limit_order (async): {e}", exc_info=True)
         return {"success": False, "error": str(e)}
 
 
