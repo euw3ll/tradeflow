@@ -165,24 +165,48 @@ async def get_market_price(symbol: str) -> dict:
     return await asyncio.to_thread(_sync_call)
 
 async def close_partial_position(api_key: str, api_secret: str, symbol: str, qty_to_close: float, side: str) -> dict:
-    """Fecha uma parte de uma posição aberta de forma assíncrona."""
+    """Fecha parte de uma posição com Market/ReduceOnly, respeitando qtyStep/minQty.
+       Se qty <= 0 após ajuste, ignora silenciosamente (não trata como erro)."""
     def _sync_call():
+        from decimal import Decimal
         try:
             session = get_session(api_key, api_secret)
             close_side = "Sell" if side == 'LONG' else "Buy"
-            
+
+            # filtros do símbolo
+            try:
+                _, step, min_qty = _get_symbol_filters(session, symbol)
+            except Exception as e:
+                logger.warning(f"[bybit_service] (close_partial) Falha ao obter filtros de {symbol}, usando defaults. Erro: {e}")
+                step, min_qty = Decimal("0.001"), Decimal("0")
+
+            qty_raw = Decimal(str(qty_to_close))
+            qty_adj = _round_down_to_step(qty_raw, step)
+
+            logger.info(f"[bybit_service] close_partial {symbol}: raw={qty_raw}, step={step}, minQty={min_qty} => adj={qty_adj}")
+
+            # nada a fechar? trate como sucesso silencioso
+            if qty_adj <= 0:
+                return {"success": True, "skipped": True, "reason": "qty_after_step_is_zero"}
+
+            # se ainda ficou abaixo do mínimo, eleva para minQty (caso haja posição suficiente)
+            if qty_adj < min_qty:
+                qty_adj = min_qty
+
             response = session.place_order(
                 category="linear", symbol=symbol, side=close_side,
-                orderType="Market", qty=str(qty_to_close), reduceOnly=True
+                orderType="Market", qty=str(qty_adj), reduceOnly=True
             )
             if response.get('retCode') == 0:
                 return {"success": True, "data": response['result']}
             else:
                 return {"success": False, "error": response.get('retMsg')}
+
         except Exception as e:
             logger.error(f"Exceção ao fechar posição parcial: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
     return await asyncio.to_thread(_sync_call)
+
 
 async def modify_position_stop_loss(api_key: str, api_secret: str, symbol: str, new_stop_loss: float) -> dict:
     """Modifica o Stop Loss de uma posição aberta de forma assíncrona."""
