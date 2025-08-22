@@ -10,3 +10,6 @@ services:
       - .env
     volumes:
       - ./data:/data
+    environment:
+      - DATABASE_URL=sqlite:////data/tradeflow.db
+    restart: unless-stopped

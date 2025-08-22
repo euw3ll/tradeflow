@@ -64,8 +64,15 @@ def run_migrations_online() -> None:
     and associate a connection with the context.
 
     """
+    # --- INÍCIO DA MODIFICAÇÃO ---
+    # Pega a configuração do alembic.ini
+    configuration = config.get_section(config.config_ini_section, {})
+    # Tenta pegar a URL de uma variável de ambiente, se não existir, usa a do .ini
+    url = os.getenv('DATABASE_URL', configuration['sqlalchemy.url'])
+    configuration['sqlalchemy.url'] = url
+    
     connectable = engine_from_config(
-        config.get_section(config.config_ini_section, {}),
+        configuration, # Usa a configuração modificada
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
     )
