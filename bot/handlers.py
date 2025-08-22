@@ -19,6 +19,7 @@ from database.crud import get_user_by_id
 from core.trade_manager import _execute_trade
 from core.performance_service import generate_performance_report
 from core.trade_manager import execute_signal_for_all_users
+from services.bybit_service import get_open_positions_with_pnl
 
 # Estados para as conversas
 (WAITING_CODE, WAITING_API_KEY, WAITING_API_SECRET, CONFIRM_REMOVE_API) = range(4)
@@ -209,22 +210,86 @@ async def my_positions_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     await query.answer()
     await query.edit_message_text("Buscando suas posições gerenciadas...")
+
     user_id = update.effective_user.id
     db = SessionLocal()
     try:
-        active_trades = db.query(Trade).filter(Trade.user_telegram_id == user_id, ~Trade.status.like('%CLOSED%')).all()
-        message = "<b>📊 Suas Posições Ativas (Gerenciadas pelo Bot)</b>\n\n"
+        user = db.query(User).filter_by(telegram_id=user_id).first()
+        if not user or not user.api_key_encrypted:
+            await query.edit_message_text(
+                "Você ainda não configurou suas chaves de API.",
+            )
+            return
+
+        api_key = decrypt_data(user.api_key_encrypted)
+        api_secret = decrypt_data(user.api_secret_encrypted)
+
+        # posições abertas (live) com P/L atual
+        live = await get_open_positions_with_pnl(api_key, api_secret)
+        live_positions = live["data"] if live.get("success") else []
+
+        # trades que o BOT está gerenciando (para os botões/IDs)
+        active_trades = db.query(Trade).filter(
+            Trade.user_telegram_id == user_id,
+            ~Trade.status.like('%CLOSED%')
+        ).all()
+
+        # monta um índice por símbolo -> trade.id (se existir)
+        trade_id_by_symbol = {t.symbol: t.id for t in active_trades}
+
+        lines = ["<b>📊 Suas Posições Ativas (Gerenciadas pelo Bot)</b>", ""]
         keyboard = []
-        if active_trades:
-            for trade in active_trades:
-                side_emoji = "🔼" if trade.side == 'LONG' else "🔽"
-                message += f"- {side_emoji} {trade.symbol} ({trade.qty} unid.)\n  Entrada: ${trade.entry_price:,.4f} | Status: {trade.status}\n\n"
-                keyboard.append([InlineKeyboardButton(f"Fechar {trade.symbol} ❌", callback_data=f"manual_close_{trade.id}")])
+
+        if not live_positions and not active_trades:
+            lines.append("Nenhuma posição sendo gerenciada no momento.")
         else:
-            message += "Nenhuma posição sendo gerenciada no momento."
-        
+            for pos in live_positions:
+                arrow = "⬆️" if pos["side"] == "LONG" else "⬇️"
+                sym = pos["symbol"]
+                size = pos["size"]
+                entry = pos["entry"] or 0.0
+                mark = pos["mark"] or 0.0
+                pnl = pos["unrealized_pnl"]
+                pnl_pct = pos["unrealized_pnl_pct"]
+
+                lines.append(
+                    f"- {arrow} <b>{sym}</b> ({size:g} unid.)\n"
+                    f"  Entrada: ${entry:.4f} | Preço: ${mark:.4f}\n"
+                    f"  P/L: <b>{pnl:+.2f} USDT</b> ({pnl_pct:+.2f}%)\n"
+                )
+
+                # se o bot estiver gerenciando esse símbolo, mostra o botão fechar
+                if sym in trade_id_by_symbol:
+                    trade_id = trade_id_by_symbol[sym]
+                    keyboard.append([
+                        InlineKeyboardButton(
+                            f"Fechar {sym} ❌",
+                            callback_data=f"manual_close_{trade_id}"
+                        )
+                    ])
+
+            # fallback: se existir trade “gerenciado” sem posição viva (ex.: zerou na corretora),
+            # ainda mostramos o item para permitir fechamento/limpeza manual.
+            for t in active_trades:
+                if t.symbol not in {p["symbol"] for p in live_positions}:
+                    side_emoji = "⬆️" if t.side == 'LONG' else "⬇️"
+                    lines.append(
+                        f"- {side_emoji} <b>{t.symbol}</b> ({t.qty:g} unid.)\n"
+                        f"  Entrada: ${t.entry_price:.4f} | Status: {t.status}\n"
+                    )
+                    keyboard.append([
+                        InlineKeyboardButton(
+                            f"Fechar {t.symbol} ❌",
+                            callback_data=f"manual_close_{t.id}"
+                        )
+                    ])
+
         keyboard.append([InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data='back_to_main_menu')])
-        await query.edit_message_text(message, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.edit_message_text(
+            "\n".join(lines),
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
     finally:
         db.close()
 

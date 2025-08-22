@@ -226,20 +226,7 @@ async def modify_position_stop_loss(api_key: str, api_secret: str, symbol: str, 
     return await asyncio.to_thread(_sync_call)
 
 async def get_open_positions(api_key: str, api_secret: str) -> dict:
-    """Busca todas as posições abertas de forma assíncrona."""
-    def _sync_call():
-        try:
-            session = get_session(api_key, api_secret)
-            response = session.get_positions(category="linear", settleCoin="USDT")
-            if response.get('retCode') == 0:
-                open_positions = [p for p in response['result']['list'] if float(p['size']) > 0]
-                return {"success": True, "data": open_positions}
-            else:
-                return {"success": False, "data": [], "error": response.get('retMsg')}
-        except Exception as e:
-            logger.error(f"Exceção ao buscar posições abertas: {e}", exc_info=True)
-            return {"success": False, "data": [], "error": str(e)}
-    return await asyncio.to_thread(_sync_call)
+    return await get_open_positions_with_pnl(api_key, api_secret)
 
 async def get_pnl_for_period(api_key: str, api_secret: str, start_time: datetime, end_time: datetime) -> dict:
     """Busca o P/L (Lucro/Prejuízo) realizado para um período de tempo específico."""
@@ -433,5 +420,96 @@ async def cancel_order(api_key: str, api_secret: str, order_id: str, symbol: str
                 return {"success": False, "error": response.get('retMsg')}
         except Exception as e:
             logger.error(f"Exceção ao cancelar ordem: {e}", exc_info=True)
+            return {"success": False, "error": str(e)}
+    return await asyncio.to_thread(_sync_call)
+
+# --- PNL FECHADO (PERFORMANCE) ---
+async def get_closed_pnl_breakdown(api_key: str, api_secret: str, start_time: datetime, end_time: datetime) -> dict:
+    """
+    Retorna o P/L total e contagem de ganhos/perdas no período informado.
+    Usa o endpoint oficial de closed PnL.
+    """
+    def _sync_call():
+        try:
+            session = get_session(api_key, api_secret)
+            resp = session.get_closed_pnl(
+                category="linear",
+                startTime=int(start_time.timestamp() * 1000),
+                endTime=int(end_time.timestamp() * 1000),
+                limit=200,
+            )
+            if resp.get("retCode") != 0:
+                return {"success": False, "error": resp.get("retMsg", "erro")}
+            items = resp.get("result", {}).get("list", []) or []
+            total = 0.0
+            wins = 0
+            losses = 0
+            for it in items:
+                pnl = float(it.get("closedPnl", 0) or 0)
+                total += pnl
+                if pnl > 0:
+                    wins += 1
+                elif pnl < 0:
+                    losses += 1
+            return {
+                "success": True,
+                "total_pnl": total,
+                "wins": wins,
+                "losses": losses,
+                "trades": len(items),
+            }
+        except Exception as e:
+            logger.error(f"Exceção em get_closed_pnl_breakdown: {e}", exc_info=True)
+            return {"success": False, "error": str(e)}
+    return await asyncio.to_thread(_sync_call)
+
+
+# --- POSIÇÕES ABERTAS COM PNL ATUAL ---
+async def get_open_positions_with_pnl(api_key: str, api_secret: str) -> dict:
+    """
+    Lista posições abertas com avgPrice, markPrice e P/L atual (valor e %).
+    """
+    def _sync_call():
+        try:
+            session = get_session(api_key, api_secret)
+            resp = session.get_positions(category="linear", settleCoin="USDT")
+            if resp.get("retCode") != 0:
+                return {"success": False, "error": resp.get("retMsg", "erro")}
+            out = []
+            for p in (resp.get("result", {}).get("list", []) or []):
+                size = float(p.get("size", 0) or 0)
+                if size <= 0:
+                    continue
+                symbol = p.get("symbol")
+                side = "LONG" if (p.get("side") == "Buy") else "SHORT"
+                entry = float(p.get("avgPrice", 0) or 0)
+                mark = float((p.get("markPrice") or 0) or 0)
+                # se mark vier 0, tenta buscar via tickers
+                if not mark and symbol:
+                    try:
+                        t = session.get_tickers(category="linear", symbol=symbol)
+                        mark = float(t["result"]["list"][0]["lastPrice"])
+                    except Exception:
+                        pass
+                if not entry or not mark:
+                    # não dá pra calcular PnL sem preço
+                    pnl = 0.0
+                    pnl_pct = 0.0
+                else:
+                    diff = (mark - entry) if side == "LONG" else (entry - mark)
+                    pnl = diff * size
+                    pnl_pct = (diff / entry) * 100.0 if entry else 0.0
+                out.append({
+                    "symbol": symbol,
+                    "side": side,
+                    "size": size,
+                    "entry": entry,
+                    "mark": mark,
+                    "unrealized_pnl": pnl,
+                    "unrealized_pnl_pct": pnl_pct,
+                })
+            return {"success": True, "data": out}
+        except Exception as e:
+            logger.error(f"Exceção em get_open_positions_with_pnl: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
     return await asyncio.to_thread(_sync_call)
