@@ -5,8 +5,39 @@ from datetime import datetime, time
 from pybit.unified_trading import HTTP
 from pybit.exceptions import InvalidRequestError
 from database.models import User
+from decimal import Decimal
 
 logger = logging.getLogger(__name__)
+
+def _round_down_to_step(value: Decimal, step: Decimal) -> Decimal:
+    # arredonda para baixo no múltiplo do step
+    if step <= 0:
+        return value
+    return (value // step) * step
+
+def _round_down_to_tick(price: Decimal, tick: Decimal) -> Decimal:
+    if tick <= 0:
+        return price
+    return (price // tick) * tick
+
+def _get_symbol_filters(session: HTTP, symbol: str):
+    """
+    Busca os filtros de preço/quantidade do símbolo (tickSize, qtyStep, minOrderQty).
+    Retorna (tick: Decimal, step: Decimal, min_qty: Decimal)
+    """
+    resp = session.get_instruments_info(category="linear", symbol=symbol)
+    if resp.get("retCode") != 0:
+        raise RuntimeError(f"Falha ao obter instruments_info: {resp.get('retMsg')}")
+    lst = ((resp.get("result") or {}).get("list") or [])
+    if not lst:
+        raise RuntimeError("instruments_info vazio para símbolo")
+    info = lst[0]
+    price_filter = (info.get("priceFilter") or {})
+    lot_filter = (info.get("lotSizeFilter") or {})
+    tick = Decimal(str(price_filter.get("tickSize", "0.0001")))
+    step = Decimal(str(lot_filter.get("qtyStep", "0.001")))
+    min_qty = Decimal(str(lot_filter.get("minOrderQty", "0")))
+    return tick, step, min_qty
 
 # Função auxiliar síncrona, não precisa de 'async'
 def get_session(api_key: str, api_secret: str) -> HTTP:
@@ -193,53 +224,103 @@ async def get_daily_pnl(api_key: str, api_secret: str) -> dict:
 
 # --- FUNÇÃO PARA ENVIAR ORDEM LIMITE ---
 async def place_limit_order(api_key: str, api_secret: str, signal_data: dict, user_settings: User, balance: float) -> dict:
-    """Envia uma nova ordem limite para a Bybit."""
+    """Envia uma nova ordem limite para a Bybit (respeita limit_price + aplica tick/step)."""
     def _sync_call():
         try:
             session = get_session(api_key, api_secret)
             symbol = signal_data['coin']
-            side = "Buy" if signal_data['order_type'] == 'LONG' else "Sell"
+            order_type = (signal_data.get('order_type') or '').upper()
+            side = "Buy" if order_type == 'LONG' else "Sell"
             leverage = str(user_settings.max_leverage)
-            entry_price = float(signal_data['entries'][0])
-            stop_loss_price = str(signal_data['stop_loss'])
-            take_profit_price = str(signal_data['targets'][0]) if signal_data.get('targets') else None
 
+            # ---------- (A) DEFINIÇÃO DO PREÇO LIMIT ----------
+            # 1) Usa limit_price vindo do trade_manager se presente:
+            price = signal_data.get('limit_price')
+            # 2) Senão, decide aqui com base na faixa de entries:
+            if price is None:
+                entries = (signal_data.get('entries') or [])[:2]
+                if len(entries) == 0:
+                    return {"success": False, "error": "Sem preços de entrada válidos para LIMIT"}
+                elif len(entries) == 1:
+                    price = float(entries[0])
+                else:
+                    lo = float(min(entries[0], entries[1]))
+                    hi = float(max(entries[0], entries[1]))
+                    price = lo if order_type == "LONG" else hi
+
+            # TP/SL (opcionais)
+            stop_loss_price = signal_data.get('stop_loss')
+            take_profit_price = (signal_data.get('targets') or [None])[0]
+
+            # ---------- (B) BUSCA DE FILTROS (tick/step) E AJUSTES ----------
+            try:
+                tick, step, min_qty = _get_symbol_filters(session, symbol)
+            except Exception as e:
+                logger.warning(f"[bybit_service] Falha ao obter filtros do símbolo, usando defaults. Erro: {e}")
+                # Defaults conservadores para não travar (ajuste se preferir forçar erro)
+                tick, step, min_qty = Decimal("0.0001"), Decimal("0.001"), Decimal("0")
+
+            # Ajuste do preço ao tick
+            price_dec = _round_down_to_tick(Decimal(str(price)), tick)
+
+            # ---------- Cálculo de quantidade (usa preço já ajustado) ----------
             entry_percent = user_settings.entry_size_percent
-            position_size_dollars = balance * (entry_percent / 100)
-            unrounded_qty = position_size_dollars / entry_price
+            position_size_dollars = Decimal(str(balance)) * (Decimal(str(entry_percent)) / Decimal("100"))
+            if price_dec <= 0:
+                return {"success": False, "error": f"Preço inválido após ajuste: {price_dec}"}
 
-            # --- LÓGICA DE PRECISÃO DE QUANTIDADE ADICIONADA ---
-            if entry_price < 2.0:
-                qty = int(unrounded_qty)
-            else:
-                qty = round(unrounded_qty, 5)
+            qty_raw = position_size_dollars / price_dec
+            qty_dec = _round_down_to_step(qty_raw, step)
 
-            if qty == 0:
-                return {"success": False, "error": "Quantidade calculada é zero. Verifique o saldo ou a % de entrada."}
+            # Garante minQty e > 0
+            if qty_dec <= 0:
+                return {"success": False, "error": f"Quantidade calculada é zero/negativa (raw={qty_raw}, step={step})."}
+            if qty_dec < min_qty:
+                # tenta elevar ao mínimo permitido
+                qty_dec = min_qty
 
-            logger.info(f"Calculando ORDEM LIMITE para {symbol}: Side={side}, Qty={qty}, Price={entry_price}")
+            # ---------- Logs e alavancagem ----------
+            logger.info(
+                f"Calculando ORDEM LIMITE para {symbol}: "
+                f"Side={side}, Qty={qty_dec}, Price={price_dec} "
+                f"(tick={tick}, step={step}, minQty={min_qty}, posSize=${position_size_dollars})"
+            )
 
             try:
                 session.set_leverage(category="linear", symbol=symbol, buyLeverage=leverage, sellLeverage=leverage)
             except InvalidRequestError as e:
-                if "leverage not modified" in str(e):
+                if "leverage not modified" in str(e).lower():
                     logger.warning(f"Alavancagem para {symbol} já está correta. Continuando...")
-                    pass
                 else:
-                    raise e
+                    raise
 
-            response = session.place_order(
-                category="linear", symbol=symbol, side=side, orderType="Limit",
-                qty=str(qty), price=str(entry_price),
-                takeProfit=take_profit_price, stopLoss=stop_loss_price, isLeverage=1
-            )
+            # ---------- Envio da ordem ----------
+            payload = {
+                "category": "linear",
+                "symbol": symbol,
+                "side": side,
+                "orderType": "Limit",
+                "qty": str(qty_dec),
+                "price": str(price_dec),
+                "isLeverage": 1,
+            }
+            if take_profit_price is not None:
+                payload["takeProfit"] = str(take_profit_price)
+            if stop_loss_price is not None:
+                payload["stopLoss"] = str(stop_loss_price)
+
+            logger.info(f"[bybit_service] Enviando LIMIT {payload}")
+            response = session.place_order(**payload)
+
             if response.get('retCode') == 0:
                 return {"success": True, "data": response['result']}
             else:
                 return {"success": False, "error": response.get('retMsg')}
+
         except Exception as e:
             logger.error(f"Exceção ao enviar ordem limite: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
+
     return await asyncio.to_thread(_sync_call)
 
 # --- FUNÇÃO PARA VERIFICAR STATUS DE UMA ORDEM ---

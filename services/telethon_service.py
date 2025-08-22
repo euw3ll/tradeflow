@@ -152,7 +152,7 @@ async def signal_listener(event):
             "source_name": f"telegram:{chat_id}"
         })
     else:
-        logger.info("⏭️ [Telethon] Chegou mensagem aqui - não é sinal.")
+        logger.debug("⏭️ [Telethon] Chegou mensagem aqui - não é sinal.")
 
 # --- Processador da Fila ---
 
