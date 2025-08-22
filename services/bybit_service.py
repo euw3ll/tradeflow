@@ -73,20 +73,16 @@ async def place_order(api_key: str, api_secret: str, signal_data: dict, user_set
             order_type = (signal_data.get('order_type') or '').upper()
             side = "Buy" if order_type == 'LONG' else "Sell"
             leverage = str(user_settings.max_leverage)
-
-            # preço de referência do sinal para sizing (não é enviado na ordem Market)
             entry_price = Decimal(str(signal_data['entries'][0]))
             stop_loss_price = signal_data.get('stop_loss')
             take_profit_price = (signal_data.get('targets') or [None])[0]
 
-            # ----- filtros do símbolo (tick/step/minQty) -----
             try:
                 tick, step, min_qty = _get_symbol_filters(session, symbol)
             except Exception as e:
                 logger.warning(f"[bybit_service] Falha ao obter filtros para {symbol}, usando defaults. Erro: {e}")
-                tick, step, min_qty = Decimal("0.0001"), Decimal("0.001"), Decimal("0")
+                return {"success": False, "error": f"Falha ao obter regras do ativo {symbol}."}
 
-            # ----- sizing em dólares -> qty (contratos) -----
             entry_percent = Decimal(str(user_settings.entry_size_percent))
             balance_dec = Decimal(str(balance))
             position_size_dollars = balance_dec * (entry_percent / Decimal("100"))
@@ -95,22 +91,25 @@ async def place_order(api_key: str, api_secret: str, signal_data: dict, user_set
                 return {"success": False, "error": f"Preço de entrada inválido para sizing: {entry_price}"}
 
             qty_raw = position_size_dollars / entry_price
-            qty_dec = _round_down_to_step(qty_raw, step)
+            qty_adj = _round_down_to_step(qty_raw, step)
 
-            if qty_dec <= 0:
-                return {"success": False, "error": f"Quantidade após ajuste ficou zero (raw={qty_raw}, step={step})."}
-
-            if qty_dec < min_qty:
-                # eleva ao mínimo permitido
-                qty_dec = min_qty
+            # --- NOVA LÓGICA DE VALIDAÇÃO ---
+            # Em vez de aumentar para o mínimo, falhamos com uma mensagem clara.
+            if qty_adj < min_qty:
+                error_msg = (
+                    f"Quantidade ajustada ({qty_adj:f}) é menor que a quantidade mínima "
+                    f"permitida ({min_qty:f}) para {symbol}. "
+                    f"Tente aumentar a % de entrada nas configurações."
+                )
+                logger.warning(f"[bybit_service] Falha na validação de Qty (Market): {error_msg}")
+                return {"success": False, "error": error_msg}
 
             logger.info(
                 f"Calculando ORDEM A MERCADO para {symbol}: "
-                f"Side={side}, Qty={qty_dec} (step={step}, minQty={min_qty}), "
+                f"Side={side}, Qty={qty_adj} (step={step}, minQty={min_qty}), "
                 f"posSize=${position_size_dollars}, refPrice={entry_price}"
             )
 
-            # ----- alavancagem -----
             try:
                 session.set_leverage(category="linear", symbol=symbol, buyLeverage=leverage, sellLeverage=leverage)
             except InvalidRequestError as e:
@@ -119,14 +118,9 @@ async def place_order(api_key: str, api_secret: str, signal_data: dict, user_set
                 else:
                     raise
 
-            # ----- envio da Market -----
             payload = {
-                "category": "linear",
-                "symbol": symbol,
-                "side": side,
-                "orderType": "Market",
-                "qty": str(qty_dec),
-                "isLeverage": 1,
+                "category": "linear", "symbol": symbol, "side": side,
+                "orderType": "Market", "qty": str(qty_adj), "isLeverage": 1,
             }
             if take_profit_price is not None:
                 payload["takeProfit"] = str(take_profit_price)
@@ -271,63 +265,52 @@ async def get_daily_pnl(api_key: str, api_secret: str) -> dict:
 async def place_limit_order(api_key: str, api_secret: str, signal_data: dict, user_settings: User, balance: float) -> dict:
     """Envia uma nova ordem limite para a Bybit (respeita limit_price + aplica tick/step)."""
     def _sync_call():
+        from decimal import Decimal
         try:
             session = get_session(api_key, api_secret)
             symbol = signal_data['coin']
             order_type = (signal_data.get('order_type') or '').upper()
             side = "Buy" if order_type == 'LONG' else "Sell"
             leverage = str(user_settings.max_leverage)
-
-            # ---------- (A) DEFINIÇÃO DO PREÇO LIMIT ----------
-            # 1) Usa limit_price vindo do trade_manager se presente:
             price = signal_data.get('limit_price')
-            # 2) Senão, decide aqui com base na faixa de entries:
+            
             if price is None:
-                entries = (signal_data.get('entries') or [])[:2]
-                if len(entries) == 0:
-                    return {"success": False, "error": "Sem preços de entrada válidos para LIMIT"}
-                elif len(entries) == 1:
-                    price = float(entries[0])
-                else:
-                    lo = float(min(entries[0], entries[1]))
-                    hi = float(max(entries[0], entries[1]))
-                    price = lo if order_type == "LONG" else hi
+                return {"success": False, "error": "Preço limite não especificado para a ordem."}
 
-            # TP/SL (opcionais)
             stop_loss_price = signal_data.get('stop_loss')
             take_profit_price = (signal_data.get('targets') or [None])[0]
 
-            # ---------- (B) BUSCA DE FILTROS (tick/step) E AJUSTES ----------
             try:
                 tick, step, min_qty = _get_symbol_filters(session, symbol)
             except Exception as e:
                 logger.warning(f"[bybit_service] Falha ao obter filtros do símbolo, usando defaults. Erro: {e}")
-                # Defaults conservadores para não travar (ajuste se preferir forçar erro)
-                tick, step, min_qty = Decimal("0.0001"), Decimal("0.001"), Decimal("0")
+                return {"success": False, "error": f"Falha ao obter regras do ativo {symbol}."}
 
-            # Ajuste do preço ao tick
-            price_dec = _round_down_to_tick(Decimal(str(price)), tick)
+            price_adj = _round_down_to_tick(Decimal(str(price)), tick)
 
-            # ---------- Cálculo de quantidade (usa preço já ajustado) ----------
             entry_percent = user_settings.entry_size_percent
             position_size_dollars = Decimal(str(balance)) * (Decimal(str(entry_percent)) / Decimal("100"))
-            if price_dec <= 0:
-                return {"success": False, "error": f"Preço inválido após ajuste: {price_dec}"}
+            
+            if price_adj <= 0:
+                return {"success": False, "error": f"Preço inválido após ajuste: {price_adj}"}
 
-            qty_raw = position_size_dollars / price_dec
-            qty_dec = _round_down_to_step(qty_raw, step)
+            qty_raw = position_size_dollars / price_adj
+            qty_adj = _round_down_to_step(qty_raw, step)
 
-            # Garante minQty e > 0
-            if qty_dec <= 0:
-                return {"success": False, "error": f"Quantidade calculada é zero/negativa (raw={qty_raw}, step={step})."}
-            if qty_dec < min_qty:
-                # tenta elevar ao mínimo permitido
-                qty_dec = min_qty
+            # --- NOVA LÓGICA DE VALIDAÇÃO ---
+            # Em vez de aumentar para o mínimo, falhamos com uma mensagem clara.
+            if qty_adj < min_qty:
+                error_msg = (
+                    f"Quantidade ajustada ({qty_adj:f}) é menor que a quantidade mínima "
+                    f"permitida ({min_qty:f}) para {symbol}. "
+                    f"Tente aumentar a % de entrada nas configurações."
+                )
+                logger.warning(f"[bybit_service] Falha na validação de Qty (Limit): {error_msg}")
+                return {"success": False, "error": error_msg}
 
-            # ---------- Logs e alavancagem ----------
             logger.info(
                 f"Calculando ORDEM LIMITE para {symbol}: "
-                f"Side={side}, Qty={qty_dec}, Price={price_dec} "
+                f"Side={side}, Qty={qty_adj}, Price={price_adj} "
                 f"(tick={tick}, step={step}, minQty={min_qty}, posSize=${position_size_dollars})"
             )
 
@@ -339,14 +322,9 @@ async def place_limit_order(api_key: str, api_secret: str, signal_data: dict, us
                 else:
                     raise
 
-            # ---------- Envio da ordem ----------
             payload = {
-                "category": "linear",
-                "symbol": symbol,
-                "side": side,
-                "orderType": "Limit",
-                "qty": str(qty_dec),
-                "price": str(price_dec),
+                "category": "linear", "symbol": symbol, "side": side,
+                "orderType": "Limit", "qty": str(qty_adj), "price": str(price_adj),
                 "isLeverage": 1,
             }
             if take_profit_price is not None:
@@ -367,6 +345,7 @@ async def place_limit_order(api_key: str, api_secret: str, signal_data: dict, us
             return {"success": False, "error": str(e)}
 
     return await asyncio.to_thread(_sync_call)
+
 
 # --- FUNÇÃO PARA VERIFICAR STATUS DE UMA ORDEM ---
 async def get_order_status(api_key: str, api_secret: str, order_id: str, symbol: str) -> dict:
