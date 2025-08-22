@@ -39,5 +39,10 @@ jobs:
             echo "Reconstruindo e iniciando novos containers..."
             sudo docker-compose up -d --build
 
+            echo "Aguardando o container estabilizar antes da migração..."
+            sleep 5 
+            echo "Executando migração do banco de dados..."
+            sudo docker exec tradeflow-bot alembic upgrade head
+
             echo "Limpando imagens Docker antigas..."
             sudo docker image prune -af
