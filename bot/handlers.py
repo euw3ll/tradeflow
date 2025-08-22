@@ -301,9 +301,8 @@ async def my_positions_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         db.close()
 
 async def user_dashboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Exibe o painel com saldo focado em USDT, outras moedas relevantes e posições (com P/L ao vivo)."""
+    """Exibe o painel com saldo focado em USDT, outras moedas e posições."""
     query = update.callback_query
-
     try:
         await query.answer()
     except BadRequest as e:
@@ -311,22 +310,12 @@ async def user_dashboard_handler(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     await query.edit_message_text("Buscando informações do painel...")
-
     user_id = update.effective_user.id
     db = SessionLocal()
-
     try:
-        # use seu helper se existir; senão, pegue direto do DB:
-        try:
-            user = get_user_by_id(user_id)  # seu helper
-        except NameError:
-            user = db.query(User).filter_by(telegram_id=user_id).first()
-
+        user = get_user_by_id(user_id)
         if not user or not user.api_key_encrypted:
-            await query.edit_message_text(
-                "Você precisa configurar sua API primeiro.",
-                reply_markup=main_menu_keyboard(telegram_id=user_id)
-            )
+            await query.edit_message_text("Você precisa configurar sua API primeiro.", reply_markup=main_menu_keyboard(telegram_id=user_id))
             return
 
         api_key = decrypt_data(user.api_key_encrypted)
@@ -334,46 +323,40 @@ async def user_dashboard_handler(update: Update, context: ContextTypes.DEFAULT_T
 
         account_info, positions_info = await asyncio.gather(
             get_account_info(api_key, api_secret),
-            get_open_positions_with_pnl(api_key, api_secret)  # << P/L em tempo real
+            get_open_positions_with_pnl(api_key, api_secret)
         )
 
         message = "<b>ℹ️ Seu Painel de Controle</b>\n\n"
-
-        # --- Saldos ---
         message += "<b>Saldos na Carteira:</b>\n"
+
         if account_info.get("success"):
-            balances = account_info.get("data", [])
-            if balances and isinstance(balances, list):
-                coin_list = balances[0].get("coin", []) or []
-                usdt_balance_value = 0.0
-                other_coins_lines = []
+            balance_data = account_info.get("data", {})
+            coin_list = balance_data.get("coin_list", [])
+            
+            usdt_balance_value = 0.0
+            other_coins_lines = []
 
-                for c in coin_list:
-                    coin = (c.get("coin") or "").upper()
-                    wallet_balance = float(c.get("walletBalance") or 0)
-                    if coin == "USDT":
-                        usdt_balance_value = wallet_balance
-                    elif wallet_balance >= 0.1:
-                        other_coins_lines.append(f"- {coin}: {wallet_balance:.2f}")
+            for c in coin_list:
+                coin = (c.get("coin") or "").upper()
+                wallet_balance_str = c.get("walletBalance")
+                wallet_balance = float(wallet_balance_str) if wallet_balance_str else 0.0
 
-                message += f"<b>- USDT: {usdt_balance_value:.2f}</b>\n"
-                if other_coins_lines:
-                    message += "\n".join(other_coins_lines)
-                if not other_coins_lines and usdt_balance_value == 0.0:
-                    message += "Nenhum saldo relevante encontrado.\n"
-            else:
-                message += "Nenhuma moeda encontrada na carteira.\n"
+                if coin == "USDT":
+                    usdt_balance_value = wallet_balance
+                elif wallet_balance >= 0.1:
+                    other_coins_lines.append(f"- {coin}: {wallet_balance:.2f}")
+
+            message += f"<b>- USDT: {usdt_balance_value:.2f}</b>\n"
+            if other_coins_lines:
+                message += "\n".join(other_coins_lines)
+            elif usdt_balance_value == 0.0:
+                 message += "Nenhum saldo relevante encontrado.\n"
         else:
             message += f"Erro ao buscar saldo: {account_info.get('error')}\n"
 
-        message += "\n\n"
-
-        # --- Posições (com P/L ao vivo) ---
-        message += "<b>Posições Abertas:</b>\n"
+        message += "\n\n<b>Posições Abertas:</b>\n"
         if positions_info.get("success") and positions_info.get("data"):
             for p in positions_info["data"]:
-                # p vem de get_open_positions_with_pnl:
-                # {symbol, side ('LONG'/'SHORT'), size, entry_price, mark_price, unrealized_pnl, unrealized_pnl_pct}
                 side = (p.get("side") or "").upper()
                 arrow = "🔼" if side == "LONG" else "🔽"
                 symbol = p.get("symbol", "???")
@@ -393,17 +376,14 @@ async def user_dashboard_handler(update: Update, context: ContextTypes.DEFAULT_T
 
         message += "\n\n<i>⚠️ Este bot opera exclusivamente com pares USDT.</i>"
 
-        await query.edit_message_text(
-            message,
-            parse_mode="HTML",
-            reply_markup=dashboard_menu_keyboard()
-        )
+        await query.edit_message_text(message, parse_mode="HTML", reply_markup=dashboard_menu_keyboard())
 
     except Exception as e:
         logger.error(f"Erro ao montar o painel do usuário: {e}", exc_info=True)
         await query.edit_message_text("Ocorreu um erro ao buscar os dados do seu painel.")
     finally:
         db.close()
+
 
 # --- CANCELAMENTO ---
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:

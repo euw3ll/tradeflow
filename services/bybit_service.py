@@ -72,7 +72,7 @@ def get_session(api_key: str, api_secret: str) -> HTTP:
     )
 
 async def get_account_info(api_key: str, api_secret: str) -> dict:
-    """Busca o saldo da conta, retornando especificamente o total e o disponível em USDT."""
+    """Busca o saldo da conta, retornando dados detalhados incluindo a lista de moedas."""
     def _sync_call():
         try:
             session = get_session(api_key, api_secret)
@@ -85,22 +85,23 @@ async def get_account_info(api_key: str, api_secret: str) -> dict:
                 
                 account_data = account_data_list[0]
                 
-                # --- LÓGICA DE CONVERSÃO CORRIGIDA ---
                 equity_str = account_data.get('totalEquity')
                 total_equity = float(equity_str) if equity_str else 0.0
+                coin_list = account_data.get('coin', [])
 
-                available_balance = 0.0
-                for coin_balance in account_data.get('coin', []):
+                available_balance_usdt = 0.0
+                for coin_balance in coin_list:
                     if coin_balance.get('coin') == 'USDT':
                         available_str = coin_balance.get('availableToWithdraw')
-                        available_balance = float(available_str) if available_str else 0.0
+                        available_balance_usdt = float(available_str) if available_str else 0.0
                         break
                 
                 return {
                     "success": True, 
                     "data": {
                         "total_equity": total_equity,
-                        "available_balance": available_balance
+                        "available_balance_usdt": available_balance_usdt,
+                        "coin_list": coin_list  # <-- Retornando a lista completa
                     }
                 }
             return {"success": False, "data": {}, "error": response.get('retMsg', 'Erro desconhecido')}
