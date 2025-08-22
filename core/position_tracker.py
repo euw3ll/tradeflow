@@ -6,7 +6,8 @@ from database.session import SessionLocal
 from database.models import Trade, User, PendingSignal
 from services.bybit_service import (
     get_market_price, close_partial_position,
-    modify_position_stop_loss, get_order_status
+    modify_position_stop_loss, get_order_status,
+    get_specific_position_size # <-- ADICIONE ESTA LINHA
 )
 # Mantemos o send_notification se você usar em outros pontos (aqui focamos em mensagem individual)
 from services.notification_service import send_notification
