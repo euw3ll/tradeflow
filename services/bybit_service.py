@@ -1,7 +1,7 @@
 import logging
 import asyncio
 from typing import Dict
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from pybit.unified_trading import HTTP
 from pybit.exceptions import InvalidRequestError
 from database.models import User
@@ -427,40 +427,64 @@ async def cancel_order(api_key: str, api_secret: str, order_id: str, symbol: str
 async def get_closed_pnl_breakdown(api_key: str, api_secret: str, start_time: datetime, end_time: datetime) -> dict:
     """
     Retorna o P/L total e contagem de ganhos/perdas no período informado.
-    Usa o endpoint oficial de closed PnL.
+    Usa o endpoint oficial de closed PnL e pagina os resultados se o período for > 7 dias.
     """
     def _sync_call():
         try:
             session = get_session(api_key, api_secret)
-            resp = session.get_closed_pnl(
-                category="linear",
-                startTime=int(start_time.timestamp() * 1000),
-                endTime=int(end_time.timestamp() * 1000),
-                limit=200,
-            )
-            if resp.get("retCode") != 0:
-                return {"success": False, "error": resp.get("retMsg", "erro")}
-            items = resp.get("result", {}).get("list", []) or []
-            total = 0.0
-            wins = 0
-            losses = 0
-            for it in items:
+
+            total_pnl = 0.0
+            total_wins = 0
+            total_losses = 0
+            all_items = []
+
+            current_start = start_time
+
+            while current_start < end_time:
+                # Calcula o fim da janela atual, limitado a 7 dias ou ao fim do período total
+                current_end = min(current_start + timedelta(days=7), end_time)
+
+                logger.info(f"[bybit_service] Buscando PnL de {current_start.strftime('%Y-%m-%d')} a {current_end.strftime('%Y-%m-%d')}")
+
+                resp = session.get_closed_pnl(
+                    category="linear",
+                    startTime=int(current_start.timestamp() * 1000),
+                    endTime=int(current_end.timestamp() * 1000),
+                    limit=200,
+                )
+
+                if resp.get("retCode") != 0:
+                    error_msg = resp.get("retMsg", f"Erro desconhecido na paginação de PnL (start={current_start})")
+                    logger.error(f"Erro da API Bybit em get_closed_pnl_breakdown: {error_msg}")
+                    # Retorna o erro da primeira falha
+                    return {"success": False, "error": error_msg}
+
+                items = resp.get("result", {}).get("list", []) or []
+                all_items.extend(items)
+
+                # Avança o início da próxima janela
+                current_start += timedelta(days=7)
+
+            # Processa a lista completa de itens coletados
+            for it in all_items:
                 pnl = float(it.get("closedPnl", 0) or 0)
-                total += pnl
+                total_pnl += pnl
                 if pnl > 0:
-                    wins += 1
+                    total_wins += 1
                 elif pnl < 0:
-                    losses += 1
+                    total_losses += 1
+
             return {
                 "success": True,
-                "total_pnl": total,
-                "wins": wins,
-                "losses": losses,
-                "trades": len(items),
+                "total_pnl": total_pnl,
+                "wins": total_wins,
+                "losses": total_losses,
+                "trades": len(all_items),
             }
         except Exception as e:
             logger.error(f"Exceção em get_closed_pnl_breakdown: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
+
     return await asyncio.to_thread(_sync_call)
 
 
