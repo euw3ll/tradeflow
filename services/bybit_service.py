@@ -513,3 +513,30 @@ async def get_open_positions_with_pnl(api_key: str, api_secret: str) -> dict:
             logger.error(f"Exceção em get_open_positions_with_pnl: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
     return await asyncio.to_thread(_sync_call)
+
+# Adicione esta nova função em services/bybit_service.py
+# Pode ser adicionada após a função modify_position_stop_loss
+
+async def get_specific_position_size(api_key: str, api_secret: str, symbol: str) -> float:
+    """
+    Busca o tamanho (size) de uma posição específica aberta na Bybit.
+    Retorna 0.0 se a posição não existir.
+    """
+    def _sync_call():
+        try:
+            session = get_session(api_key, api_secret)
+            # Usamos o filtro de símbolo para buscar apenas a posição de interesse
+            response = session.get_positions(category="linear", symbol=symbol)
+            
+            if response.get('retCode') == 0:
+                position_list = response.get('result', {}).get('list', [])
+                if position_list and position_list[0]:
+                    # Retorna o tamanho da primeira (e única) posição na lista
+                    return float(position_list[0].get('size', 0.0))
+            # Se a lista estiver vazia ou houver erro, a posição não existe ou não foi encontrada
+            return 0.0
+        except Exception as e:
+            logger.error(f"Exceção em get_specific_position_size para {symbol}: {e}", exc_info=True)
+            return 0.0 # Em caso de erro, assumimos que não há posição para evitar fechamentos indevidos
+
+    return await asyncio.to_thread(_sync_call)

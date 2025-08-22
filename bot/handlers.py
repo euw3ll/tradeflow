@@ -776,11 +776,12 @@ async def manual_close_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         api_key = decrypt_data(user.api_key_encrypted)
         api_secret = decrypt_data(user.api_secret_encrypted)
 
-        close_result = close_partial_position(
+        close_result = await close_partial_position( # Adicionado 'await'
             api_key, 
             api_secret, 
             trade_to_close.symbol, 
-            trade_to_close.remaining_qty, 
+            # Usaremos o 'qty' total salvo no trade, pois o fechamento manual é para a posição inteira
+            trade_to_close.qty, 
             trade_to_close.side
         )
 

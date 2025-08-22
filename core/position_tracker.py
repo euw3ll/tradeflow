@@ -117,21 +117,32 @@ async def check_active_trades_for_user(application: Application, user: User, db:
     active_trades = db.query(Trade).filter(
         Trade.user_telegram_id == user.telegram_id,
         ~Trade.status.like('%CLOSED%')
-    ).all()
+    ).all() # [cite: 40]
     if not active_trades:
         return
 
-    logger.info(f"Rastreador: Verificando {len(active_trades)} trade(s) ativo(s) para o usuário {user.telegram_id}.")
-    api_key = decrypt_data(user.api_key_encrypted)
-    api_secret = decrypt_data(user.api_secret_encrypted)
+    logger.info(f"Rastreador: Verificando {len(active_trades)} trade(s) ativo(s) para o usuário {user.telegram_id}.") # [cite: 41]
+    api_key = decrypt_data(user.api_key_encrypted) # [cite: 41]
+    api_secret = decrypt_data(user.api_secret_encrypted) # [cite: 41]
 
     for trade in active_trades:
-        price_result = await get_market_price(trade.symbol)
+        # --- NOVA LÓGICA: VERIFICAÇÃO DE POSIÇÃO FANTASMA ---
+        live_position_size = await get_specific_position_size(api_key, api_secret, trade.symbol)
+        
+        if live_position_size <= 0:
+            logger.info(f"[tracker] Posição fantasma detectada para {trade.symbol} (user: {user.telegram_id}). DB status: {trade.status}, Live size: 0. Marcando como fechada.")
+            trade.status = 'CLOSED_GHOST' # Novo status para fácil identificação
+            trade.remaining_qty = 0.0
+            # Não notificamos o usuário para não poluir o chat, a posição simplesmente sumirá da lista.
+            continue # Pula para o próximo trade
+
+        # --- LÓGICA EXISTENTE (COM PEQUENOS AJUSTES) ---
+        price_result = await get_market_price(trade.symbol) # [cite: 41]
         if not price_result.get("success"):
-            logger.warning(f"[tracker] Falha ao obter preço de {trade.symbol}: {price_result.get('error')}")
+            logger.warning(f"[tracker] Falha ao obter preço de {trade.symbol}: {price_result.get('error')}") # [cite: 41]
             continue
 
-        current_price = price_result["price"]
+        current_price = price_result["price"] # [cite: 42]
         reached_tp = False
 
         # --- TAKE PROFIT ---
@@ -140,11 +151,8 @@ async def check_active_trades_for_user(application: Application, user: User, db:
             if (trade.side == 'LONG' and current_price >= next_target_price) or \
                (trade.side == 'SHORT' and current_price <= next_target_price):
 
-                db.refresh(trade)  # garante objeto atualizado do DB
-                # Fecha 50% se houver mais de 1 alvo restante,
-                # senão fecha tudo (último alvo)
-                qty_to_close = trade.remaining_qty if len(trade.initial_targets) == 1 \
-                               else (trade.remaining_qty / 2.0)
+                # AGORA, usamos o live_position_size para calcular o fechamento
+                qty_to_close = live_position_size if len(trade.initial_targets) == 1 else (live_position_size / 2.0)
 
                 close_result = await close_partial_position(
                     api_key, api_secret, trade.symbol, qty_to_close, trade.side
@@ -152,55 +160,45 @@ async def check_active_trades_for_user(application: Application, user: User, db:
 
                 if close_result.get("success"):
                     if close_result.get("skipped"):
-                        # Nada a fechar (qty virou 0 após ajuste de step/minQty)
-                        logger.info(
-                            f"[tracker] {trade.symbol}: fechamento parcial ignorado "
-                            f"(qty ajustada a zero). Mantendo trade e alvos."
-                        )
-                        # não notifica usuário como erro
+                        logger.info(f"[tracker] {trade.symbol}: fechamento parcial ignorado (qty ajustada a zero). Mantendo trade e alvos.") # [cite: 45, 46, 47]
                     else:
-                        # Move SL (trailing simples): no primeiro TP → para preço de entrada;
-                        # senão, pode mover para o último target atingido (simples).
                         new_stop_loss = trade.entry_price if trade.status == 'ACTIVE' else trade.initial_targets[-1]
-                        sl_result = await modify_position_stop_loss(api_key, api_secret, trade.symbol, new_stop_loss)
+                        sl_result = await modify_position_stop_loss(api_key, api_secret, trade.symbol, new_stop_loss) # [cite: 49]
 
                         if sl_result.get("success"):
-                            trade.remaining_qty -= qty_to_close
-                            # remove o alvo atingido
-                            trade.initial_targets = trade.initial_targets[1:]
+                            # A atualização do remaining_qty é uma estimativa, a fonte da verdade sempre será a exchange
+                            trade.remaining_qty = live_position_size - qty_to_close
+                            trade.initial_targets = trade.initial_targets[1:] # [cite: 50]
                             trade.current_stop_loss = new_stop_loss
                             reached_tp = True
 
-                            if trade.remaining_qty <= 0.0 or not trade.initial_targets:
+                            if trade.remaining_qty <= 0.00001 or not trade.initial_targets:
                                 trade.status = 'CLOSED_PROFIT'
                             else:
-                                trade.status = 'ACTIVE_TP_HIT'
+                                trade.status = 'ACTIVE_TP_HIT' # [cite: 52]
 
                             await application.bot.send_message(
                                 chat_id=user.telegram_id,
                                 text=(
-                                    f"💰 <b>Take Profit Atingido! ({trade.symbol})</b>\n"
+                                    f"💰 <b>Take Profit Atingido! ({trade.symbol})</b>\n" # [cite: 53, 54]
                                     f"Parte da posição foi realizada.\n"
                                     f"Novo Stop Loss: <b>{new_stop_loss:,.4f}</b>."
                                 ),
                                 parse_mode='HTML'
-                            )
+                            ) # [cite: 55]
                         else:
-                            logger.error(
-                                f"-> Falha ao mover Stop Loss para {user.telegram_id}: {sl_result.get('error')}"
-                            )
+                            logger.error(f"-> Falha ao mover Stop Loss para {user.telegram_id}: {sl_result.get('error')}") # [cite: 56]
                             await application.bot.send_message(
                                 chat_id=user.telegram_id,
-                                text=f"⚠️ Falha ao mover seu Stop Loss para {trade.symbol}.",
+                                text=f"⚠️ Falha ao mover seu Stop Loss para {trade.symbol}.", # [cite: 57]
                                 parse_mode='HTML'
-                            )
+                            ) # [cite: 58]
                 else:
-                    # Só notifica se NÃO for skip
                     err = close_result.get('error')
-                    logger.error(f"-> Falha ao fechar posição parcial para {user.telegram_id}: {err}")
+                    logger.error(f"-> Falha ao fechar posição parcial para {user.telegram_id}: {err}") # [cite: 59]
                     await application.bot.send_message(
                         chat_id=user.telegram_id,
-                        text=f"⚠️ Falha ao realizar seu lucro parcial para {trade.symbol}.",
+                        text=f"⚠️ Falha ao realizar seu lucro parcial para {trade.symbol}.", # [cite: 60]
                         parse_mode='HTML'
                     )
 
@@ -209,16 +207,16 @@ async def check_active_trades_for_user(application: Application, user: User, db:
             stop_hit = (
                 (trade.side == 'LONG' and current_price <= trade.current_stop_loss) or
                 (trade.side == 'SHORT' and current_price >= trade.current_stop_loss)
-            )
+            ) # [cite: 60, 61]
             if stop_hit:
-                logger.info(f"STOP LOSS ATINGIDO para {trade.symbol} do usuário {user.telegram_id}.")
-                trade.status = 'CLOSED_LOSS'
-                trade.remaining_qty = 0.0
+                logger.info(f"STOP LOSS ATINGIDO para {trade.symbol} do usuário {user.telegram_id}.") # [cite: 61]
+                trade.status = 'CLOSED_LOSS' # [cite: 62]
+                trade.remaining_qty = 0.0 # [cite: 62]
                 await application.bot.send_message(
                     chat_id=user.telegram_id,
-                    text=f"🛑 <b>Stop Loss Atingido</b>\n<b>Moeda:</b> {trade.symbol}",
+                    text=f"🛑 <b>Stop Loss Atingido</b>\n<b>Moeda:</b> {trade.symbol}", # [cite: 62]
                     parse_mode='HTML'
-                )
+                ) # [cite: 63]
 
 
 async def run_tracker(application: Application):
