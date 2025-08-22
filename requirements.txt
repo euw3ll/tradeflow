@@ -4,3 +4,4 @@ SQLAlchemy
 cryptography
 pybit
 telethon
+alembic==1.13.1
