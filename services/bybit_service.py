@@ -63,57 +63,91 @@ async def get_account_info(api_key: str, api_secret: str) -> dict:
     return await asyncio.to_thread(_sync_call)
 
 async def place_order(api_key: str, api_secret: str, signal_data: dict, user_settings: User, balance: float) -> dict:
-    """Abre uma nova posição a mercado de forma assíncrona."""
+    """Abre uma nova posição a mercado (Market) respeitando qtyStep/minOrderQty da Bybit."""
     def _sync_call():
+        from decimal import Decimal
         try:
             session = get_session(api_key, api_secret)
+
             symbol = signal_data['coin']
-            side = "Buy" if signal_data['order_type'] == 'LONG' else "Sell"
+            order_type = (signal_data.get('order_type') or '').upper()
+            side = "Buy" if order_type == 'LONG' else "Sell"
             leverage = str(user_settings.max_leverage)
-            entry_price = signal_data['entries'][0]
-            stop_loss_price = str(signal_data['stop_loss'])
-            take_profit_price = str(signal_data['targets'][0]) if signal_data.get('targets') else None
-            
-            entry_percent = user_settings.entry_size_percent
-            position_size_dollars = balance * (entry_percent / 100)
-            unrounded_qty = position_size_dollars / entry_price
 
-            # --- LÓGICA DE PRECISÃO DE QUANTIDADE ADICIONADA ---
-            # Para moedas de preço baixo (como XRP), a quantidade deve ser um número inteiro.
-            # Para moedas de preço alto (como BTC), precisamos de casas decimais.
-            if entry_price < 2.0: # Regra simples: se o preço for menor que $2, trata como inteiro
-                qty = int(unrounded_qty)
-            else:
-                qty = round(unrounded_qty, 5)
+            # preço de referência do sinal para sizing (não é enviado na ordem Market)
+            entry_price = Decimal(str(signal_data['entries'][0]))
+            stop_loss_price = signal_data.get('stop_loss')
+            take_profit_price = (signal_data.get('targets') or [None])[0]
 
-            if qty == 0:
-                return {"success": False, "error": "Quantidade calculada é zero. Verifique o saldo ou a % de entrada."}
+            # ----- filtros do símbolo (tick/step/minQty) -----
+            try:
+                tick, step, min_qty = _get_symbol_filters(session, symbol)
+            except Exception as e:
+                logger.warning(f"[bybit_service] Falha ao obter filtros para {symbol}, usando defaults. Erro: {e}")
+                tick, step, min_qty = Decimal("0.0001"), Decimal("0.001"), Decimal("0")
 
-            logger.info(f"Calculando ordem A MERCADO para {symbol}: Side={side}, Qty={qty}, Size=${position_size_dollars:.2f}")
+            # ----- sizing em dólares -> qty (contratos) -----
+            entry_percent = Decimal(str(user_settings.entry_size_percent))
+            balance_dec = Decimal(str(balance))
+            position_size_dollars = balance_dec * (entry_percent / Decimal("100"))
 
+            if entry_price <= 0:
+                return {"success": False, "error": f"Preço de entrada inválido para sizing: {entry_price}"}
+
+            qty_raw = position_size_dollars / entry_price
+            qty_dec = _round_down_to_step(qty_raw, step)
+
+            if qty_dec <= 0:
+                return {"success": False, "error": f"Quantidade após ajuste ficou zero (raw={qty_raw}, step={step})."}
+
+            if qty_dec < min_qty:
+                # eleva ao mínimo permitido
+                qty_dec = min_qty
+
+            logger.info(
+                f"Calculando ORDEM A MERCADO para {symbol}: "
+                f"Side={side}, Qty={qty_dec} (step={step}, minQty={min_qty}), "
+                f"posSize=${position_size_dollars}, refPrice={entry_price}"
+            )
+
+            # ----- alavancagem -----
             try:
                 session.set_leverage(category="linear", symbol=symbol, buyLeverage=leverage, sellLeverage=leverage)
             except InvalidRequestError as e:
-                if "leverage not modified" in str(e):
+                if "leverage not modified" in str(e).lower():
                     logger.warning(f"Alavancagem para {symbol} já está correta. Continuando...")
-                    pass
                 else:
-                    raise e
+                    raise
 
-            response = session.place_order(
-                category="linear", symbol=symbol, side=side, orderType="Market",
-                qty=str(qty), takeProfit=take_profit_price, stopLoss=stop_loss_price, isLeverage=1
-            )
+            # ----- envio da Market -----
+            payload = {
+                "category": "linear",
+                "symbol": symbol,
+                "side": side,
+                "orderType": "Market",
+                "qty": str(qty_dec),
+                "isLeverage": 1,
+            }
+            if take_profit_price is not None:
+                payload["takeProfit"] = str(take_profit_price)
+            if stop_loss_price is not None:
+                payload["stopLoss"] = str(stop_loss_price)
+
+            logger.info(f"[bybit_service] Enviando MARKET {payload}")
+            response = session.place_order(**payload)
+
             if response.get('retCode') == 0:
                 return {"success": True, "data": response['result']}
             else:
                 return {"success": False, "error": response.get('retMsg')}
+
         except Exception as e:
-            logger.error(f"Exceção ao abrir ordem: {e}", exc_info=True)
+            logger.error(f"Exceção ao abrir ordem (Market): {e}", exc_info=True)
             return {"success": False, "error": str(e)}
+
     return await asyncio.to_thread(_sync_call)
 
-    
+
 async def get_market_price(symbol: str) -> dict:
     """Busca o preço de mercado atual de forma assíncrona."""
     def _sync_call():
