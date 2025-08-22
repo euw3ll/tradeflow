@@ -25,6 +25,7 @@ from core.trade_manager import execute_signal_for_all_users
 (WAITING_CODE, WAITING_API_KEY, WAITING_API_SECRET, CONFIRM_REMOVE_API) = range(4)
 (ASKING_ENTRY_PERCENT, ASKING_MAX_LEVERAGE, ASKING_MIN_CONFIDENCE) = range(10, 13)
 (ASKING_PROFIT_TARGET, ASKING_LOSS_LIMIT) = range(13, 15)
+ASKING_COIN_WHITELIST = 15
 
 logger = logging.getLogger(__name__)
 
@@ -1043,3 +1044,68 @@ async def performance_menu_handler(update: Update, context: ContextTypes.DEFAULT
             parse_mode='HTML',
             reply_markup=performance_menu_keyboard()
         )
+
+# --- FLUXO DE CONFIGURAÇÃO DE WHITELIST ---
+
+async def ask_coin_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Pergunta ao usuário sua nova whitelist de moedas."""
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    
+    context.user_data['settings_message_id'] = query.message.message_id
+    
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter_by(telegram_id=user_id).first()
+        current_whitelist = user.coin_whitelist if user else 'todas'
+    finally:
+        db.close()
+
+    instructions = (
+        f"<b>✅ Whitelist de Moedas</b>\n\n"
+        f"Sua configuração atual é: <code>{current_whitelist}</code>\n\n"
+        f"Envie uma lista de moedas e/ou categorias separadas por vírgula.\n\n"
+        f"<b>Exemplos:</b>\n"
+        f"• <code>todas</code> (para operar todos os sinais)\n"
+        f"• <code>btcusdt, ethusdt, solusdt</code>\n"
+        f"• <code>memecoins, btcusdt</code> (opera moedas meme + BTC)\n\n"
+        f"<b>Categorias disponíveis:</b> <code>memecoins</code>, <code>altcoins</code>, <code>defi</code>."
+    )
+    
+    await query.edit_message_text(text=instructions, parse_mode='HTML')
+    return ASKING_COIN_WHITELIST
+
+async def receive_coin_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Recebe, valida e salva a nova whitelist."""
+    user_id = update.effective_user.id
+    message_id_to_edit = context.user_data.get('settings_message_id')
+    
+    # Apaga a mensagem do usuário para manter o chat limpo
+    await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id)
+
+    # Normaliza a entrada: remove espaços extras e converte para minúsculas
+    whitelist_text = update.message.text.lower().strip()
+    
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter_by(telegram_id=user_id).first()
+        if user:
+            user.coin_whitelist = whitelist_text
+            db.commit()
+            
+            feedback_text = (
+                f"✅ Whitelist de moedas atualizada para: <code>{whitelist_text}</code>"
+            )
+
+            await context.bot.edit_message_text(
+                chat_id=update.effective_chat.id,
+                message_id=message_id_to_edit,
+                text=feedback_text,
+                parse_mode='HTML',
+                reply_markup=settings_menu_keyboard(user)
+            )
+    finally:
+        db.close()
+
+    return ConversationHandler.END

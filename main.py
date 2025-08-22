@@ -19,6 +19,7 @@ from bot.handlers import (
     bot_config_handler, toggle_approval_mode_handler, handle_signal_approval, 
     ask_profit_target, receive_profit_target, ASKING_PROFIT_TARGET,
     ask_loss_limit, receive_loss_limit, ASKING_LOSS_LIMIT, 
+    ask_coin_whitelist, receive_coin_whitelist, ASKING_COIN_WHITELIST,
     performance_menu_handler
 )
 from database.session import init_db
@@ -94,7 +95,12 @@ async def main():
         states={ ASKING_LOSS_LIMIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_loss_limit)] },
         fallbacks=[CommandHandler("cancel", cancel)], per_message=False,
     )
-    
+    whitelist_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(ask_coin_whitelist, pattern='^set_coin_whitelist$')],
+        states={ ASKING_COIN_WHITELIST: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_coin_whitelist)] },
+        fallbacks=[CommandHandler("cancel", cancel)], per_message=False,
+    )
+
     # Adicionando todos os handlers
     application.add_handler(register_conv)
     application.add_handler(api_conv)
@@ -104,6 +110,7 @@ async def main():
     application.add_handler(settings_confidence_conv)
     application.add_handler(profit_target_conv)
     application.add_handler(loss_limit_conv)
+    application.add_handler(whitelist_conv)
     
     application.add_handler(CommandHandler("admin", admin_menu))
     application.add_handler(CallbackQueryHandler(list_channels_handler, pattern='^admin_list_channels$'))

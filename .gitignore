@@ -20,4 +20,7 @@ __pycache__/
 *.session-journal
 
 # Arquivos do VSCode
-.vscode/
+.vscode/tradeflow.db
+*.db-journal
+tradeflow.db
+*.db-journal

@@ -14,6 +14,7 @@ from utils.security import decrypt_data
 from utils.config import ADMIN_ID
 from bot.keyboards import signal_approval_keyboard
 from services.signal_parser import SignalType
+from core.whitelist_service import is_coin_in_whitelist
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +75,11 @@ async def execute_signal_for_all_users(signal_data: dict, application: Applicati
     logger.info(f"Sinal ({signal_type}) aprovado. Replicando para {len(all_users_to_trade)} usuário(s)...")
 
     for user in all_users_to_trade:
+        if not is_coin_in_whitelist(symbol, user.coin_whitelist):
+            logger.info(f"Sinal para {symbol} ignorado para o usuário {user.telegram_id} devido à sua whitelist ('{user.coin_whitelist}').")
+            # Opcional: notificar o usuário que o sinal foi ignorado
+            # await application.bot.send_message(chat_id=user.telegram_id, text=f"ℹ️ Sinal para {symbol} ignorado devido à sua whitelist.")
+            continue # Pula para o próximo usuário
         if signal_type == SignalType.MARKET:
             await _execute_trade(signal_data, user, application, db, source_name)
         elif signal_type == SignalType.LIMIT:

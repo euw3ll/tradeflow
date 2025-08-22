@@ -60,19 +60,20 @@ def settings_menu_keyboard(user_settings):
     """
     Retorna o teclado do menu de configurações, mostrando os valores atuais.
     """
-    # Pega os valores do objeto do usuário
-    entry_percent = user_settings.entry_size_percent # Campo atualizado
+    entry_percent = user_settings.entry_size_percent
     max_leverage = user_settings.max_leverage
     min_confidence = user_settings.min_confidence
 
     keyboard = [
-        # --- BOTÃO ATUALIZADO ---
         [InlineKeyboardButton(f"Tamanho da Entrada: {entry_percent:.2f}%", callback_data='set_entry_percent')],
         [InlineKeyboardButton(f"Alavancagem Máxima: {max_leverage}x", callback_data='set_max_leverage')],
         [InlineKeyboardButton(f"Confiança Mínima (IA): {min_confidence:.2f}%", callback_data='set_min_confidence')],
+        # --- ADICIONE O NOVO BOTÃO AQUI ---
+        [InlineKeyboardButton("✅ Whitelist de Moedas", callback_data='set_coin_whitelist')],
         [InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data='back_to_main_menu')]
     ]
     return InlineKeyboardMarkup(keyboard)
+
 
 def bot_config_keyboard(user_settings):
     """
