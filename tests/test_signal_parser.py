@@ -131,3 +131,4 @@ def test_parse_signal_without_spaces_after_emojis():
     assert data["entries"] == [22.85, 22.85]
     assert data["stop_loss"] == 24.22
     assert data["targets"] == [22.69, 22.55]
+
