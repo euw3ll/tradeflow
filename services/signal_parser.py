@@ -1,5 +1,6 @@
 import re
 import logging
+import unicodedata
 from typing import Dict, Any, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -44,21 +45,25 @@ def _full_signal_extractor(message_text: str) -> Optional[Dict[str, Any]]:
         matches = re.findall(pattern, text, re.IGNORECASE | re.MULTILINE)
         return [float(v.replace(',', '.')) for v in matches]
 
-    text_lower = message_text.lower()
+    def normalize_text(text: str) -> str:
+        """Remove acentos e converte para minúsculas."""
+        return unicodedata.normalize("NFKD", text).encode("ASCII", "ignore").decode("utf-8").lower()
+
+    text_normalized = normalize_text(message_text)
     signal_type = None
-    if 'ordem limite' in text_lower:
+    if 'ordem limite' in text_normalized:
         signal_type = SignalType.LIMIT
-    elif 'ordem à mercado' in text_lower or 'sinal entrou no preço' in text_lower:
+    elif 'ordem a mercado' in text_normalized or 'sinal entrou no preco' in text_normalized:
         signal_type = SignalType.MARKET
 
     # Regex atualizadas para serem mais tolerantes, buscando do início da linha (^)
-    # e ignorando emojis ou texto inicial com (?:.*\s)?
-    coin = find_single_value(r'^(?:.*\s)?(?:Moeda|Coin|Pair):\s*(\w+)', message_text)
-    order_type = find_single_value(r'^(?:.*\s)?Tipo:\s*(LONG|SHORT)', message_text)
-    entry_zone_str = find_single_value(r'^(?:.*\s)?Zona\s*de\s*Entrada:\s*([\d\.\,\s-]+)', message_text)
-    stop_loss_str = find_single_value(r'^(?:.*\s)?Stop\s*Loss:\s*([\d\.\,]+)', message_text)
+    # e ignorando emojis ou texto inicial sem exigir espaço após o emoji.
+    coin = find_single_value(r'^\W*(?:Moeda|Coin|Pair):\s*(\w+)', message_text)
+    order_type = find_single_value(r'^\W*Tipo:\s*(LONG|SHORT)', message_text)
+    entry_zone_str = find_single_value(r'^\W*Zona\s*de\s*Entrada:\s*([\d\.\,\s-]+)', message_text)
+    stop_loss_str = find_single_value(r'^\W*Stop\s*Loss:\s*([\d\.\,]+)', message_text)
     targets = find_multiple_values(r'T\d+:\s*([\d\.\,]+)', message_text)
-    confidence_str = find_single_value(r'^(?:.*\s)?Confiança:\s*([\d\.\,]+)%', message_text)
+    confidence_str = find_single_value(r'^\W*Confiança:\s*([\d\.\,]+)%', message_text)
 
 
     # Validação essencial: Se não for um sinal de entrada completo, retorna None

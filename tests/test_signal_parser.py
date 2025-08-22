@@ -88,3 +88,46 @@ def test_parse_complex_signal_with_emojis_and_extra_text():
     assert data["stop_loss"] == 2.9
     assert data["targets"] == [2.44, 2.37, 2.29, 2.2]
     assert data["confidence"] == 66.67
+
+
+def test_parse_market_signal_without_accent():
+    message = textwrap.dedent(
+        """
+        🏁 #123 - Ordem a Mercado
+        Moeda: AVAX
+        Tipo: SHORT (Futures)
+        Zona de Entrada: 22.85 - 22.85
+        Stop Loss: 24.22
+        Alvos:
+        T1: 22.69
+        """
+    )
+
+    data = parse_signal(message)
+
+    assert data["type"] == SignalType.MARKET
+    assert data["coin"] == "AVAXUSDT"
+
+
+def test_parse_signal_without_spaces_after_emojis():
+    message = textwrap.dedent(
+        """
+        🏁#39170 - Ordem à Mercado
+        💎Moeda: AVAX
+        📊Tipo: SHORT (Futures)
+        💰Zona de Entrada: 22.85000000 - 22.85000000
+        🛑Stop Loss: 24.22000000 (5.9956%)
+        T1: 22.69000000 (0.70%)
+        T2: 22.55000000 (1.31%)
+        """
+    )
+
+    data = parse_signal(message)
+
+    assert data is not None, "O parser deve interpretar sinais sem espaços após emojis"
+    assert data["type"] == SignalType.MARKET
+    assert data["coin"] == "AVAXUSDT"
+    assert data["order_type"] == "SHORT"
+    assert data["entries"] == [22.85, 22.85]
+    assert data["stop_loss"] == 24.22
+    assert data["targets"] == [22.69, 22.55]
