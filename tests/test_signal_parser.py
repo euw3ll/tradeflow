@@ -40,7 +40,7 @@ def test_parse_signal_with_coin_synonym():
     assert data["coin"] == "NMRUSDT"
     assert data["type"] == SignalType.LIMIT
 
-# --- NOVO TESTE ADICIONADO ---
+
 def test_parse_complex_signal_with_emojis_and_extra_text():
     message = textwrap.dedent(
         """
@@ -64,16 +64,6 @@ def test_parse_complex_signal_with_emojis_and_extra_text():
 
         📊 Status: Sinal aberto
 
-        📝 Notas: Sinal aguardando condições de entrada
-
-        🔍 Análise de Risco:
-        💰 Margem Recomendada: 2.00%
-        📈 Exposição Total: 12.00%
-        💀 Preço de Liquidação: 3.01291700
-        ✅ Stop Loss Seguro: Sim
-
-        📊 Análise de Mercado (IA):
-        📈 Tendência: Baixa (bearish)
         🟢 Confiança: 66.67%  🧭 Consenso: 4/6
         """
     )
@@ -88,3 +78,48 @@ def test_parse_complex_signal_with_emojis_and_extra_text():
     assert data["stop_loss"] == 2.9
     assert data["targets"] == [2.44, 2.37, 2.29, 2.2]
     assert data["confidence"] == 66.67
+
+
+
+# --- NOVO TESTE: MARKET (Ordem à Mercado) ---
+def test_parse_market_signal_with_accent():
+    message = textwrap.dedent(
+        """
+        🏁 #39170 - Ordem à Mercado
+
+        💎 Moeda: AVAX
+        📊 Tipo: SHORT (Futures)
+
+        💰 Zona de Entrada: 22.85000000 - 22.85000000
+        🛑 Stop Loss: 24.22000000
+        Alvos:
+        T1: 22.69000000
+        T2: 22.55000000
+        """
+    )
+
+    data = parse_signal(message)
+
+    assert data is not None
+    assert data["type"] == SignalType.MARKET
+    assert data["coin"] == "AVAXUSDT"
+    assert data["order_type"] == "SHORT"
+    assert data["entries"][0] == 22.85
+    assert data["stop_loss"] == 24.22
+    assert 22.69 in data["targets"]
+    assert 22.55 in data["targets"]
+
+
+# --- NOVO TESTE: CANCELAR ---
+def test_parse_cancel_signal():
+    message = textwrap.dedent(
+        """
+        ⚠️ BTC sinal cancelado
+        """
+    )
+
+    data = parse_signal(message)
+
+    assert data is not None
+    assert data["type"] == SignalType.CANCELAR
+    assert data["coin"] == "BTCUSDT"

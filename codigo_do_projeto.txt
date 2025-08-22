@@ -730,6 +730,12 @@ async def process_new_signal(signal_data: dict, application: Application, source
         db.close()
 
 ========================================
+# Arquivo: tests/__init__.py
+========================================
+
+
+
+========================================
 # Arquivo: tests/test_signal_parser.py
 ========================================
 
@@ -775,6 +781,54 @@ def test_parse_signal_with_coin_synonym():
     assert data["coin"] == "NMRUSDT"
     assert data["type"] == SignalType.LIMIT
 
+# --- NOVO TESTE ADICIONADO ---
+def test_parse_complex_signal_with_emojis_and_extra_text():
+    message = textwrap.dedent(
+        """
+        ⏳ #38792 - Ordem Limite
+
+        📢 Canal: GRE - 58
+        🌐 Plataforma: telegram
+
+        💎 Moeda: CYBER
+        📊 Tipo: SHORT (Futures)
+        📈 Alavancagem: 10x
+
+        💰 Zona de Entrada: 2.52500000 - 2.64000000
+        🛑 Stop Loss: 2.90000000 (12.2943%)
+        🎯 Alvos:
+        T1: 2.44000000 (5.52%)
+        T2: 2.37000000 (8.23%)
+        T3: 2.29000000 (11.33%)
+        T4: 2.20000000 (14.81%)
+        ☯️ R/R ratio: 0.4
+
+        📊 Status: Sinal aberto
+
+        📝 Notas: Sinal aguardando condições de entrada
+
+        🔍 Análise de Risco:
+        💰 Margem Recomendada: 2.00%
+        📈 Exposição Total: 12.00%
+        💀 Preço de Liquidação: 3.01291700
+        ✅ Stop Loss Seguro: Sim
+
+        📊 Análise de Mercado (IA):
+        📈 Tendência: Baixa (bearish)
+        🟢 Confiança: 66.67%  🧭 Consenso: 4/6
+        """
+    )
+
+    data = parse_signal(message)
+
+    assert data is not None, "O parser não deveria retornar None para este sinal"
+    assert data["type"] == SignalType.LIMIT
+    assert data["coin"] == "CYBERUSDT"
+    assert data["order_type"] == "SHORT"
+    assert data["entries"] == [2.525, 2.64]
+    assert data["stop_loss"] == 2.9
+    assert data["targets"] == [2.44, 2.37, 2.29, 2.2]
+    assert data["confidence"] == 66.67
 
 ========================================
 # Arquivo: utils/__init__.py
@@ -853,137 +907,6 @@ if __name__ == "__main__":
         create_invite_code(code_to_create)
     else:
         print("Erro: Por favor, forneça um código para criar. Exemplo: python create_invite.py MEU-CODIGO-NOVO")
-
-========================================
-# Arquivo: scripts/generate_session.py
-========================================
-
-import asyncio
-from telethon.sync import TelegramClient
-from dotenv import load_dotenv
-import os
-
-# Carrega as variáveis de ambiente (API_ID, API_HASH)
-load_dotenv()
-API_ID = os.getenv('API_ID')
-API_HASH = os.getenv('API_HASH')
-
-# --- CORREÇÃO PRINCIPAL ---
-# Define o caminho completo para salvar o arquivo dentro do volume persistente
-SESSION_NAME = '/data/tradeflow_user'
-
-async def main():
-    print(f"Gerando o arquivo de sessão em '{SESSION_NAME}.session'...")
-    # Usa 'with' para garantir que o cliente se desconecte corretamente
-    async with TelegramClient(SESSION_NAME, API_ID, API_HASH) as client:
-        me = await client.get_me()
-        print(f"Login bem-sucedido como: {me.first_name}")
-        print("Arquivo de sessão foi criado/atualizado com sucesso no local correto.")
-
-if __name__ == "__main__":
-    asyncio.run(main())
-
-========================================
-# Arquivo: scripts/test_bybit_connection.py
-========================================
-
-import os
-import logging
-from dotenv import load_dotenv
-from pybit.unified_trading import HTTP
-
-# Configura o logging para vermos mais detalhes em caso de erro
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-def test_connection():
-    """
-    Script de teste isolado para validar a conexão e as credenciais da Bybit.
-    """
-    # 1. Carrega as credenciais do seu arquivo .env
-    load_dotenv()
-    api_key = os.getenv("BYBIT_API_KEY")
-    api_secret = os.getenv("BYBIT_API_SECRET")
-
-    if not api_key or not api_secret:
-        print("\n❌ ERRO: Verifique se BYBIT_API_KEY e BYBIT_API_SECRET estão no seu arquivo .env")
-        return
-
-    print("\n--- INICIANDO TESTE DE CONEXÃO COM A BYBIT ---")
-    print(f"Usando API Key que termina em: ...{api_key[-4:]}")
-
-    try:
-        # 2. Tenta criar a sessão e buscar o saldo (exatamente como o bot faz)
-        session = HTTP(
-            testnet=False, # Conectando na conta REAL
-            api_key=api_key,
-            api_secret=api_secret
-        )
-        
-        print("\nEtapa 1: Conectando e buscando saldo da Carteira Unificada...")
-        response = session.get_wallet_balance(accountType="UNIFIED")
-
-        # 3. Analisa a resposta da Bybit
-        if response.get('retCode') == 0:
-            print("\n✅ SUCESSO! Conexão bem-sucedida e permissões corretas.")
-            balance = response['result']['list'][0]['totalEquity']
-            print(f"   - Saldo Total da Conta Unificada: {balance} USDT")
-        else:
-            print("\n❌ FALHA! A Bybit retornou um erro.")
-            print(f"   - Código do Erro: {response.get('retCode')}")
-            print(f"   - Mensagem da API: {response.get('retMsg')}")
-
-    except Exception as e:
-        print("\n❌ FALHA CRÍTICA! Ocorreu uma exceção ao tentar conectar.")
-        print("   Isso geralmente indica um problema de rede (bloqueio de IP) ou de configuração do ambiente.")
-        print(f"\n   Detalhes do Erro:\n   {e}")
-
-    print("\n--- TESTE FINALIZADO ---")
-
-if __name__ == "__main__":
-    test_connection()
-
-========================================
-# Arquivo: scripts/test_trade.py
-========================================
-
-import os
-from dotenv import load_dotenv
-from services.bybit_service import get_account_info
-import json
-
-load_dotenv()
-
-BYBIT_API_KEY = os.getenv("BYBIT_API_KEY")
-BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET")
-
-def run_auth_test():
-    if not BYBIT_API_KEY or not BYBIT_API_SECRET:
-        print("❌ Por favor, defina BYBIT_API_KEY e BYBIT_API_SECRET no seu arquivo .env")
-        return
-
-    # --- LINHAS DE DIAGNÓSTICO ADICIONADAS ---
-    print("="*40)
-    print("VERIFICAÇÃO DAS CHAVES CARREGADAS PELO SCRIPT:")
-    print(f"API Key lida....: {BYBIT_API_KEY[:4]}...{BYBIT_API_KEY[-4:]}")
-    print(f"API Secret lida..: {BYBIT_API_SECRET[:4]}...{BYBIT_API_SECRET[-4:]}")
-    print("="*40)
-    # ---------------------------------------------
-
-    print("\n▶️  Tentando autenticar e buscar o saldo da conta de testes...")
-    
-    result = get_account_info(BYBIT_API_KEY, BYBIT_API_SECRET)
-    
-    print("\n" + "="*30)
-    if result.get("success"):
-        print("✅ Autenticação bem-sucedida!")
-        print(json.dumps(result.get("data"), indent=2))
-    else:
-        print("❌ Falha na autenticação.")
-        print(f"Motivo: {result.get('error')}")
-    print("="*30)
-
-if __name__ == "__main__":
-    run_auth_test()
 
 ========================================
 # Arquivo: bot/__init__.py
@@ -2484,11 +2407,14 @@ def _full_signal_extractor(message_text: str) -> Optional[Dict[str, Any]]:
     Função dedicada para extrair todos os detalhes de um sinal de entrada completo.
     """
     def find_single_value(pattern: str, text: str) -> Optional[str]:
-        match = re.search(pattern, text, re.IGNORECASE)
+        # A nova regex usa '.*?' para pular qualquer caractere (como emojis)
+        # entre o início da linha (ou a keyword) e o valor que queremos capturar.
+        match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
         return match.group(1).strip() if match else None
 
     def find_multiple_values(pattern: str, text: str) -> List[float]:
-        matches = re.findall(pattern, text, re.IGNORECASE)
+        # Adicionamos '.*?' aqui também para maior robustez.
+        matches = re.findall(pattern, text, re.IGNORECASE | re.MULTILINE)
         return [float(v.replace(',', '.')) for v in matches]
 
     text_lower = message_text.lower()
@@ -2498,16 +2424,22 @@ def _full_signal_extractor(message_text: str) -> Optional[Dict[str, Any]]:
     elif 'ordem à mercado' in text_lower or 'sinal entrou no preço' in text_lower:
         signal_type = SignalType.MARKET
 
-    coin = find_single_value(r'(?:💎\s*)?(?:Moeda|Coin|Pair):\s*(\w+)', message_text)
-    order_type = find_single_value(r'Tipo:\s*(LONG|SHORT)', message_text)
-    entry_zone_str = find_single_value(r'Zona\s*de\s*Entrada:\s*([\d\.\,\s-]+)', message_text)
-    stop_loss_str = find_single_value(r'Stop\s*Loss:\s*([\d\.\,]+)', message_text)
+    # Regex atualizadas para serem mais tolerantes, buscando do início da linha (^)
+    # e ignorando emojis ou texto inicial com (?:.*\s)?
+    coin = find_single_value(r'^(?:.*\s)?(?:Moeda|Coin|Pair):\s*(\w+)', message_text)
+    order_type = find_single_value(r'^(?:.*\s)?Tipo:\s*(LONG|SHORT)', message_text)
+    entry_zone_str = find_single_value(r'^(?:.*\s)?Zona\s*de\s*Entrada:\s*([\d\.\,\s-]+)', message_text)
+    stop_loss_str = find_single_value(r'^(?:.*\s)?Stop\s*Loss:\s*([\d\.\,]+)', message_text)
     targets = find_multiple_values(r'T\d+:\s*([\d\.\,]+)', message_text)
-    confidence_str = find_single_value(r'Confiança:\s*([\d\.\,]+)%', message_text)
+    confidence_str = find_single_value(r'^(?:.*\s)?Confiança:\s*([\d\.\,]+)%', message_text)
+
 
     # Validação essencial: Se não for um sinal de entrada completo, retorna None
     if not all([signal_type, coin, order_type, entry_zone_str, stop_loss_str]):
-        logger.debug("[Parser] Mensagem não corresponde a um sinal de entrada completo. Ignorando.")
+        # Adiciona log para depuração em caso de falha
+        logger.warning(f"[Parser] Mensagem não correspondeu a um sinal completo. Detalhes:\n"
+                     f"- signal_type: {signal_type}\n- coin: {coin}\n- order_type: {order_type}\n"
+                     f"- entry_zone_str: {entry_zone_str}\n- stop_loss_str: {stop_loss_str}")
         return None
 
     entries = [float(val.replace(',', '.')) for val in re.findall(r'([\d\.\,]+)', entry_zone_str)]
@@ -2558,7 +2490,6 @@ def parse_signal(message_text: str) -> Optional[Dict[str, Any]]:
 
     logger.info("[Parser] Nenhum padrão de sinal conhecido foi encontrado na mensagem.")
     return None
-
 
 ========================================
 # Arquivo: services/telethon_service.py

@@ -79,24 +79,81 @@ async def execute_signal_for_all_users(signal_data: dict, application: Applicati
         elif signal_type == SignalType.LIMIT:
             existing_pending = db.query(PendingSignal).filter_by(user_telegram_id=user.telegram_id, symbol=symbol).first()
             if existing_pending:
-                await application.bot.send_message(chat_id=user.telegram_id, text=f"ℹ️ Você já tem uma ordem limite pendente para <b>{symbol}</b>. O novo sinal foi ignorado.", parse_mode='HTML')
+                await application.bot.send_message(
+                    chat_id=user.telegram_id,
+                    text=f"ℹ️ Você já tem uma ordem limite pendente para <b>{symbol}</b>. O novo sinal foi ignorado.",
+                    parse_mode='HTML'
+                )
                 continue
-            
+
+            # ---- NOVO: escolher um único preço para a ordem limite ----
+            entries = (signal_data.get('entries') or [])[:2]
+            if not entries:
+                await application.bot.send_message(
+                    chat_id=user.telegram_id,
+                    text=f"❌ Sinal LIMIT para <b>{symbol}</b> sem preços de entrada válidos.",
+                    parse_mode='HTML'
+                )
+                continue
+
+            if len(entries) == 1:
+                limit_price = float(entries[0])
+            else:
+                lo = float(min(entries[0], entries[1]))
+                hi = float(max(entries[0], entries[1]))
+                if (signal_data.get('order_type') or '').upper() == 'LONG':
+                    limit_price = lo   # LONG -> comprar no mais baixo da faixa
+                else:
+                    limit_price = hi   # SHORT -> vender no mais alto da faixa
+
+            # injeta no payload para a bybit_service
+            signal_data_with_price = dict(signal_data)
+            signal_data_with_price['limit_price'] = limit_price
+            # -----------------------------------------------------------
+
             user_api_key = decrypt_data(user.api_key_encrypted)
             user_api_secret = decrypt_data(user.api_secret_encrypted)
+
             account_info = await get_account_info(user_api_key, user_api_secret)
-            balance = float(account_info.get("data", [{}])[0].get('totalEquity', 0))
-            limit_order_result = await place_limit_order(user_api_key, user_api_secret, signal_data, user, balance)
+            if not account_info.get("success"):
+                await application.bot.send_message(
+                    chat_id=user.telegram_id,
+                    text=f"❌ Falha ao buscar seu saldo Bybit para posicionar LIMIT em <b>{symbol}</b>.",
+                    parse_mode='HTML'
+                )
+                continue
+
+            balance = float((account_info.get("data") or [{}])[0].get('totalEquity', 0))
+
+            # >>> IMPORTANTE: agora enviamos signal_data_with_price <<<
+            limit_order_result = await place_limit_order(user_api_key, user_api_secret, signal_data_with_price, user, balance)
 
             if limit_order_result.get("success"):
                 order_id = limit_order_result["data"]["orderId"]
-                db.add(PendingSignal(user_telegram_id=user.telegram_id, symbol=symbol, order_id=order_id, signal_data=signal_data))
-                await application.bot.send_message(chat_id=user.telegram_id, text=f"✅ Ordem Limite para <b>{symbol}</b> foi posicionada. Monitorando...", parse_mode='HTML')
+                db.add(PendingSignal(
+                    user_telegram_id=user.telegram_id,
+                    symbol=symbol,
+                    order_id=order_id,
+                    signal_data=signal_data_with_price
+                ))
+                await application.bot.send_message(
+                    chat_id=user.telegram_id,
+                    text=(
+                        f"✅ Ordem <b>Limite</b> posicionada para <b>{symbol}</b> ({signal_data.get('order_type')}).\n"
+                        f"🎯 Preço: <b>{limit_price}</b>\n"
+                        f"🛑 Stop: <b>{signal_data.get('stop_loss')}</b>\n"
+                        f"👀 Monitorando a execução…"
+                    ),
+                    parse_mode='HTML'
+                )
             else:
-                error = limit_order_result.get('error')
-                await application.bot.send_message(chat_id=user.telegram_id, text=f"❌ Falha ao posicionar sua ordem limite para <b>{symbol}</b>: {error}", parse_mode='HTML')
+                error = limit_order_result.get('error') or limit_order_result
+                await application.bot.send_message(
+                    chat_id=user.telegram_id,
+                    text=f"❌ Falha ao posicionar sua ordem limite para <b>{symbol}</b>.\n<b>Motivo:</b> {error}",
+                    parse_mode='HTML'
+                )
     db.commit()
-
 
 async def process_new_signal(signal_data: dict, application: Application, source_name: str):
     """
