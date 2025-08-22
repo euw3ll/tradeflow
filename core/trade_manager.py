@@ -36,12 +36,8 @@ async def _execute_trade(signal_data: dict, user: User, application: Application
         await application.bot.send_message(chat_id=user.telegram_id, text=f"❌ Falha ao buscar seu saldo Bybit para operar {signal_data['coin']}.")
         return
 
-    balances = account_info.get("data", [])
-    if not balances:
-        await application.bot.send_message(chat_id=user.telegram_id, text=f"❌ Falha: Nenhuma info de saldo recebida da Bybit para operar {signal_data['coin']}.")
-        return
-
-    balance = float(balances[0].get('totalEquity', 0))
+    balance_data = account_info.get("data", {})
+    balance = float(balance_data.get('available_balance', 0))
     result = await place_order(api_key, api_secret, signal_data, user, balance)
     
     if result.get("success"):
@@ -129,7 +125,8 @@ async def execute_signal_for_all_users(signal_data: dict, application: Applicati
                 )
                 continue
 
-            balance = float((account_info.get("data") or [{}])[0].get('totalEquity', 0))
+            balance_data = account_info.get("data", {})
+            balance = float(balance_data.get('available_balance', 0))
 
             # >>> IMPORTANTE: agora enviamos signal_data_with_price <<<
             limit_order_result = await place_limit_order(user_api_key, user_api_secret, signal_data_with_price, user, balance)

@@ -13,7 +13,13 @@ from .keyboards import (
     dashboard_menu_keyboard, settings_menu_keyboard, view_targets_keyboard, 
     bot_config_keyboard, performance_menu_keyboard)
 from utils.security import encrypt_data, decrypt_data
-from services.bybit_service import get_open_positions, get_account_info, close_partial_position, get_open_positions_with_pnl
+from services.bybit_service import (
+    get_open_positions, 
+    get_account_info, 
+    close_partial_position, 
+    get_open_positions_with_pnl,
+    get_market_price
+)
 from utils.config import ADMIN_ID
 from database.crud import get_user_by_id
 from core.trade_manager import _execute_trade
@@ -777,19 +783,42 @@ async def manual_close_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         api_key = decrypt_data(user.api_key_encrypted)
         api_secret = decrypt_data(user.api_secret_encrypted)
 
-        close_result = await close_partial_position( # Adicionado 'await'
+        # --- NOVA LÓGICA ---
+        # 1. Pega o preço atual para calcular o P/L
+        price_result = await get_market_price(trade_to_close.symbol)
+        if not price_result.get("success"):
+            await context.bot.send_message(chat_id=user_id, text=f"⚠️ Não foi possível obter o preço atual de {trade_to_close.symbol} para calcular o P/L.")
+            current_price = trade_to_close.entry_price # Fallback
+        else:
+            current_price = price_result["price"]
+
+        # 2. Fecha a posição
+        close_result = await close_partial_position(
             api_key, 
             api_secret, 
             trade_to_close.symbol, 
-            # Usaremos o 'qty' total salvo no trade, pois o fechamento manual é para a posição inteira
-            trade_to_close.qty, 
+            trade_to_close.remaining_qty, 
             trade_to_close.side
         )
 
         if close_result.get("success"):
+            # 3. Calcula o P/L e formata a mensagem
+            pnl = (current_price - trade_to_close.entry_price) * trade_to_close.remaining_qty if trade_to_close.side == 'LONG' else (trade_to_close.entry_price - current_price) * trade_to_close.remaining_qty
+            
+            resultado_str = "LUCRO" if pnl >= 0 else "PREJUÍZO"
+            emoji = "✅" if pnl >= 0 else "🔻"
+            
+            message_text = (
+                f"{emoji} <b>Posição Fechada Manualmente ({resultado_str})</b>\n"
+                f"<b>Moeda:</b> {trade_to_close.symbol}\n"
+                f"<b>Resultado:</b> ${pnl:,.2f}"
+            )
+            
             trade_to_close.status = 'CLOSED_MANUAL'
             db.commit()
-            await query.edit_message_text(f"✅ Posição para {trade_to_close.symbol} fechada manualmente com sucesso!")
+            await query.edit_message_text(message_text, parse_mode='HTML')
+            # Atualiza a lista de posições após um pequeno delay
+            await asyncio.sleep(2)
             await my_positions_handler(update, context)
         else:
             error_msg = close_result.get('error')
@@ -799,6 +828,7 @@ async def manual_close_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             )
     finally:
         db.close()
+
 
 async def bot_config_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Exibe o menu de configuração do bot com o modo de aprovação atual."""

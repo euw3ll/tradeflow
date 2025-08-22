@@ -72,17 +72,34 @@ def get_session(api_key: str, api_secret: str) -> HTTP:
     )
 
 async def get_account_info(api_key: str, api_secret: str) -> dict:
-    """Busca informações da conta de forma assíncrona."""
+    """Busca o saldo da conta, retornando especificamente o total e o disponível em USDT."""
     def _sync_call():
         try:
             session = get_session(api_key, api_secret)
             response = session.get_wallet_balance(accountType="UNIFIED")
+
             if response.get('retCode') == 0:
-                return {"success": True, "data": response['result']['list']}
-            return {"success": False, "data": [], "error": response.get('retMsg', 'Erro desconhecido')}
+                account_data = response['result']['list'][0]
+                total_equity = float(account_data.get('totalEquity', 0))
+                
+                available_balance = 0.0
+                for coin_balance in account_data.get('coin', []):
+                    if coin_balance.get('coin') == 'USDT':
+                        available_balance = float(coin_balance.get('availableToWithdraw', 0))
+                        break
+                
+                return {
+                    "success": True, 
+                    "data": {
+                        "total_equity": total_equity,
+                        "available_balance": available_balance
+                    }
+                }
+            return {"success": False, "data": {}, "error": response.get('retMsg', 'Erro desconhecido')}
         except Exception as e:
             logger.error(f"Exceção em get_account_info: {e}", exc_info=True)
-            return {"success": False, "data": [], "error": str(e)}
+            return {"success": False, "data": {}, "error": str(e)}
+
     return await asyncio.to_thread(_sync_call)
 
 async def place_order(api_key: str, api_secret: str, signal_data: dict, user_settings: User, balance: float) -> dict:
