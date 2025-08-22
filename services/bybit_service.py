@@ -79,13 +79,21 @@ async def get_account_info(api_key: str, api_secret: str) -> dict:
             response = session.get_wallet_balance(accountType="UNIFIED")
 
             if response.get('retCode') == 0:
-                account_data = response['result']['list'][0]
-                total_equity = float(account_data.get('totalEquity', 0))
+                account_data_list = response['result'].get('list', [])
+                if not account_data_list:
+                    return {"success": False, "data": {}, "error": "Lista de contas vazia na resposta da API."}
                 
+                account_data = account_data_list[0]
+                
+                # --- LÓGICA DE CONVERSÃO CORRIGIDA ---
+                equity_str = account_data.get('totalEquity')
+                total_equity = float(equity_str) if equity_str else 0.0
+
                 available_balance = 0.0
                 for coin_balance in account_data.get('coin', []):
                     if coin_balance.get('coin') == 'USDT':
-                        available_balance = float(coin_balance.get('availableToWithdraw', 0))
+                        available_str = coin_balance.get('availableToWithdraw')
+                        available_balance = float(available_str) if available_str else 0.0
                         break
                 
                 return {
@@ -101,6 +109,7 @@ async def get_account_info(api_key: str, api_secret: str) -> dict:
             return {"success": False, "data": {}, "error": str(e)}
 
     return await asyncio.to_thread(_sync_call)
+
 
 async def place_order(api_key: str, api_secret: str, signal_data: dict, user_settings: User, balance: float) -> dict:
     """Abre uma nova posição a mercado (Market) com validação completa."""
