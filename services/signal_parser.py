@@ -1,5 +1,6 @@
 import re
 import logging
+import unicodedata
 from typing import Dict, Any, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -44,11 +45,15 @@ def _full_signal_extractor(message_text: str) -> Optional[Dict[str, Any]]:
         matches = re.findall(pattern, text, re.IGNORECASE | re.MULTILINE)
         return [float(v.replace(',', '.')) for v in matches]
 
-    text_lower = message_text.lower()
+    def normalize_text(text: str) -> str:
+        """Remove acentos e converte para minúsculas."""
+        return unicodedata.normalize("NFKD", text).encode("ASCII", "ignore").decode("utf-8").lower()
+
+    text_normalized = normalize_text(message_text)
     signal_type = None
-    if 'ordem limite' in text_lower:
+    if 'ordem limite' in text_normalized:
         signal_type = SignalType.LIMIT
-    elif 'ordem à mercado' in text_lower or 'sinal entrou no preço' in text_lower:
+    elif 'ordem a mercado' in text_normalized or 'sinal entrou no preco' in text_normalized:
         signal_type = SignalType.MARKET
 
     # Regex atualizadas para serem mais tolerantes, buscando do início da linha (^)

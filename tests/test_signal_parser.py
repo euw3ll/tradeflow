@@ -88,3 +88,22 @@ def test_parse_complex_signal_with_emojis_and_extra_text():
     assert data["stop_loss"] == 2.9
     assert data["targets"] == [2.44, 2.37, 2.29, 2.2]
     assert data["confidence"] == 66.67
+
+
+def test_parse_market_signal_without_accent():
+    message = textwrap.dedent(
+        """
+        🏁 #123 - Ordem a Mercado
+        Moeda: AVAX
+        Tipo: SHORT (Futures)
+        Zona de Entrada: 22.85 - 22.85
+        Stop Loss: 24.22
+        Alvos:
+        T1: 22.69
+        """
+    )
+
+    data = parse_signal(message)
+
+    assert data["type"] == SignalType.MARKET
+    assert data["coin"] == "AVAXUSDT"
