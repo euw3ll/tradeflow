@@ -15,12 +15,13 @@ from bot.handlers import (
     ask_max_leverage, receive_max_leverage, ASKING_MAX_LEVERAGE,
     ask_min_confidence, receive_min_confidence, ASKING_MIN_CONFIDENCE,
     admin_menu, list_channels_handler, select_channel_to_monitor, select_topic_to_monitor,
-    manual_close_handler, admin_view_targets_handler, back_to_admin_menu_handler,
+    admin_view_targets_handler, back_to_admin_menu_handler,
     bot_config_handler, toggle_approval_mode_handler, handle_signal_approval, 
     ask_profit_target, receive_profit_target, ASKING_PROFIT_TARGET,
     ask_loss_limit, receive_loss_limit, ASKING_LOSS_LIMIT, 
     ask_coin_whitelist, receive_coin_whitelist, ASKING_COIN_WHITELIST,
-    performance_menu_handler, list_closed_trades_handler
+    performance_menu_handler, list_closed_trades_handler,
+    prompt_manual_close_handler, execute_manual_close_handler
 )
 from database.session import init_db
 from services.telethon_service import start_signal_monitor
@@ -125,7 +126,8 @@ async def main():
     application.add_handler(CallbackQueryHandler(user_settings_handler, pattern='^user_settings$'))
     application.add_handler(CallbackQueryHandler(user_dashboard_handler, pattern='^user_dashboard$'))
     application.add_handler(CallbackQueryHandler(back_to_main_menu_handler, pattern='^back_to_main_menu$'))
-    application.add_handler(CallbackQueryHandler(manual_close_handler, pattern='^manual_close_'))
+    application.add_handler(CallbackQueryHandler(prompt_manual_close_handler, pattern='^confirm_close_'))
+    application.add_handler(CallbackQueryHandler(execute_manual_close_handler, pattern='^execute_close_'))
 
     application.add_handler(CallbackQueryHandler(performance_menu_handler, pattern='^perf_'))
     

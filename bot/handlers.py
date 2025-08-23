@@ -11,7 +11,7 @@ from database.models import User, InviteCode, MonitoredTarget, Trade, SignalForA
 from .keyboards import (
     main_menu_keyboard, confirm_remove_keyboard, admin_menu_keyboard, 
     dashboard_menu_keyboard, settings_menu_keyboard, view_targets_keyboard, 
-    bot_config_keyboard, performance_menu_keyboard)
+    bot_config_keyboard, performance_menu_keyboard, confirm_manual_close_keyboard)
 from utils.security import encrypt_data, decrypt_data
 from services.bybit_service import (
     get_open_positions, 
@@ -224,25 +224,20 @@ async def my_positions_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         user = db.query(User).filter_by(telegram_id=user_id).first()
         if not user or not user.api_key_encrypted:
-            await query.edit_message_text(
-                "Você ainda não configurou suas chaves de API.",
-            )
+            await query.edit_message_text("Você ainda não configurou suas chaves de API.")
             return
 
         api_key = decrypt_data(user.api_key_encrypted)
         api_secret = decrypt_data(user.api_secret_encrypted)
 
-        # posições abertas (live) com P/L atual
         live = await get_open_positions_with_pnl(api_key, api_secret)
         live_positions = live["data"] if live.get("success") else []
 
-        # trades que o BOT está gerenciando (para os botões/IDs)
         active_trades = db.query(Trade).filter(
             Trade.user_telegram_id == user_id,
             ~Trade.status.like('%CLOSED%')
         ).all()
 
-        # monta um índice por símbolo -> trade.id (se existir)
         trade_id_by_symbol = {t.symbol: t.id for t in active_trades}
 
         lines = ["<b>📊 Suas Posições Ativas (Gerenciadas pelo Bot)</b>", ""]
@@ -266,18 +261,12 @@ async def my_positions_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                     f"  P/L: <b>{pnl:+.2f} USDT</b> ({pnl_pct:+.2f}%)\n"
                 )
 
-                # se o bot estiver gerenciando esse símbolo, mostra o botão fechar
                 if sym in trade_id_by_symbol:
                     trade_id = trade_id_by_symbol[sym]
                     keyboard.append([
-                        InlineKeyboardButton(
-                            f"Fechar {sym} ❌",
-                            callback_data=f"manual_close_{trade_id}"
-                        )
+                        InlineKeyboardButton(f"Fechar {sym} ❌", callback_data=f"confirm_close_{trade_id}")
                     ])
 
-            # fallback: se existir trade “gerenciado” sem posição viva (ex.: zerou na corretora),
-            # ainda mostramos o item para permitir fechamento/limpeza manual.
             for t in active_trades:
                 if t.symbol not in {p["symbol"] for p in live_positions}:
                     side_emoji = "⬆️" if t.side == 'LONG' else "⬇️"
@@ -286,10 +275,7 @@ async def my_positions_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                         f"  Entrada: ${t.entry_price:.4f} | Status: {t.status}\n"
                     )
                     keyboard.append([
-                        InlineKeyboardButton(
-                            f"Fechar {t.symbol} ❌",
-                            callback_data=f"manual_close_{t.id}"
-                        )
+                        InlineKeyboardButton(f"Fechar {t.symbol} ❌", callback_data=f"confirm_close_{t.id}")
                     ])
 
         keyboard.append([InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data='back_to_main_menu')])
@@ -744,11 +730,12 @@ async def receive_min_confidence(update: Update, context: ContextTypes.DEFAULT_T
         
         return ASKING_MIN_CONFIDENCE
     
-async def manual_close_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Lida com o fechamento manual de uma posição, salvando o P/L."""
+async def execute_manual_close_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lida com a EXECUÇÃO do fechamento manual após a confirmação."""
     query = update.callback_query
     await query.answer("Processando fechamento...")
 
+    # O callback_data agora será 'execute_close_123'
     trade_id = int(query.data.split('_')[-1])
     user_id = update.effective_user.id
 
@@ -1170,3 +1157,30 @@ async def list_closed_trades_handler(update: Update, context: ContextTypes.DEFAU
 
     finally:
         db.close()
+
+async def prompt_manual_close_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Exibe a tela de confirmação para o fechamento manual de uma posição."""
+    query = update.callback_query
+    await query.answer()
+    trade_id = int(query.data.split('_')[-1])
+    
+    db = SessionLocal()
+    try:
+        trade = db.query(Trade).filter_by(id=trade_id).first()
+        if not trade:
+            await query.edit_message_text("Erro: Trade não encontrado ou já fechado.")
+            return
+
+        message = (
+            f"⚠️ <b>Confirmar Fechamento</b> ⚠️\n\n"
+            f"Você tem certeza que deseja fechar manualmente sua posição em <b>{trade.symbol}</b>?\n\n"
+            f"Esta ação é irreversível."
+        )
+        await query.edit_message_text(
+            text=message,
+            parse_mode='HTML',
+            reply_markup=confirm_manual_close_keyboard(trade_id)
+        )
+    finally:
+        db.close()
+

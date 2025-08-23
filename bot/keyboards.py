@@ -133,3 +133,13 @@ def performance_menu_keyboard():
         [InlineKeyboardButton("⬅️ Voltar ao Menu Principal", callback_data='back_to_main_menu')]
     ]
     return InlineKeyboardMarkup(keyboard)
+
+def confirm_manual_close_keyboard(trade_id: int):
+    """Retorna o teclado de confirmação para o fechamento manual de um trade."""
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Sim, fechar", callback_data=f'execute_close_{trade_id}'),
+            InlineKeyboardButton("❌ Cancelar", callback_data='user_positions') # Volta para a lista de posições
+        ],
+    ]
+    return InlineKeyboardMarkup(keyboard)
