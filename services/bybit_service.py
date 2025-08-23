@@ -72,17 +72,19 @@ def get_session(api_key: str, api_secret: str) -> HTTP:
     )
 
 async def get_account_info(api_key: str, api_secret: str) -> dict:
-    """Busca o saldo da conta, retornando dados detalhados incluindo a lista de moedas."""
+    """Busca o saldo da conta, com LOGS DETALHADOS para depuração."""
     def _sync_call():
         try:
             session = get_session(api_key, api_secret)
             response = session.get_wallet_balance(accountType="UNIFIED")
 
+            # --- LOG DE DEPURAÇÃO ---
+            logger.info(f"[DEBUG] Resposta completa da API get_wallet_balance: {response}")
+            
             if response.get('retCode') == 0:
                 account_data_list = response['result'].get('list', [])
                 if not account_data_list:
                     return {"success": False, "data": {}, "error": "Lista de contas vazia na resposta da API."}
-                
                 account_data = account_data_list[0]
                 
                 equity_str = account_data.get('totalEquity')
@@ -96,14 +98,15 @@ async def get_account_info(api_key: str, api_secret: str) -> dict:
                         available_balance_usdt = float(available_str) if available_str else 0.0
                         break
                 
-                return {
-                    "success": True, 
-                    "data": {
-                        "total_equity": total_equity,
-                        "available_balance_usdt": available_balance_usdt,
-                        "coin_list": coin_list  # <-- Retornando a lista completa
-                    }
+                result_data = {
+                    "total_equity": total_equity,
+                    "available_balance_usdt": available_balance_usdt,
+                    "coin_list": coin_list
                 }
+                # --- LOG DE DEPURAÇÃO ---
+                logger.info(f"[DEBUG] get_account_info retornando dados processados: {result_data}")
+                return {"success": True, "data": result_data}
+
             return {"success": False, "data": {}, "error": response.get('retMsg', 'Erro desconhecido')}
         except Exception as e:
             logger.error(f"Exceção em get_account_info: {e}", exc_info=True)
@@ -113,60 +116,56 @@ async def get_account_info(api_key: str, api_secret: str) -> dict:
 
 
 async def place_order(api_key: str, api_secret: str, signal_data: dict, user_settings: User, balance: float) -> dict:
-    """Abre uma nova posição a mercado (Market) com validação completa."""
+    """Abre uma nova posição a mercado (Market) com LOGS DETALHADOS para depuração."""
     async def pre_flight_checks():
         symbol = signal_data['coin']
-        if symbol not in INSTRUMENT_INFO_CACHE:
-            await get_instrument_info(symbol)
+        if symbol not in INSTRUMENT_INFO_CACHE: await get_instrument_info(symbol)
         return INSTRUMENT_INFO_CACHE.get(symbol)
 
     def _sync_call(instrument_rules: Dict[str, Any]):
+        # --- LOG DE DEPURAÇÃO ---
+        logger.info(f"[DEBUG] Entrando em _sync_call de place_order para {signal_data['coin']}")
+        logger.info(f"[DEBUG] Saldo recebido: {balance}, % Entrada: {user_settings.entry_size_percent}, Alavancagem: {user_settings.max_leverage}")
         try:
             symbol = signal_data['coin']
-
-            if not instrument_rules or not instrument_rules.get("success"):
-                return instrument_rules or {"success": False, "error": f"Regras para {symbol} não encontradas."}
-            if instrument_rules["status"] != "Trading":
-                return {"success": False, "error": f"O símbolo {symbol} não está ativo para negociação ({instrument_rules['status']})."}
+            if not instrument_rules or not instrument_rules.get("success"): return instrument_rules or {"success": False, "error": f"Regras para {symbol} não encontradas."}
+            if instrument_rules["status"] != "Trading": return {"success": False, "error": f"O símbolo {symbol} não está ativo para negociação ({instrument_rules['status']})."}
 
             session = get_session(api_key, api_secret)
             side = "Buy" if (signal_data.get('order_type') or '').upper() == 'LONG' else "Sell"
             leverage = Decimal(str(user_settings.max_leverage))
             entry_price = Decimal(str(signal_data['entries'][0]))
+            
             margin_in_dollars = Decimal(str(balance)) * (Decimal(str(user_settings.entry_size_percent)) / Decimal("100"))
             notional_value = margin_in_dollars * leverage
+            # --- LOG DE DEPURAÇÃO ---
+            logger.info(f"[DEBUG] Margem: ${margin_in_dollars:.4f}, Valor Nocional: ${notional_value:.4f}, Preço Entrada: {entry_price}")
             
             if entry_price <= 0: return {"success": False, "error": f"Preço de entrada inválido: {entry_price}"}
-
             qty_raw = notional_value / entry_price
             qty_adj = _round_down_to_step(qty_raw, instrument_rules["qtyStep"])
+            # --- LOG DE DEPURAÇÃO ---
+            logger.info(f"[DEBUG] Qtd Crua: {qty_raw:.8f}, Qtd Ajustada: {qty_adj:.8f} (Step: {instrument_rules['qtyStep']})")
 
+            # ... resto da função ...
             if qty_adj < instrument_rules["minOrderQty"]:
                 return {"success": False, "error": f"Qtd. ajustada ({qty_adj:f}) é menor que a mínima permitida ({instrument_rules['minOrderQty']:f}) para {symbol}."}
-            
             final_notional_value = qty_adj * entry_price
             if final_notional_value < instrument_rules["minNotionalValue"]:
                 return {"success": False, "error": f"Valor total da ordem (${final_notional_value:.2f}) é menor que o mínimo permitido de ${instrument_rules['minNotionalValue']:.2f}."}
-
-            # --- LÓGICA CORRIGIDA ---
+            
             payload = {
-                "category": "linear", "symbol": symbol, "side": side,
-                "orderType": "Market", "qty": str(qty_adj),
-                "takeProfit": str((signal_data.get('targets') or [None])[0]),
-                "stopLoss": str(signal_data.get('stop_loss')),
+                "category": "linear", "symbol": symbol, "side": side, "orderType": "Market", "qty": str(qty_adj),
+                "takeProfit": str((signal_data.get('targets') or [None])[0]), "stopLoss": str(signal_data.get('stop_loss')),
             }
-
             try:
                 session.set_leverage(category="linear", symbol=symbol, buyLeverage=str(leverage), sellLeverage=str(leverage))
             except InvalidRequestError as e:
-                if "leverage not modified" in str(e).lower():
-                    logger.warning(f"Alavancagem para {symbol} já está correta. Continuando...")
-                else:
-                    return {"success": False, "error": str(e)} # Retorna outros erros de alavancagem
-
+                if "leverage not modified" in str(e).lower(): logger.warning(f"Alavancagem para {symbol} já está correta. Continuando...")
+                else: return {"success": False, "error": str(e)}
+            
             response = session.place_order(**{k: v for k, v in payload.items() if v is not None})
-            if response.get('retCode') == 0:
-                return {"success": True, "data": response['result']}
+            if response.get('retCode') == 0: return {"success": True, "data": response['result']}
             return {"success": False, "error": response.get('retMsg')}
         
         except Exception as e:

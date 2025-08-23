@@ -38,6 +38,9 @@ async def _execute_trade(signal_data: dict, user: User, application: Application
 
     balance_data = account_info.get("data", {})
     balance = float(balance_data.get('available_balance_usdt', 0))
+    logger.info(f"[DEBUG] Dados de conta recebidos pelo trade_manager: {account_info}")
+    logger.info(f"[DEBUG] Saldo extraído para o trade: {balance}")
+
     result = await place_order(api_key, api_secret, signal_data, user, balance)
     
     if result.get("success"):
