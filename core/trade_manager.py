@@ -7,7 +7,8 @@ from database.session import SessionLocal
 from database.models import User, Trade, PendingSignal, SignalForApproval
 from services.bybit_service import (
     place_order, get_account_info,
-    place_limit_order, cancel_order
+    place_limit_order, cancel_order,
+    get_order_history
 )
 from services.notification_service import send_notification
 from utils.security import decrypt_data
@@ -28,7 +29,7 @@ def _avaliar_sinal(signal_data: dict, user_settings: User) -> Tuple[bool, str]:
     return True, "Sinal aprovado pelos seus critérios."
 
 async def _execute_trade(signal_data: dict, user: User, application: Application, db: Session, source_name: str):
-    """Executa uma ordem a MERCADO e envia uma notificação detalhada."""
+    """Executa uma ordem a MERCADO, busca os detalhes da execução e envia uma notificação detalhada."""
     api_key = decrypt_data(user.api_key_encrypted)
     api_secret = decrypt_data(user.api_secret_encrypted)
     
@@ -40,29 +41,40 @@ async def _execute_trade(signal_data: dict, user: User, application: Application
     balance_data = account_info.get("data", {})
     balance = float(balance_data.get('available_balance_usdt', 0))
 
-    order_result = await place_order(
-        api_key, api_secret, signal_data, user, balance
-    )
+    order_result = await place_order(api_key, api_secret, signal_data, user, balance)
     
     if order_result.get("success"):
-        order_data = order_result['data']
-        order_id = order_data['orderId']
+        initial_order_data = order_result['data']
+        order_id = initial_order_data['orderId']
         
-        # Extrai dados para a notificação e para o DB
+        # --- LÓGICA DE CORREÇÃO ---
+        await asyncio.sleep(2) # Espera 2 segundos para a ordem ser preenchida
+        
+        final_order_data_result = await get_order_history(api_key, api_secret, order_id)
+        
+        if not final_order_data_result.get("success"):
+            await application.bot.send_message(chat_id=user.telegram_id, text=f"⚠️ Ordem {signal_data['coin']} enviada, mas falha ao confirmar detalhes. Verifique na corretora.")
+            return
+
+        final_order_data = final_order_data_result['data']
+        # --- FIM DA LÓGICA DE CORREÇÃO ---
+        
         symbol = signal_data['coin']
         side = signal_data['order_type']
         leverage = user.max_leverage
-        qty = float(order_data.get('qty', 0))
-        # Usa o preço médio de execução se disponível, senão o preço do sinal
-        entry_price_str = order_data.get('avgPrice', signal_data['entries'][0])
-        entry_price = float(entry_price_str) if entry_price_str else 0.0
         
+        # Usa os dados finais e mais precisos
+        qty = float(final_order_data.get('cumExecQty', 0))
+        entry_price = float(final_order_data.get('avgPrice', 0))
+        
+        if qty == 0 or entry_price == 0:
+            await application.bot.send_message(chat_id=user.telegram_id, text=f"⚠️ Ordem {symbol} enviada, mas a execução reportou quantidade/preço zerado. Verifique na corretora.")
+            return
+            
         margin = (qty * entry_price) / leverage if leverage > 0 else 0
-        
         stop_loss = signal_data['stop_loss']
         take_profit = (signal_data.get('targets') or [None])[0]
 
-        # Salva o trade no DB
         new_trade = Trade(
             user_telegram_id=user.telegram_id, order_id=order_id,
             symbol=symbol, side=side, qty=qty, entry_price=entry_price,
@@ -71,9 +83,8 @@ async def _execute_trade(signal_data: dict, user: User, application: Application
             remaining_qty=qty
         )
         db.add(new_trade)
-        logger.info(f"Trade {order_id} para o usuário {user.telegram_id} salvo no DB.")
+        logger.info(f"Trade {order_id} para o usuário {user.telegram_id} salvo no DB com dados de execução.")
         
-        # --- NOVA NOTIFICAÇÃO DETALHADA ---
         message = (
             f"📈 <b>Ordem a Mercado Aberta!</b>\n\n"
             f"  - 📊 <b>Tipo:</b> {side} | <b>Alavancagem:</b> {leverage}x\n"

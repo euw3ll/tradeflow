@@ -565,3 +565,22 @@ async def get_specific_position_size(api_key: str, api_secret: str, symbol: str)
             return 0.0 # Em caso de erro, assumimos que não há posição para evitar fechamentos indevidos
 
     return await asyncio.to_thread(_sync_call)
+    
+async def get_order_history(api_key: str, api_secret: str, order_id: str) -> dict:
+    """Busca os detalhes de uma ordem específica no histórico."""
+    def _sync_call():
+        try:
+            session = get_session(api_key, api_secret)
+            response = session.get_order_history(category="linear", orderId=order_id, limit=1)
+            
+            if response.get('retCode') == 0:
+                order_list = response.get('result', {}).get('list', [])
+                if order_list:
+                    return {"success": True, "data": order_list[0]}
+                return {"success": False, "error": "Ordem não encontrada no histórico."}
+            return {"success": False, "error": response.get('retMsg')}
+        except Exception as e:
+            logger.error(f"Exceção em get_order_history: {e}", exc_info=True)
+            return {"success": False, "error": str(e)}
+
+    return await asyncio.to_thread(_sync_call)
