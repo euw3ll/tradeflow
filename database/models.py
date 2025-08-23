@@ -18,8 +18,6 @@ class User(Base):
     daily_profit_target = Column(Float, default=0.0, nullable=False)
     daily_loss_limit = Column(Float, default=0.0, nullable=False)
     coin_whitelist = Column(String, default='todas', nullable=False)
-    closed_at = Column(DateTime(timezone=True), nullable=True)
-    closed_pnl = Column(Float, nullable=True)
 
 class InviteCode(Base):
     __tablename__ = 'invite_codes'
@@ -50,6 +48,8 @@ class Trade(Base):
     status = Column(String, default='ACTIVE')
     remaining_qty = Column(Float)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    closed_at = Column(DateTime(timezone=True), nullable=True)
+    closed_pnl = Column(Float, nullable=True)
 
 class PendingSignal(Base):
     __tablename__ = 'pending_signals'
