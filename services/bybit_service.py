@@ -72,30 +72,35 @@ def get_session(api_key: str, api_secret: str) -> HTTP:
     )
 
 async def get_account_info(api_key: str, api_secret: str) -> dict:
-    """Busca o saldo da conta, com LOGS DETALHADOS para depuração."""
+    """Busca o saldo da conta, calculando o saldo disponível para Contas Unificadas."""
     def _sync_call():
         try:
             session = get_session(api_key, api_secret)
             response = session.get_wallet_balance(accountType="UNIFIED")
-
-            # --- LOG DE DEPURAÇÃO ---
-            logger.info(f"[DEBUG] Resposta completa da API get_wallet_balance: {response}")
             
             if response.get('retCode') == 0:
                 account_data_list = response['result'].get('list', [])
                 if not account_data_list:
                     return {"success": False, "data": {}, "error": "Lista de contas vazia na resposta da API."}
-                account_data = account_data_list[0]
                 
+                account_data = account_data_list[0]
                 equity_str = account_data.get('totalEquity')
                 total_equity = float(equity_str) if equity_str else 0.0
                 coin_list = account_data.get('coin', [])
-
+                
                 available_balance_usdt = 0.0
-                for coin_balance in coin_list:
-                    if coin_balance.get('coin') == 'USDT':
-                        available_str = coin_balance.get('availableToWithdraw')
-                        available_balance_usdt = float(available_str) if available_str else 0.0
+                for coin in coin_list:
+                    if coin.get('coin') == 'USDT':
+                        wallet_balance_str = coin.get('walletBalance', '0')
+                        order_margin_str = coin.get('totalOrderIM', '0')
+                        position_margin_str = coin.get('totalPositionIM', '0')
+
+                        wallet_balance = float(wallet_balance_str) if wallet_balance_str else 0.0
+                        order_margin = float(order_margin_str) if order_margin_str else 0.0
+                        position_margin = float(position_margin_str) if position_margin_str else 0.0
+                        
+                        # Cálculo correto para Conta de Trading Unificada
+                        available_balance_usdt = wallet_balance - order_margin - position_margin
                         break
                 
                 result_data = {
@@ -103,10 +108,8 @@ async def get_account_info(api_key: str, api_secret: str) -> dict:
                     "available_balance_usdt": available_balance_usdt,
                     "coin_list": coin_list
                 }
-                # --- LOG DE DEPURAÇÃO ---
-                logger.info(f"[DEBUG] get_account_info retornando dados processados: {result_data}")
                 return {"success": True, "data": result_data}
-
+                
             return {"success": False, "data": {}, "error": response.get('retMsg', 'Erro desconhecido')}
         except Exception as e:
             logger.error(f"Exceção em get_account_info: {e}", exc_info=True)
@@ -114,18 +117,14 @@ async def get_account_info(api_key: str, api_secret: str) -> dict:
 
     return await asyncio.to_thread(_sync_call)
 
-
 async def place_order(api_key: str, api_secret: str, signal_data: dict, user_settings: User, balance: float) -> dict:
-    """Abre uma nova posição a mercado (Market) com LOGS DETALHADOS para depuração."""
+    """Abre uma nova posição a mercado (Market) com validação completa."""
     async def pre_flight_checks():
         symbol = signal_data['coin']
         if symbol not in INSTRUMENT_INFO_CACHE: await get_instrument_info(symbol)
         return INSTRUMENT_INFO_CACHE.get(symbol)
 
     def _sync_call(instrument_rules: Dict[str, Any]):
-        # --- LOG DE DEPURAÇÃO ---
-        logger.info(f"[DEBUG] Entrando em _sync_call de place_order para {signal_data['coin']}")
-        logger.info(f"[DEBUG] Saldo recebido: {balance}, % Entrada: {user_settings.entry_size_percent}, Alavancagem: {user_settings.max_leverage}")
         try:
             symbol = signal_data['coin']
             if not instrument_rules or not instrument_rules.get("success"): return instrument_rules or {"success": False, "error": f"Regras para {symbol} não encontradas."}
@@ -138,16 +137,11 @@ async def place_order(api_key: str, api_secret: str, signal_data: dict, user_set
             
             margin_in_dollars = Decimal(str(balance)) * (Decimal(str(user_settings.entry_size_percent)) / Decimal("100"))
             notional_value = margin_in_dollars * leverage
-            # --- LOG DE DEPURAÇÃO ---
-            logger.info(f"[DEBUG] Margem: ${margin_in_dollars:.4f}, Valor Nocional: ${notional_value:.4f}, Preço Entrada: {entry_price}")
             
             if entry_price <= 0: return {"success": False, "error": f"Preço de entrada inválido: {entry_price}"}
             qty_raw = notional_value / entry_price
             qty_adj = _round_down_to_step(qty_raw, instrument_rules["qtyStep"])
-            # --- LOG DE DEPURAÇÃO ---
-            logger.info(f"[DEBUG] Qtd Crua: {qty_raw:.8f}, Qtd Ajustada: {qty_adj:.8f} (Step: {instrument_rules['qtyStep']})")
 
-            # ... resto da função ...
             if qty_adj < instrument_rules["minOrderQty"]:
                 return {"success": False, "error": f"Qtd. ajustada ({qty_adj:f}) é menor que a mínima permitida ({instrument_rules['minOrderQty']:f}) para {symbol}."}
             final_notional_value = qty_adj * entry_price
