@@ -113,7 +113,7 @@ async def check_pending_orders_for_user(application: Application, user: User, db
             )
 
 async def check_active_trades_for_user(application: Application, user: User, db: Session):
-    """Verifica e gerencia os trades ativos, salvando o P/L no fechamento."""
+    """Verifica e gerencia os trades ativos, com lógica robusta contra race conditions."""
     active_trades = db.query(Trade).filter(
         Trade.user_telegram_id == user.telegram_id,
         ~Trade.status.like('%CLOSED%')
@@ -125,84 +125,90 @@ async def check_active_trades_for_user(application: Application, user: User, db:
     api_secret = decrypt_data(user.api_secret_encrypted)
 
     for trade in active_trades:
+        # Pega os dados essenciais uma vez no início do loop
         price_result = await get_market_price(trade.symbol)
+        live_position_size = await get_specific_position_size(api_key, api_secret, trade.symbol)
+
         if not price_result.get("success"):
             continue
         current_price = price_result["price"]
 
-        # 1. VERIFICA TAKE PROFIT
-        if trade.initial_targets:
-            next_target_price = trade.initial_targets[0]
-            if (trade.side == 'LONG' and current_price >= next_target_price) or \
-               (trade.side == 'SHORT' and current_price <= next_target_price):
-                
-                live_position_size = await get_specific_position_size(api_key, api_secret, trade.symbol)
-                if live_position_size <= 0:
-                    continue
+        # --- NOVA LÓGICA REESTRUTURADA ---
 
-                qty_to_close = live_position_size if len(trade.initial_targets) == 1 else (live_position_size / 2.0)
-                close_result = await close_partial_position(api_key, api_secret, trade.symbol, qty_to_close, trade.side)
-
-                if close_result.get("success") and not close_result.get("skipped"):
-                    profit = abs(next_target_price - trade.entry_price) * qty_to_close
-                    trade.remaining_qty -= qty_to_close
-                    remaining_targets = trade.initial_targets[1:]
-                    trade.initial_targets = remaining_targets
+        # CENÁRIO 1: A POSIÇÃO AINDA ESTÁ ABERTA NA CORRETORA
+        if live_position_size > 0:
+            # 1a. VERIFICA TAKE PROFIT
+            if trade.initial_targets:
+                next_target_price = trade.initial_targets[0]
+                if (trade.side == 'LONG' and current_price >= next_target_price) or \
+                   (trade.side == 'SHORT' and current_price <= next_target_price):
                     
-                    message_text = ""
-                    if not remaining_targets or trade.remaining_qty < 0.00001:
-                        trade.status = 'CLOSED_PROFIT'
-                        trade.closed_at = func.now()
-                        trade.closed_pnl = profit
-                        message_text = f"🏆 <b>Último Alvo Atingido! (LUCRO)</b> 🏆\n<b>Moeda:</b> {trade.symbol}\n<b>Lucro Realizado:</b> ${profit:,.2f}"
-                    else:
-                        trade.status = 'ACTIVE_TP_HIT'
-                        next_tp_price = remaining_targets[0]
-                        tp_update_result = await modify_position_take_profit(api_key, api_secret, trade.symbol, next_tp_price)
-                        if tp_update_result.get("success"):
-                            logger.info(f"Take Profit para {trade.symbol} atualizado para o próximo alvo: {next_tp_price}")
-                        else:
-                            logger.error(f"Falha ao atualizar Take Profit para {trade.symbol}: {tp_update_result.get('error')}")
+                    qty_to_close = live_position_size if len(trade.initial_targets) == 1 else (live_position_size / 2.0)
+                    close_result = await close_partial_position(api_key, api_secret, trade.symbol, qty_to_close, trade.side)
+
+                    if close_result.get("success") and not close_result.get("skipped"):
+                        profit = abs(next_target_price - trade.entry_price) * qty_to_close
+                        trade.remaining_qty -= qty_to_close
+                        remaining_targets = trade.initial_targets[1:]
+                        trade.initial_targets = remaining_targets
                         
-                        message_text = (
-                            f"💰 <b>Take Profit Atingido! (LUCRO)</b>\n"
-                            f"<b>Moeda:</b> {trade.symbol}\n"
-                            f"<b>Lucro Parcial:</b> ${profit:,.2f}\n"
-                            f"<b>Próximo Alvo:</b> ${next_tp_price:,.4f}"
-                        )
-                    
-                    await application.bot.send_message(chat_id=user.telegram_id, text=message_text, parse_mode='HTML')
-                    continue
-        
-        # 2. VERIFICA STOP LOSS
-        stop_hit = (
-            (trade.side == 'LONG' and current_price <= trade.current_stop_loss) or
-            (trade.side == 'SHORT' and current_price >= trade.current_stop_loss)
-        )
-        if stop_hit:
-            live_position_size = await get_specific_position_size(api_key, api_secret, trade.symbol)
-            if live_position_size <= 0:
+                        message_text = ""
+                        if not remaining_targets or trade.remaining_qty < 0.00001:
+                            trade.status = 'CLOSED_PROFIT'; trade.closed_at = func.now(); trade.closed_pnl = profit
+                            message_text = f"🏆 <b>Último Alvo Atingido! (LUCRO)</b> 🏆\n<b>Moeda:</b> {trade.symbol}\n<b>Lucro Realizado:</b> ${profit:,.2f}"
+                        else:
+                            trade.status = 'ACTIVE_TP_HIT'
+                            next_tp_price = remaining_targets[0]
+                            await modify_position_take_profit(api_key, api_secret, trade.symbol, next_tp_price)
+                            message_text = f"💰 <b>Take Profit Atingido! (LUCRO)</b>\n<b>Moeda:</b> {trade.symbol}\n<b>Lucro Parcial:</b> ${profit:,.2f}\n<b>Próximo Alvo:</b> ${next_tp_price:,.4f}"
+                        
+                        await application.bot.send_message(chat_id=user.telegram_id, text=message_text, parse_mode='HTML')
+                        continue
+
+            # 1b. VERIFICA STOP LOSS
+            stop_hit = (
+                (trade.side == 'LONG' and current_price <= trade.current_stop_loss) or
+                (trade.side == 'SHORT' and current_price >= trade.current_stop_loss)
+            )
+            if stop_hit:
+                loss = abs(trade.current_stop_loss - trade.entry_price) * live_position_size
+                trade.status = 'CLOSED_LOSS'; trade.closed_at = func.now(); trade.closed_pnl = -loss
+                trade.remaining_qty = 0.0
+                message_text = f"🛑 <b>Stop Loss Atingido (PREJUÍZO)</b>\n<b>Moeda:</b> {trade.symbol}\n<b>Prejuízo Realizado:</b> ${-loss:,.2f}"
+                await application.bot.send_message(chat_id=user.telegram_id, text=message_text, parse_mode='HTML')
                 continue
 
-            loss = abs(trade.current_stop_loss - trade.entry_price) * live_position_size
-            trade.status = 'CLOSED_LOSS'
-            trade.closed_at = func.now()
-            trade.closed_pnl = -loss
-            trade.remaining_qty = 0.0
+        # CENÁRIO 2: A POSIÇÃO NÃO FOI ENCONTRADA NA CORRETORA (JÁ FECHOU)
+        else:
+            logger.info(f"[tracker] Posição para {trade.symbol} não encontrada na Bybit. Investigando motivo...")
             
-            message_text = f"🛑 <b>Stop Loss Atingido (PREJUÍZO)</b>\n<b>Moeda:</b> {trade.symbol}\n<b>Prejuízo Realizado:</b> ${-loss:,.2f}"
-            await application.bot.send_message(chat_id=user.telegram_id, text=message_text, parse_mode='HTML')
-            continue
+            # 2a. INVESTIGA SE FOI UM TAKE PROFIT
+            if trade.initial_targets:
+                next_target_price = trade.initial_targets[0]
+                if (trade.side == 'LONG' and current_price >= next_target_price) or \
+                   (trade.side == 'SHORT' and current_price <= next_target_price):
+                    
+                    profit = abs(next_target_price - trade.entry_price) * trade.qty # Usa a quantidade total do trade para o cálculo final
+                    trade.status = 'CLOSED_PROFIT'; trade.closed_at = func.now(); trade.closed_pnl = profit
+                    trade.remaining_qty = 0.0
+                    message_text = f"🏆 <b>Alvo Final Atingido! (LUCRO)</b> 🏆\n<b>Moeda:</b> {trade.symbol}\n<b>Lucro Realizado:</b> ${profit:,.2f}\n<i>(Posição fechada pela corretora)</i>"
+                    await application.bot.send_message(chat_id=user.telegram_id, text=message_text, parse_mode='HTML')
+                    continue
 
-        # 3. VERIFICA POSIÇÃO FANTASMA
-        live_position_size = await get_specific_position_size(api_key, api_secret, trade.symbol)
-        if live_position_size <= 0:
-            logger.info(f"[tracker] Posição fantasma para {trade.symbol} detectada e limpa.")
-            trade.status = 'CLOSED_GHOST'
-            trade.closed_at = func.now()
-            trade.closed_pnl = 0.0
+            # 2b. INVESTIGA SE FOI UM STOP LOSS
+            if (trade.side == 'LONG' and current_price <= trade.current_stop_loss) or \
+               (trade.side == 'SHORT' and current_price >= trade.current_stop_loss):
+               
+                loss = abs(trade.current_stop_loss - trade.entry_price) * trade.qty
+                trade.status = 'CLOSED_LOSS'; trade.closed_at = func.now(); trade.closed_pnl = -loss
+                trade.remaining_qty = 0.0
+                message_text = f"🛑 <b>Stop Loss Atingido (PREJUÍZO)</b>\n<b>Moeda:</b> {trade.symbol}\n<b>Prejuízo Realizado:</b> ${-loss:,.2f}\n<i>(Posição fechada pela corretora)</i>"
+                await application.bot.send_message(chat_id=user.telegram_id, text=message_text, parse_mode='HTML')
+                continue
+
+            # 2c. SE NÃO FOI NENHUM DOS DOIS, É UM FECHAMENTO EXTERNO/FANTASMA
+            trade.status = 'CLOSED_GHOST'; trade.closed_at = func.now(); trade.closed_pnl = 0.0
             trade.remaining_qty = 0.0
-            
             message_text = f"ℹ️ Posição em <b>{trade.symbol}</b> não foi encontrada na Bybit e foi removida do monitoramento."
             await application.bot.send_message(chat_id=user.telegram_id, text=message_text, parse_mode='HTML')
 
