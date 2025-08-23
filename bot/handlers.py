@@ -230,53 +230,64 @@ async def my_positions_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         api_key = decrypt_data(user.api_key_encrypted)
         api_secret = decrypt_data(user.api_secret_encrypted)
 
-        live = await get_open_positions_with_pnl(api_key, api_secret)
-        live_positions = live["data"] if live.get("success") else []
-
+        # Busca as posições ativas que o bot está gerenciando no nosso DB
         active_trades = db.query(Trade).filter(
             Trade.user_telegram_id == user_id,
             ~Trade.status.like('%CLOSED%')
         ).all()
 
-        trade_id_by_symbol = {t.symbol: t.id for t in active_trades}
+        if not active_trades:
+            await query.edit_message_text(
+                "<b>📊 Suas Posições Ativas</b>\n\nNenhuma posição sendo gerenciada no momento.",
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data='back_to_main_menu')]])
+            )
+            return
+
+        # Busca os dados ao vivo (P/L) da Bybit para essas posições
+        live_pnl_data = {}
+        live_positions_result = await get_open_positions_with_pnl(api_key, api_secret)
+        if live_positions_result.get("success"):
+            for pos in live_positions_result.get("data", []):
+                live_pnl_data[pos["symbol"]] = pos
 
         lines = ["<b>📊 Suas Posições Ativas (Gerenciadas pelo Bot)</b>", ""]
         keyboard = []
 
-        if not live_positions and not active_trades:
-            lines.append("Nenhuma posição sendo gerenciada no momento.")
-        else:
-            for pos in live_positions:
-                arrow = "⬆️" if pos["side"] == "LONG" else "⬇️"
-                sym = pos["symbol"]
-                size = pos["size"]
-                entry = pos["entry"] or 0.0
-                mark = pos["mark"] or 0.0
-                pnl = pos["unrealized_pnl"]
-                pnl_pct = pos["unrealized_pnl_pct"]
-
-                lines.append(
-                    f"- {arrow} <b>{sym}</b> ({size:g} unid.)\n"
-                    f"  Entrada: ${entry:.4f} | Preço: ${mark:.4f}\n"
-                    f"  P/L: <b>{pnl:+.2f} USDT</b> ({pnl_pct:+.2f}%)\n"
+        for trade in active_trades:
+            arrow = "⬆️" if trade.side == "LONG" else "⬇️"
+            pnl_info = ""
+            
+            # Adiciona os dados de P/L ao vivo, se disponíveis
+            if trade.symbol in live_pnl_data:
+                live_data = live_pnl_data[trade.symbol]
+                pnl = live_data["unrealized_pnl"]
+                pnl_pct = live_data["unrealized_pnl_pct"]
+                mark_price = live_data["mark"]
+                pnl_info = (
+                    f"  Preço Atual: ${mark_price:,.4f}\n"
+                    f"  P/L: <b>{pnl:+.2f} USDT ({pnl_pct:+.2f}%)</b>\n"
                 )
+            else:
+                pnl_info = f"  Status: {trade.status}\n"
 
-                if sym in trade_id_by_symbol:
-                    trade_id = trade_id_by_symbol[sym]
-                    keyboard.append([
-                        InlineKeyboardButton(f"Fechar {sym} ❌", callback_data=f"confirm_close_{trade_id}")
-                    ])
+            # --- NOVA LÓGICA PARA EXIBIR ALVOS ---
+            targets_info = ""
+            if trade.initial_targets:
+                next_target = trade.initial_targets[0]
+                remaining_count = len(trade.initial_targets)
+                targets_info = f"  🎯 Próximo Alvo: ${next_target:,.4f} ({remaining_count} restantes)\n"
 
-            for t in active_trades:
-                if t.symbol not in {p["symbol"] for p in live_positions}:
-                    side_emoji = "⬆️" if t.side == 'LONG' else "⬇️"
-                    lines.append(
-                        f"- {side_emoji} <b>{t.symbol}</b> ({t.qty:g} unid.)\n"
-                        f"  Entrada: ${t.entry_price:.4f} | Status: {t.status}\n"
-                    )
-                    keyboard.append([
-                        InlineKeyboardButton(f"Fechar {t.symbol} ❌", callback_data=f"confirm_close_{t.id}")
-                    ])
+            lines.append(
+                f"- {arrow} <b>{trade.symbol}</b> ({trade.qty:g} unid.)\n"
+                f"  Entrada: ${trade.entry_price:.4f}\n"
+                f"{pnl_info}"
+                f"{targets_info}"
+            )
+
+            keyboard.append([
+                InlineKeyboardButton(f"Fechar {trade.symbol} ❌", callback_data=f"confirm_close_{trade.id}")
+            ])
 
         keyboard.append([InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data='back_to_main_menu')])
         await query.edit_message_text(
@@ -287,8 +298,9 @@ async def my_positions_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     finally:
         db.close()
 
+
 async def user_dashboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Exibe o painel com saldo focado em USDT, outras moedas e posições."""
+    """Exibe o painel com um resumo dos saldos da carteira."""
     query = update.callback_query
     try:
         await query.answer()
@@ -308,10 +320,7 @@ async def user_dashboard_handler(update: Update, context: ContextTypes.DEFAULT_T
         api_key = decrypt_data(user.api_key_encrypted)
         api_secret = decrypt_data(user.api_secret_encrypted)
 
-        account_info, positions_info = await asyncio.gather(
-            get_account_info(api_key, api_secret),
-            get_open_positions_with_pnl(api_key, api_secret)
-        )
+        account_info = await get_account_info(api_key, api_secret)
 
         message = "<b>ℹ️ Seu Painel de Controle</b>\n\n"
         message += "<b>Saldos na Carteira:</b>\n"
@@ -330,10 +339,13 @@ async def user_dashboard_handler(update: Update, context: ContextTypes.DEFAULT_T
 
                 if coin == "USDT":
                     usdt_balance_value = wallet_balance
-                elif wallet_balance >= 0.1:
-                    other_coins_lines.append(f"- {coin}: {wallet_balance:.2f}")
+                # --- LÓGICA CORRIGIDA AQUI ---
+                # A verificação complexa que usava 'price_result' foi trocada
+                # por uma verificação simples para exibir apenas saldos relevantes.
+                elif wallet_balance > 0.01:
+                    other_coins_lines.append(f"- {coin}: {wallet_balance:g}")
 
-            message += f"<b>- USDT: {usdt_balance_value:.2f}</b>\n"
+            message += f"<b>- USDT: {usdt_balance_value:,.2f}</b>\n"
             if other_coins_lines:
                 message += "\n".join(other_coins_lines)
             elif usdt_balance_value == 0.0:
@@ -341,27 +353,7 @@ async def user_dashboard_handler(update: Update, context: ContextTypes.DEFAULT_T
         else:
             message += f"Erro ao buscar saldo: {account_info.get('error')}\n"
 
-        message += "\n\n<b>Posições Abertas:</b>\n"
-        if positions_info.get("success") and positions_info.get("data"):
-            for p in positions_info["data"]:
-                side = (p.get("side") or "").upper()
-                arrow = "🔼" if side == "LONG" else "🔽"
-                symbol = p.get("symbol", "???")
-                size = p.get("size", 0)
-                entry = float(p.get("entry_price") or 0)
-                mark = float(p.get("mark_price") or 0)
-                pnl = float(p.get("unrealized_pnl") or 0)
-                pnl_pct = float(p.get("unrealized_pnl_pct") or 0)
-
-                message += (
-                    f"- {arrow} {symbol}: {size:g}\n"
-                    f"  Entrada: ${entry:,.4f} | Atual: ${mark:,.4f}\n"
-                    f"  P/L: <b>${pnl:+.2f} ({pnl_pct:+.2f}%)</b>\n"
-                )
-        else:
-            message += "- Nenhuma posição aberta no momento."
-
-        message += "\n\n<i>⚠️ Este bot opera exclusivamente com pares USDT.</i>"
+        message += "\n\n<i>Use o menu 'Minhas Posições' para ver os detalhes dos seus trades.</i>"
 
         await query.edit_message_text(message, parse_mode="HTML", reply_markup=dashboard_menu_keyboard())
 
