@@ -598,3 +598,4 @@ async def modify_position_take_profit(api_key: str, api_secret: str, symbol: str
             logger.error(f"Exceção ao modificar Take Profit: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
     return await asyncio.to_thread(_sync_call)
+

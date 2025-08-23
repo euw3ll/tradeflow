@@ -77,7 +77,8 @@ async def _execute_trade(signal_data: dict, user: User, application: Application
             user_telegram_id=user.telegram_id, order_id=order_id,
             symbol=symbol, side=side, qty=qty, entry_price=entry_price,
             stop_loss=stop_loss, current_stop_loss=stop_loss,
-            initial_targets=all_targets, status='ACTIVE', # Garante que todos os alvos sejam salvos
+            initial_targets=all_targets, # Garante que todos os alvos sejam salvos
+            status='ACTIVE',
             remaining_qty=qty
         )
         db.add(new_trade)

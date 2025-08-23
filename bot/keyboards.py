@@ -129,6 +129,7 @@ def performance_menu_keyboard():
             InlineKeyboardButton("Últimos 7 Dias", callback_data='perf_7_days'),
             InlineKeyboardButton("Últimos 30 Dias", callback_data='perf_30_days')
         ],
+        [InlineKeyboardButton("📜 Histórico de Trades", callback_data='list_closed_trades')],
         [InlineKeyboardButton("⬅️ Voltar ao Menu Principal", callback_data='back_to_main_menu')]
     ]
     return InlineKeyboardMarkup(keyboard)

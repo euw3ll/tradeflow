@@ -235,8 +235,9 @@ class User(Base):
     approval_mode = Column(String, default='AUTOMATIC', nullable=False)
     daily_profit_target = Column(Float, default=0.0, nullable=False)
     daily_loss_limit = Column(Float, default=0.0, nullable=False)
-    # ADICIONE A LINHA ABAIXO
     coin_whitelist = Column(String, default='todas', nullable=False)
+    closed_at = Column(DateTime(timezone=True), nullable=True)
+    closed_pnl = Column(Float, nullable=True)
 
 class InviteCode(Base):
     __tablename__ = 'invite_codes'
@@ -404,11 +405,11 @@ from database.models import Trade, User, PendingSignal
 from services.bybit_service import (
     get_market_price, close_partial_position,
     modify_position_stop_loss, get_order_status,
-    get_specific_position_size # <-- ADICIONE ESTA LINHA
+    get_specific_position_size, modify_position_take_profit
 )
-# Mantemos o send_notification se você usar em outros pontos (aqui focamos em mensagem individual)
 from services.notification_service import send_notification
 from utils.security import decrypt_data
+from sqlalchemy.sql import func
 
 logger = logging.getLogger(__name__)
 
@@ -509,95 +510,86 @@ async def check_pending_orders_for_user(application: Application, user: User, db
                 f"Seguir monitorando."
             )
 
-
 async def check_active_trades_for_user(application: Application, user: User, db: Session):
-    """Verifica e gerencia os trades ativos de UM usuário específico."""
+    """Verifica e gerencia os trades ativos, com lógica completa para múltiplos TPs."""
+    # ... (código inicial da função permanece o mesmo) ...
     active_trades = db.query(Trade).filter(
         Trade.user_telegram_id == user.telegram_id,
         ~Trade.status.like('%CLOSED%')
     ).all()
-    if not active_trades:
-        return
-
+    if not active_trades: return
     api_key = decrypt_data(user.api_key_encrypted)
     api_secret = decrypt_data(user.api_secret_encrypted)
 
     for trade in active_trades:
-        live_position_size = await get_specific_position_size(api_key, api_secret, trade.symbol)
-        if live_position_size <= 0:
-            logger.info(f"[tracker] Posição fantasma detectada para {trade.symbol}. Marcando como fechada.")
-            trade.status = 'CLOSED_GHOST'
-            trade.remaining_qty = 0.0
-            continue
-
         price_result = await get_market_price(trade.symbol)
-        if not price_result.get("success"):
-            continue
-
+        if not price_result.get("success"): continue
         current_price = price_result["price"]
-        reached_tp = False
 
-        # --- TAKE PROFIT ---
+        # 1. VERIFICA TAKE PROFIT
         if trade.initial_targets:
             next_target_price = trade.initial_targets[0]
             if (trade.side == 'LONG' and current_price >= next_target_price) or \
                (trade.side == 'SHORT' and current_price <= next_target_price):
                 
+                live_position_size = await get_specific_position_size(api_key, api_secret, trade.symbol)
+                if live_position_size <= 0: continue
+
                 qty_to_close = live_position_size if len(trade.initial_targets) == 1 else (live_position_size / 2.0)
                 close_result = await close_partial_position(api_key, api_secret, trade.symbol, qty_to_close, trade.side)
 
                 if close_result.get("success") and not close_result.get("skipped"):
-                    # --- NOVA LÓGICA DE NOTIFICAÇÃO DE LUCRO ---
-                    profit = (next_target_price - trade.entry_price) * qty_to_close if trade.side == 'LONG' else (trade.entry_price - next_target_price) * qty_to_close
-                    
-                    # Atualiza o trade no DB
-                    trade.remaining_qty = live_position_size - qty_to_close
+                    profit = abs(next_target_price - trade.entry_price) * qty_to_close
+                    trade.remaining_qty -= qty_to_close
                     remaining_targets = trade.initial_targets[1:]
                     trade.initial_targets = remaining_targets
                     
                     message_text = ""
-                    if not remaining_targets or trade.remaining_qty <= 0.00001:
+                    if not remaining_targets or trade.remaining_qty < 0.00001:
                         trade.status = 'CLOSED_PROFIT'
-                        message_text = (
-                            f"🏆 <b>Último Alvo Atingido! (LUCRO)</b> 🏆\n"
-                            f"<b>Moeda:</b> {trade.symbol}\n"
-                            f"<b>Lucro Realizado:</b> ${profit:,.2f}\n\n"
-                            f"A posição foi completamente fechada."
-                        )
+                        message_text = f"🏆 <b>Último Alvo Atingido! (LUCRO)</b> 🏆\n<b>Moeda:</b> {trade.symbol}\n<b>Lucro Realizado:</b> ${profit:,.2f}"
                     else:
                         trade.status = 'ACTIVE_TP_HIT'
+                        # --- NOVA LÓGICA: ATUALIZA O TP NA BYBIT ---
+                        next_tp_price = remaining_targets[0]
+                        tp_update_result = await modify_position_take_profit(api_key, api_secret, trade.symbol, next_tp_price)
+                        if tp_update_result.get("success"):
+                            logger.info(f"Take Profit para {trade.symbol} atualizado para o próximo alvo: {next_tp_price}")
+                        else:
+                            logger.error(f"Falha ao atualizar Take Profit para {trade.symbol}: {tp_update_result.get('error')}")
+                        
                         message_text = (
                             f"💰 <b>Take Profit Atingido! (LUCRO)</b>\n"
                             f"<b>Moeda:</b> {trade.symbol}\n"
                             f"<b>Lucro Parcial:</b> ${profit:,.2f}\n"
-                            f"<b>Alvos Restantes:</b> {len(remaining_targets)}"
+                            f"<b>Próximo Alvo (TP{len(trade.initial_targets) - len(remaining_targets) + 1}):</b> ${next_tp_price:,.4f}"
                         )
                     
                     await application.bot.send_message(chat_id=user.telegram_id, text=message_text, parse_mode='HTML')
-                    reached_tp = True
+                    continue
+        
+        # ... (O resto da função com a lógica de Stop Loss e Posição Fantasma continua igual) ...
+        stop_hit = (
+            (trade.side == 'LONG' and current_price <= trade.current_stop_loss) or
+            (trade.side == 'SHORT' and current_price >= trade.current_stop_loss)
+        )
+        if stop_hit:
+            live_position_size = await get_specific_position_size(api_key, api_secret, trade.symbol)
+            if live_position_size <= 0: continue
+            loss = abs(trade.current_stop_loss - trade.entry_price) * live_position_size
+            trade.status = 'CLOSED_LOSS'
+            trade.remaining_qty = 0.0
+            message_text = f"🛑 <b>Stop Loss Atingido (PREJUÍZO)</b>\n<b>Moeda:</b> {trade.symbol}\n<b>Prejuízo Realizado:</b> ${loss:,.2f}"
+            await application.bot.send_message(chat_id=user.telegram_id, text=message_text, parse_mode='HTML')
+            continue
 
-        # --- STOP LOSS ---
-        if not reached_tp:
-            stop_hit = (
-                (trade.side == 'LONG' and current_price <= trade.current_stop_loss) or
-                (trade.side == 'SHORT' and current_price >= trade.current_stop_loss)
-            )
-            if stop_hit:
-                # --- NOVA LÓGICA DE NOTIFICAÇÃO DE PREJUÍZO ---
-                loss = (trade.current_stop_loss - trade.entry_price) * live_position_size if trade.side == 'LONG' else (trade.entry_price - trade.current_stop_loss) * live_position_size
-                
-                trade.status = 'CLOSED_LOSS'
-                trade.remaining_qty = 0.0
-
-                message_text = (
-                    f"🛑 <b>Stop Loss Atingido (PREJUÍZO)</b>\n"
-                    f"<b>Moeda:</b> {trade.symbol}\n"
-                    f"<b>Prejuízo Realizado:</b> ${loss:,.2f}\n\n"
-                    f"A posição foi completamente fechada."
-                )
-                await application.bot.send_message(chat_id=user.telegram_id, text=message_text, parse_mode='HTML')
-
-
+        live_position_size = await get_specific_position_size(api_key, api_secret, trade.symbol)
+        if live_position_size <= 0:
+            logger.info(f"[tracker] Posição fantasma para {trade.symbol} detectada e limpa.")
+            trade.status = 'CLOSED_GHOST'
+            trade.remaining_qty = 0.0
+            message_text = f"ℹ️ Posição em <b>{trade.symbol}</b> não foi encontrada na Bybit e foi removida do monitoramento."
+            await application.bot.send_message(chat_id=user.telegram_id, text=message_text, parse_mode='HTML')
 
 async def run_tracker(application: Application):
     """Função principal que roda o verificador em loop para TODOS os usuários."""
@@ -631,6 +623,7 @@ async def run_tracker(application: Application):
 ========================================
 
 import os
+import asyncio
 import logging
 from typing import Tuple
 from telegram.ext import Application
@@ -639,7 +632,8 @@ from database.session import SessionLocal
 from database.models import User, Trade, PendingSignal, SignalForApproval
 from services.bybit_service import (
     place_order, get_account_info,
-    place_limit_order, cancel_order
+    place_limit_order, cancel_order,
+    get_order_history
 )
 from services.notification_service import send_notification
 from utils.security import decrypt_data
@@ -660,6 +654,7 @@ def _avaliar_sinal(signal_data: dict, user_settings: User) -> Tuple[bool, str]:
     return True, "Sinal aprovado pelos seus critérios."
 
 async def _execute_trade(signal_data: dict, user: User, application: Application, db: Session, source_name: str):
+    """Executa uma ordem a MERCADO, busca os detalhes da execução e envia uma notificação detalhada."""
     api_key = decrypt_data(user.api_key_encrypted)
     api_secret = decrypt_data(user.api_secret_encrypted)
     
@@ -669,27 +664,67 @@ async def _execute_trade(signal_data: dict, user: User, application: Application
         return
 
     balance_data = account_info.get("data", {})
-    balance = float(balance_data.get('available_balance', 0))
-    result = await place_order(api_key, api_secret, signal_data, user, balance)
+    balance = float(balance_data.get('available_balance_usdt', 0))
+
+    order_result = await place_order(api_key, api_secret, signal_data, user, balance)
     
-    if result.get("success"):
-        order_data = result['data']
+    if order_result.get("success"):
+        order_data = order_result['data']
         order_id = order_data['orderId']
+        
+        await asyncio.sleep(2)
+        final_order_data_result = await get_order_history(api_key, api_secret, order_id)
+        if not final_order_data_result.get("success"):
+            await application.bot.send_message(chat_id=user.telegram_id, text=f"⚠️ Ordem {signal_data['coin']} enviada, mas falha ao confirmar detalhes. Verifique na corretora.")
+            return
+        final_order_data = final_order_data_result['data']
+        
+        symbol = signal_data['coin']
+        side = signal_data['order_type']
+        leverage = user.max_leverage
+        qty = float(final_order_data.get('cumExecQty', 0))
+        entry_price = float(final_order_data.get('avgPrice', 0))
+        
+        if qty == 0 or entry_price == 0:
+            await application.bot.send_message(chat_id=user.telegram_id, text=f"⚠️ Ordem {symbol} enviada, mas a execução reportou quantidade/preço zerado.")
+            return
+            
+        margin = (qty * entry_price) / leverage if leverage > 0 else 0
+        stop_loss = signal_data['stop_loss']
+        
+        # --- LÓGICA DE NOTIFICAÇÃO CORRIGIDA ---
+        all_targets = signal_data.get('targets') or []
+        take_profit_1 = all_targets[0] if all_targets else "N/A"
+        num_targets = len(all_targets)
+
         new_trade = Trade(
             user_telegram_id=user.telegram_id, order_id=order_id,
-            symbol=signal_data['coin'], side=signal_data['order_type'],
-            qty=float(order_data.get('qty', 0)), entry_price=signal_data['entries'][0],
-            stop_loss=signal_data['stop_loss'], current_stop_loss=signal_data['stop_loss'],
-            initial_targets=signal_data['targets'], status='ACTIVE',
-            remaining_qty=float(order_data.get('qty', 0))
+            symbol=symbol, side=side, qty=qty, entry_price=entry_price,
+            stop_loss=stop_loss, current_stop_loss=stop_loss,
+            initial_targets=all_targets, status='ACTIVE', # Garante que todos os alvos sejam salvos
+            remaining_qty=qty
         )
         db.add(new_trade)
-        logger.info(f"Trade {order_id} para o usuário {user.telegram_id} salvo no DB.")
-        await application.bot.send_message(chat_id=user.telegram_id, text=f"📈 <b>Ordem Aberta com Sucesso!</b>\n<b>Moeda:</b> {signal_data['coin']}", parse_mode='HTML')
-    else:
-        error_msg = result.get('error')
-        await application.bot.send_message(chat_id=user.telegram_id, text=f"❌ <b>Falha ao Abrir Ordem</b>\n<b>Moeda:</b> {signal_data['coin']}\n<b>Motivo:</b> {error_msg}", parse_mode='HTML')
+        logger.info(f"Trade {order_id} para o usuário {user.telegram_id} salvo no DB com dados de execução.")
+        
+        tp_text = f"${float(take_profit_1):,.4f}" if isinstance(take_profit_1, (int, float)) else take_profit_1
+        if num_targets > 1:
+            tp_text += f" (de {num_targets} alvos)"
 
+        message = (
+            f"📈 <b>Ordem a Mercado Aberta!</b>\n\n"
+            f"  - 📊 <b>Tipo:</b> {side} | <b>Alavancagem:</b> {leverage}x\n"
+            f"  - 💎 <b>Moeda:</b> {symbol}\n"
+            f"  - 🔢 <b>Quantidade:</b> {qty:g}\n"
+            f"  - 💵 <b>Preço de Entrada:</b> ${entry_price:,.4f}\n"
+            f"  - 💰 <b>Margem:</b> ${margin:,.2f}\n"
+            f"  - 🛡️ <b>Stop Loss:</b> ${stop_loss:,.4f}\n"
+            f"  - 🎯 <b>Take Profit 1:</b> {tp_text}"
+        )
+        await application.bot.send_message(chat_id=user.telegram_id, text=message, parse_mode='HTML')
+    else:
+        error_msg = order_result.get('error')
+        await application.bot.send_message(chat_id=user.telegram_id, text=f"❌ <b>Falha ao Abrir Ordem</b>\n<b>Moeda:</b> {signal_data['coin']}\n<b>Motivo:</b> {error_msg}", parse_mode='HTML')
 
 async def execute_signal_for_all_users(signal_data: dict, application: Application, db: Session, source_name: str):
     signal_type = signal_data.get("type")
@@ -758,7 +793,7 @@ async def execute_signal_for_all_users(signal_data: dict, application: Applicati
                 continue
 
             balance_data = account_info.get("data", {})
-            balance = float(balance_data.get('available_balance', 0))
+            balance = float(balance_data.get('available_balance_usdt', 0))
 
             # >>> IMPORTANTE: agora enviamos signal_data_with_price <<<
             limit_order_result = await place_limit_order(user_api_key, user_api_secret, signal_data_with_price, user, balance)
@@ -3156,6 +3191,39 @@ def downgrade() -> None:
     # ### end Alembic commands ###
 
 ========================================
+# Arquivo: alembic/versions/fb136ee62ca2_add_close_info_to_trades.py
+========================================
+
+"""add_close_info_to_trades
+
+Revision ID: <SEU_REVISION_ID_AQUI>
+Revises: 09d80b6e64de
+Create Date: 2025-08-23 11:50:00.123456
+
+"""
+from alembic import op
+import sqlalchemy as sa
+
+
+# revision identifiers, used by Alembic.
+revision = '<SEU_REVISION_ID_AQUI>' # Coloque o ID gerado aqui
+down_revision = '09d80b6e64de'      # Aponta para a migração anterior
+branch_labels = None
+depends_on = None
+
+
+def upgrade() -> None:
+    # Comando para adicionar as novas colunas à tabela 'trades'
+    op.add_column('trades', sa.Column('closed_at', sa.DateTime(timezone=True), nullable=True))
+    op.add_column('trades', sa.Column('closed_pnl', sa.Float(), nullable=True))
+
+
+def downgrade() -> None:
+    # Comando para remover as colunas caso precise reverter
+    op.drop_column('trades', 'closed_pnl')
+    op.drop_column('trades', 'closed_at')
+
+========================================
 # Arquivo: services/__init__.py
 ========================================
 
@@ -3239,38 +3307,44 @@ def get_session(api_key: str, api_secret: str) -> HTTP:
     )
 
 async def get_account_info(api_key: str, api_secret: str) -> dict:
-    """Busca o saldo da conta, retornando dados detalhados incluindo a lista de moedas."""
+    """Busca o saldo da conta, calculando o saldo disponível para Contas Unificadas."""
     def _sync_call():
         try:
             session = get_session(api_key, api_secret)
             response = session.get_wallet_balance(accountType="UNIFIED")
-
+            
             if response.get('retCode') == 0:
                 account_data_list = response['result'].get('list', [])
                 if not account_data_list:
                     return {"success": False, "data": {}, "error": "Lista de contas vazia na resposta da API."}
                 
                 account_data = account_data_list[0]
-                
                 equity_str = account_data.get('totalEquity')
                 total_equity = float(equity_str) if equity_str else 0.0
                 coin_list = account_data.get('coin', [])
-
+                
                 available_balance_usdt = 0.0
-                for coin_balance in coin_list:
-                    if coin_balance.get('coin') == 'USDT':
-                        available_str = coin_balance.get('availableToWithdraw')
-                        available_balance_usdt = float(available_str) if available_str else 0.0
+                for coin in coin_list:
+                    if coin.get('coin') == 'USDT':
+                        wallet_balance_str = coin.get('walletBalance', '0')
+                        order_margin_str = coin.get('totalOrderIM', '0')
+                        position_margin_str = coin.get('totalPositionIM', '0')
+
+                        wallet_balance = float(wallet_balance_str) if wallet_balance_str else 0.0
+                        order_margin = float(order_margin_str) if order_margin_str else 0.0
+                        position_margin = float(position_margin_str) if position_margin_str else 0.0
+                        
+                        # Cálculo correto para Conta de Trading Unificada
+                        available_balance_usdt = wallet_balance - order_margin - position_margin
                         break
                 
-                return {
-                    "success": True, 
-                    "data": {
-                        "total_equity": total_equity,
-                        "available_balance_usdt": available_balance_usdt,
-                        "coin_list": coin_list  # <-- Retornando a lista completa
-                    }
+                result_data = {
+                    "total_equity": total_equity,
+                    "available_balance_usdt": available_balance_usdt,
+                    "coin_list": coin_list
                 }
+                return {"success": True, "data": result_data}
+                
             return {"success": False, "data": {}, "error": response.get('retMsg', 'Erro desconhecido')}
         except Exception as e:
             logger.error(f"Exceção em get_account_info: {e}", exc_info=True)
@@ -3278,62 +3352,49 @@ async def get_account_info(api_key: str, api_secret: str) -> dict:
 
     return await asyncio.to_thread(_sync_call)
 
-
 async def place_order(api_key: str, api_secret: str, signal_data: dict, user_settings: User, balance: float) -> dict:
     """Abre uma nova posição a mercado (Market) com validação completa."""
     async def pre_flight_checks():
         symbol = signal_data['coin']
-        if symbol not in INSTRUMENT_INFO_CACHE:
-            await get_instrument_info(symbol)
+        if symbol not in INSTRUMENT_INFO_CACHE: await get_instrument_info(symbol)
         return INSTRUMENT_INFO_CACHE.get(symbol)
 
     def _sync_call(instrument_rules: Dict[str, Any]):
         try:
             symbol = signal_data['coin']
-
-            if not instrument_rules or not instrument_rules.get("success"):
-                return instrument_rules or {"success": False, "error": f"Regras para {symbol} não encontradas."}
-            if instrument_rules["status"] != "Trading":
-                return {"success": False, "error": f"O símbolo {symbol} não está ativo para negociação ({instrument_rules['status']})."}
+            if not instrument_rules or not instrument_rules.get("success"): return instrument_rules or {"success": False, "error": f"Regras para {symbol} não encontradas."}
+            if instrument_rules["status"] != "Trading": return {"success": False, "error": f"O símbolo {symbol} não está ativo para negociação ({instrument_rules['status']})."}
 
             session = get_session(api_key, api_secret)
             side = "Buy" if (signal_data.get('order_type') or '').upper() == 'LONG' else "Sell"
             leverage = Decimal(str(user_settings.max_leverage))
             entry_price = Decimal(str(signal_data['entries'][0]))
+            
             margin_in_dollars = Decimal(str(balance)) * (Decimal(str(user_settings.entry_size_percent)) / Decimal("100"))
             notional_value = margin_in_dollars * leverage
             
             if entry_price <= 0: return {"success": False, "error": f"Preço de entrada inválido: {entry_price}"}
-
             qty_raw = notional_value / entry_price
             qty_adj = _round_down_to_step(qty_raw, instrument_rules["qtyStep"])
 
             if qty_adj < instrument_rules["minOrderQty"]:
                 return {"success": False, "error": f"Qtd. ajustada ({qty_adj:f}) é menor que a mínima permitida ({instrument_rules['minOrderQty']:f}) para {symbol}."}
-            
             final_notional_value = qty_adj * entry_price
             if final_notional_value < instrument_rules["minNotionalValue"]:
                 return {"success": False, "error": f"Valor total da ordem (${final_notional_value:.2f}) é menor que o mínimo permitido de ${instrument_rules['minNotionalValue']:.2f}."}
-
-            # --- LÓGICA CORRIGIDA ---
+            
             payload = {
-                "category": "linear", "symbol": symbol, "side": side,
-                "orderType": "Market", "qty": str(qty_adj),
-                "takeProfit": str((signal_data.get('targets') or [None])[0]),
-                "stopLoss": str(signal_data.get('stop_loss')),
+                "category": "linear", "symbol": symbol, "side": side, "orderType": "Market", "qty": str(qty_adj),
+                "takeProfit": str((signal_data.get('targets') or [None])[0]), "stopLoss": str(signal_data.get('stop_loss')),
             }
-
             try:
                 session.set_leverage(category="linear", symbol=symbol, buyLeverage=str(leverage), sellLeverage=str(leverage))
             except InvalidRequestError as e:
-                if "leverage not modified" in str(e).lower():
-                    logger.warning(f"Alavancagem para {symbol} já está correta. Continuando...")
-                else:
-                    return {"success": False, "error": str(e)} # Retorna outros erros de alavancagem
-
+                if "leverage not modified" in str(e).lower(): logger.warning(f"Alavancagem para {symbol} já está correta. Continuando...")
+                else: return {"success": False, "error": str(e)}
+            
             response = session.place_order(**{k: v for k, v in payload.items() if v is not None})
-            if response.get('retCode') == 0:
-                return {"success": True, "data": response['result']}
+            if response.get('retCode') == 0: return {"success": True, "data": response['result']}
             return {"success": False, "error": response.get('retMsg')}
         
         except Exception as e:
@@ -3713,9 +3774,6 @@ async def get_open_positions_with_pnl(api_key: str, api_secret: str) -> dict:
             return {"success": False, "error": str(e)}
     return await asyncio.to_thread(_sync_call)
 
-# Adicione esta nova função em services/bybit_service.py
-# Pode ser adicionada após a função modify_position_stop_loss
-
 async def get_specific_position_size(api_key: str, api_secret: str, symbol: str) -> float:
     """
     Busca o tamanho (size) de uma posição específica aberta na Bybit.
@@ -3739,6 +3797,43 @@ async def get_specific_position_size(api_key: str, api_secret: str, symbol: str)
             return 0.0 # Em caso de erro, assumimos que não há posição para evitar fechamentos indevidos
 
     return await asyncio.to_thread(_sync_call)
+    
+async def get_order_history(api_key: str, api_secret: str, order_id: str) -> dict:
+    """Busca os detalhes de uma ordem específica no histórico."""
+    def _sync_call():
+        try:
+            session = get_session(api_key, api_secret)
+            response = session.get_order_history(category="linear", orderId=order_id, limit=1)
+            
+            if response.get('retCode') == 0:
+                order_list = response.get('result', {}).get('list', [])
+                if order_list:
+                    return {"success": True, "data": order_list[0]}
+                return {"success": False, "error": "Ordem não encontrada no histórico."}
+            return {"success": False, "error": response.get('retMsg')}
+        except Exception as e:
+            logger.error(f"Exceção em get_order_history: {e}", exc_info=True)
+            return {"success": False, "error": str(e)}
+
+    return await asyncio.to_thread(_sync_call)
+
+async def modify_position_take_profit(api_key: str, api_secret: str, symbol: str, new_take_profit: float) -> dict:
+    """Modifica o Take Profit de uma posição aberta."""
+    def _sync_call():
+        try:
+            session = get_session(api_key, api_secret)
+            response = session.set_trading_stop(
+                category="linear", symbol=symbol, takeProfit=str(new_take_profit)
+            )
+            if response.get('retCode') == 0:
+                return {"success": True, "data": response['result']}
+            else:
+                return {"success": False, "error": response.get('retMsg')}
+        except Exception as e:
+            logger.error(f"Exceção ao modificar Take Profit: {e}", exc_info=True)
+            return {"success": False, "error": str(e)}
+    return await asyncio.to_thread(_sync_call)
+
 
 ========================================
 # Arquivo: services/notification_service.py

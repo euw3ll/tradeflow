@@ -25,6 +25,7 @@ from database.crud import get_user_by_id
 from core.trade_manager import _execute_trade
 from core.performance_service import generate_performance_report
 from core.trade_manager import execute_signal_for_all_users
+from sqlalchemy.sql import func
 
 
 # Estados para as conversas
@@ -744,7 +745,7 @@ async def receive_min_confidence(update: Update, context: ContextTypes.DEFAULT_T
         return ASKING_MIN_CONFIDENCE
     
 async def manual_close_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Lida com o fechamento manual de uma posição pelo usuário."""
+    """Lida com o fechamento manual de uma posição, salvando o P/L."""
     query = update.callback_query
     await query.answer("Processando fechamento...")
 
@@ -763,41 +764,33 @@ async def manual_close_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         api_key = decrypt_data(user.api_key_encrypted)
         api_secret = decrypt_data(user.api_secret_encrypted)
 
-        # --- NOVA LÓGICA ---
-        # 1. Pega o preço atual para calcular o P/L
         price_result = await get_market_price(trade_to_close.symbol)
-        if not price_result.get("success"):
-            await context.bot.send_message(chat_id=user_id, text=f"⚠️ Não foi possível obter o preço atual de {trade_to_close.symbol} para calcular o P/L.")
-            current_price = trade_to_close.entry_price # Fallback
-        else:
-            current_price = price_result["price"]
+        current_price = price_result["price"] if price_result.get("success") else trade_to_close.entry_price
 
-        # 2. Fecha a posição
         close_result = await close_partial_position(
-            api_key, 
-            api_secret, 
+            api_key, api_secret, 
             trade_to_close.symbol, 
             trade_to_close.remaining_qty, 
             trade_to_close.side
         )
 
         if close_result.get("success"):
-            # 3. Calcula o P/L e formata a mensagem
             pnl = (current_price - trade_to_close.entry_price) * trade_to_close.remaining_qty if trade_to_close.side == 'LONG' else (trade_to_close.entry_price - current_price) * trade_to_close.remaining_qty
             
+            trade_to_close.status = 'CLOSED_MANUAL'
+            trade_to_close.closed_at = func.now()
+            trade_to_close.closed_pnl = pnl
+            db.commit()
+
             resultado_str = "LUCRO" if pnl >= 0 else "PREJUÍZO"
             emoji = "✅" if pnl >= 0 else "🔻"
-            
             message_text = (
                 f"{emoji} <b>Posição Fechada Manualmente ({resultado_str})</b>\n"
                 f"<b>Moeda:</b> {trade_to_close.symbol}\n"
                 f"<b>Resultado:</b> ${pnl:,.2f}"
             )
             
-            trade_to_close.status = 'CLOSED_MANUAL'
-            db.commit()
             await query.edit_message_text(message_text, parse_mode='HTML')
-            # Atualiza a lista de posições após um pequeno delay
             await asyncio.sleep(2)
             await my_positions_handler(update, context)
         else:
@@ -1119,3 +1112,61 @@ async def receive_coin_whitelist(update: Update, context: ContextTypes.DEFAULT_T
         db.close()
 
     return ConversationHandler.END
+
+async def list_closed_trades_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Busca no DB e lista os últimos trades fechados do usuário."""
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    
+    await query.edit_message_text("Buscando seu histórico de trades...")
+
+    db = SessionLocal()
+    try:
+        # Busca os últimos 15 trades fechados, ordenados do mais recente para o mais antigo
+        closed_trades = db.query(Trade).filter(
+            Trade.user_telegram_id == user_id,
+            Trade.status.like('%CLOSED%')
+        ).order_by(Trade.closed_at.desc()).limit(15).all()
+
+        message = "<b>📜 Seus Últimos Trades Fechados</b>\n\n"
+
+        if not closed_trades:
+            message += "Nenhum trade fechado encontrado no seu histórico."
+        else:
+            for trade in closed_trades:
+                # Define o emoji e o texto do resultado com base no status e no P/L
+                pnl = trade.closed_pnl if trade.closed_pnl is not None else 0.0
+                resultado_str = f"<b>Resultado: ${pnl:,.2f}</b>"
+                
+                emoji = "❔"
+                if trade.status == 'CLOSED_PROFIT':
+                    emoji = "🏆"
+                elif trade.status == 'CLOSED_LOSS':
+                    emoji = "🛑"
+                elif trade.status == 'CLOSED_MANUAL':
+                    emoji = "✅" if pnl >= 0 else "🔻"
+                elif trade.status == 'CLOSED_GHOST':
+                    emoji = "ℹ️"
+                    resultado_str = "<i>Fechado externamente</i>"
+
+                # Formata a data de fechamento
+                data_fechamento = trade.closed_at.strftime('%d/%m %H:%M') if trade.closed_at else 'N/A'
+
+                message += (
+                    f"{emoji} <b>{trade.symbol}</b> ({trade.side})\n"
+                    f"  - Fechado em: {data_fechamento}\n"
+                    f"  - {resultado_str}\n\n"
+                )
+        
+        # Cria um teclado com o botão para voltar ao menu de desempenho
+        keyboard = [[InlineKeyboardButton("⬅️ Voltar ao Desempenho", callback_data='perf_today')]]
+        
+        await query.edit_message_text(
+            text=message,
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    finally:
+        db.close()

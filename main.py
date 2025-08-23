@@ -20,7 +20,7 @@ from bot.handlers import (
     ask_profit_target, receive_profit_target, ASKING_PROFIT_TARGET,
     ask_loss_limit, receive_loss_limit, ASKING_LOSS_LIMIT, 
     ask_coin_whitelist, receive_coin_whitelist, ASKING_COIN_WHITELIST,
-    performance_menu_handler
+    performance_menu_handler, list_closed_trades_handler
 )
 from database.session import init_db
 from services.telethon_service import start_signal_monitor
@@ -128,6 +128,8 @@ async def main():
     application.add_handler(CallbackQueryHandler(manual_close_handler, pattern='^manual_close_'))
 
     application.add_handler(CallbackQueryHandler(performance_menu_handler, pattern='^perf_'))
+    
+    application.add_handler(CallbackQueryHandler(list_closed_trades_handler, pattern='^list_closed_trades$'))
 
     application.add_handler(CallbackQueryHandler(bot_config_handler, pattern='^bot_config$'))
     application.add_handler(CallbackQueryHandler(toggle_approval_mode_handler, pattern='^toggle_approval_mode$'))
