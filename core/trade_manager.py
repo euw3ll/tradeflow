@@ -37,7 +37,7 @@ async def _execute_trade(signal_data: dict, user: User, application: Application
         return
 
     balance_data = account_info.get("data", {})
-    balance = float(balance_data.get('available_balance', 0))
+    balance = float(balance_data.get('available_balance_usdt', 0))
     result = await place_order(api_key, api_secret, signal_data, user, balance)
     
     if result.get("success"):
@@ -126,7 +126,7 @@ async def execute_signal_for_all_users(signal_data: dict, application: Applicati
                 continue
 
             balance_data = account_info.get("data", {})
-            balance = float(balance_data.get('available_balance', 0))
+            balance = float(balance_data.get('available_balance_usdt', 0))
 
             # >>> IMPORTANTE: agora enviamos signal_data_with_price <<<
             limit_order_result = await place_limit_order(user_api_key, user_api_secret, signal_data_with_price, user, balance)

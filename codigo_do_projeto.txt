@@ -45,6 +45,7 @@ from bot.handlers import (
     bot_config_handler, toggle_approval_mode_handler, handle_signal_approval, 
     ask_profit_target, receive_profit_target, ASKING_PROFIT_TARGET,
     ask_loss_limit, receive_loss_limit, ASKING_LOSS_LIMIT, 
+    ask_coin_whitelist, receive_coin_whitelist, ASKING_COIN_WHITELIST,
     performance_menu_handler
 )
 from database.session import init_db
@@ -120,7 +121,12 @@ async def main():
         states={ ASKING_LOSS_LIMIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_loss_limit)] },
         fallbacks=[CommandHandler("cancel", cancel)], per_message=False,
     )
-    
+    whitelist_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(ask_coin_whitelist, pattern='^set_coin_whitelist$')],
+        states={ ASKING_COIN_WHITELIST: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_coin_whitelist)] },
+        fallbacks=[CommandHandler("cancel", cancel)], per_message=False,
+    )
+
     # Adicionando todos os handlers
     application.add_handler(register_conv)
     application.add_handler(api_conv)
@@ -130,6 +136,7 @@ async def main():
     application.add_handler(settings_confidence_conv)
     application.add_handler(profit_target_conv)
     application.add_handler(loss_limit_conv)
+    application.add_handler(whitelist_conv)
     
     application.add_handler(CommandHandler("admin", admin_menu))
     application.add_handler(CallbackQueryHandler(list_channels_handler, pattern='^admin_list_channels$'))
@@ -176,7 +183,10 @@ if __name__ == "__main__":
 
 #!/bin/sh
 
-# Inicia a aplicação principal do bot diretamente.
+echo "Aplicando migrações do banco de dados..."
+# Este comando garante que o DB esteja sempre na versão mais recente
+alembic upgrade head
+
 echo "Iniciando o bot TradeFlow..."
 python main.py
 
@@ -219,14 +229,14 @@ class User(Base):
     first_name = Column(String)
     api_key_encrypted = Column(String)
     api_secret_encrypted = Column(String)
-    entry_size_percent = Column(Float, default=5.0) # Define 5% como padrão
+    entry_size_percent = Column(Float, default=5.0)
     max_leverage = Column(Integer, default=10)
     min_confidence = Column(Float, default=0.0)
     approval_mode = Column(String, default='AUTOMATIC', nullable=False)
-    # Meta de lucro diário. 0.0 significa desativado.
     daily_profit_target = Column(Float, default=0.0, nullable=False)
-    # Limite de perda diário (valor positivo). 0.0 significa desativado.
     daily_loss_limit = Column(Float, default=0.0, nullable=False)
+    # ADICIONE A LINHA ABAIXO
+    coin_whitelist = Column(String, default='todas', nullable=False)
 
 class InviteCode(Base):
     __tablename__ = 'invite_codes'
@@ -393,7 +403,8 @@ from database.session import SessionLocal
 from database.models import Trade, User, PendingSignal
 from services.bybit_service import (
     get_market_price, close_partial_position,
-    modify_position_stop_loss, get_order_status
+    modify_position_stop_loss, get_order_status,
+    get_specific_position_size # <-- ADICIONE ESTA LINHA
 )
 # Mantemos o send_notification se você usar em outros pontos (aqui focamos em mensagem individual)
 from services.notification_service import send_notification
@@ -508,14 +519,19 @@ async def check_active_trades_for_user(application: Application, user: User, db:
     if not active_trades:
         return
 
-    logger.info(f"Rastreador: Verificando {len(active_trades)} trade(s) ativo(s) para o usuário {user.telegram_id}.")
     api_key = decrypt_data(user.api_key_encrypted)
     api_secret = decrypt_data(user.api_secret_encrypted)
 
     for trade in active_trades:
+        live_position_size = await get_specific_position_size(api_key, api_secret, trade.symbol)
+        if live_position_size <= 0:
+            logger.info(f"[tracker] Posição fantasma detectada para {trade.symbol}. Marcando como fechada.")
+            trade.status = 'CLOSED_GHOST'
+            trade.remaining_qty = 0.0
+            continue
+
         price_result = await get_market_price(trade.symbol)
         if not price_result.get("success"):
-            logger.warning(f"[tracker] Falha ao obter preço de {trade.symbol}: {price_result.get('error')}")
             continue
 
         current_price = price_result["price"]
@@ -526,70 +542,39 @@ async def check_active_trades_for_user(application: Application, user: User, db:
             next_target_price = trade.initial_targets[0]
             if (trade.side == 'LONG' and current_price >= next_target_price) or \
                (trade.side == 'SHORT' and current_price <= next_target_price):
+                
+                qty_to_close = live_position_size if len(trade.initial_targets) == 1 else (live_position_size / 2.0)
+                close_result = await close_partial_position(api_key, api_secret, trade.symbol, qty_to_close, trade.side)
 
-                db.refresh(trade)  # garante objeto atualizado do DB
-                # Fecha 50% se houver mais de 1 alvo restante,
-                # senão fecha tudo (último alvo)
-                qty_to_close = trade.remaining_qty if len(trade.initial_targets) == 1 \
-                               else (trade.remaining_qty / 2.0)
-
-                close_result = await close_partial_position(
-                    api_key, api_secret, trade.symbol, qty_to_close, trade.side
-                )
-
-                if close_result.get("success"):
-                    if close_result.get("skipped"):
-                        # Nada a fechar (qty virou 0 após ajuste de step/minQty)
-                        logger.info(
-                            f"[tracker] {trade.symbol}: fechamento parcial ignorado "
-                            f"(qty ajustada a zero). Mantendo trade e alvos."
+                if close_result.get("success") and not close_result.get("skipped"):
+                    # --- NOVA LÓGICA DE NOTIFICAÇÃO DE LUCRO ---
+                    profit = (next_target_price - trade.entry_price) * qty_to_close if trade.side == 'LONG' else (trade.entry_price - next_target_price) * qty_to_close
+                    
+                    # Atualiza o trade no DB
+                    trade.remaining_qty = live_position_size - qty_to_close
+                    remaining_targets = trade.initial_targets[1:]
+                    trade.initial_targets = remaining_targets
+                    
+                    message_text = ""
+                    if not remaining_targets or trade.remaining_qty <= 0.00001:
+                        trade.status = 'CLOSED_PROFIT'
+                        message_text = (
+                            f"🏆 <b>Último Alvo Atingido! (LUCRO)</b> 🏆\n"
+                            f"<b>Moeda:</b> {trade.symbol}\n"
+                            f"<b>Lucro Realizado:</b> ${profit:,.2f}\n\n"
+                            f"A posição foi completamente fechada."
                         )
-                        # não notifica usuário como erro
                     else:
-                        # Move SL (trailing simples): no primeiro TP → para preço de entrada;
-                        # senão, pode mover para o último target atingido (simples).
-                        new_stop_loss = trade.entry_price if trade.status == 'ACTIVE' else trade.initial_targets[-1]
-                        sl_result = await modify_position_stop_loss(api_key, api_secret, trade.symbol, new_stop_loss)
-
-                        if sl_result.get("success"):
-                            trade.remaining_qty -= qty_to_close
-                            # remove o alvo atingido
-                            trade.initial_targets = trade.initial_targets[1:]
-                            trade.current_stop_loss = new_stop_loss
-                            reached_tp = True
-
-                            if trade.remaining_qty <= 0.0 or not trade.initial_targets:
-                                trade.status = 'CLOSED_PROFIT'
-                            else:
-                                trade.status = 'ACTIVE_TP_HIT'
-
-                            await application.bot.send_message(
-                                chat_id=user.telegram_id,
-                                text=(
-                                    f"💰 <b>Take Profit Atingido! ({trade.symbol})</b>\n"
-                                    f"Parte da posição foi realizada.\n"
-                                    f"Novo Stop Loss: <b>{new_stop_loss:,.4f}</b>."
-                                ),
-                                parse_mode='HTML'
-                            )
-                        else:
-                            logger.error(
-                                f"-> Falha ao mover Stop Loss para {user.telegram_id}: {sl_result.get('error')}"
-                            )
-                            await application.bot.send_message(
-                                chat_id=user.telegram_id,
-                                text=f"⚠️ Falha ao mover seu Stop Loss para {trade.symbol}.",
-                                parse_mode='HTML'
-                            )
-                else:
-                    # Só notifica se NÃO for skip
-                    err = close_result.get('error')
-                    logger.error(f"-> Falha ao fechar posição parcial para {user.telegram_id}: {err}")
-                    await application.bot.send_message(
-                        chat_id=user.telegram_id,
-                        text=f"⚠️ Falha ao realizar seu lucro parcial para {trade.symbol}.",
-                        parse_mode='HTML'
-                    )
+                        trade.status = 'ACTIVE_TP_HIT'
+                        message_text = (
+                            f"💰 <b>Take Profit Atingido! (LUCRO)</b>\n"
+                            f"<b>Moeda:</b> {trade.symbol}\n"
+                            f"<b>Lucro Parcial:</b> ${profit:,.2f}\n"
+                            f"<b>Alvos Restantes:</b> {len(remaining_targets)}"
+                        )
+                    
+                    await application.bot.send_message(chat_id=user.telegram_id, text=message_text, parse_mode='HTML')
+                    reached_tp = True
 
         # --- STOP LOSS ---
         if not reached_tp:
@@ -598,14 +583,20 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                 (trade.side == 'SHORT' and current_price >= trade.current_stop_loss)
             )
             if stop_hit:
-                logger.info(f"STOP LOSS ATINGIDO para {trade.symbol} do usuário {user.telegram_id}.")
+                # --- NOVA LÓGICA DE NOTIFICAÇÃO DE PREJUÍZO ---
+                loss = (trade.current_stop_loss - trade.entry_price) * live_position_size if trade.side == 'LONG' else (trade.entry_price - trade.current_stop_loss) * live_position_size
+                
                 trade.status = 'CLOSED_LOSS'
                 trade.remaining_qty = 0.0
-                await application.bot.send_message(
-                    chat_id=user.telegram_id,
-                    text=f"🛑 <b>Stop Loss Atingido</b>\n<b>Moeda:</b> {trade.symbol}",
-                    parse_mode='HTML'
+
+                message_text = (
+                    f"🛑 <b>Stop Loss Atingido (PREJUÍZO)</b>\n"
+                    f"<b>Moeda:</b> {trade.symbol}\n"
+                    f"<b>Prejuízo Realizado:</b> ${loss:,.2f}\n\n"
+                    f"A posição foi completamente fechada."
                 )
+                await application.bot.send_message(chat_id=user.telegram_id, text=message_text, parse_mode='HTML')
+
 
 
 async def run_tracker(application: Application):
@@ -655,6 +646,7 @@ from utils.security import decrypt_data
 from utils.config import ADMIN_ID
 from bot.keyboards import signal_approval_keyboard
 from services.signal_parser import SignalType
+from core.whitelist_service import is_coin_in_whitelist
 
 logger = logging.getLogger(__name__)
 
@@ -676,12 +668,8 @@ async def _execute_trade(signal_data: dict, user: User, application: Application
         await application.bot.send_message(chat_id=user.telegram_id, text=f"❌ Falha ao buscar seu saldo Bybit para operar {signal_data['coin']}.")
         return
 
-    balances = account_info.get("data", [])
-    if not balances:
-        await application.bot.send_message(chat_id=user.telegram_id, text=f"❌ Falha: Nenhuma info de saldo recebida da Bybit para operar {signal_data['coin']}.")
-        return
-
-    balance = float(balances[0].get('totalEquity', 0))
+    balance_data = account_info.get("data", {})
+    balance = float(balance_data.get('available_balance', 0))
     result = await place_order(api_key, api_secret, signal_data, user, balance)
     
     if result.get("success"):
@@ -715,6 +703,11 @@ async def execute_signal_for_all_users(signal_data: dict, application: Applicati
     logger.info(f"Sinal ({signal_type}) aprovado. Replicando para {len(all_users_to_trade)} usuário(s)...")
 
     for user in all_users_to_trade:
+        if not is_coin_in_whitelist(symbol, user.coin_whitelist):
+            logger.info(f"Sinal para {symbol} ignorado para o usuário {user.telegram_id} devido à sua whitelist ('{user.coin_whitelist}').")
+            # Opcional: notificar o usuário que o sinal foi ignorado
+            # await application.bot.send_message(chat_id=user.telegram_id, text=f"ℹ️ Sinal para {symbol} ignorado devido à sua whitelist.")
+            continue # Pula para o próximo usuário
         if signal_type == SignalType.MARKET:
             await _execute_trade(signal_data, user, application, db, source_name)
         elif signal_type == SignalType.LIMIT:
@@ -764,7 +757,8 @@ async def execute_signal_for_all_users(signal_data: dict, application: Applicati
                 )
                 continue
 
-            balance = float((account_info.get("data") or [{}])[0].get('totalEquity', 0))
+            balance_data = account_info.get("data", {})
+            balance = float(balance_data.get('available_balance', 0))
 
             # >>> IMPORTANTE: agora enviamos signal_data_with_price <<<
             limit_order_result = await place_limit_order(user_api_key, user_api_secret, signal_data_with_price, user, balance)
@@ -868,6 +862,70 @@ async def process_new_signal(signal_data: dict, application: Application, source
             
     finally:
         db.close()
+
+========================================
+# Arquivo: core/whitelist_service.py
+========================================
+
+import logging
+from typing import Set
+
+logger = logging.getLogger(__name__)
+
+# --- CATEGORIAS DE MOEDAS ---
+# Estas listas podem ser expandidas no futuro. Usamos Sets para performance.
+
+# Moedas de grande capitalização e projetos estabelecidos (excluindo BTC e ETH)
+ALTCOINS_L1_L2: Set[str] = {
+    'SOLUSDT', 'XRPUSDT', 'ADAUSDT', 'AVAXUSDT', 'DOTUSDT', 'MATICUSDT',
+    'LINKUSDT', 'TRXUSDT', 'ATOMUSDT', 'NEARUSDT', 'APTUSDT', 'OPUSDT',
+    'ARBUSDT', 'LDOUSDT', 'SUIUSDT'
+}
+
+# Moedas relacionadas a Finanças Descentralizadas
+DEFI: Set[str] = {
+    'UNIUSDT', 'AAVEUSDT', 'MKRUSDT', 'SNXUSDT', 'COMPUSDT', 'CRVUSDT',
+    'SUSHIUSDT', 'YFIUSDT'
+}
+
+# Moedas de "memes" com alta volatilidade
+MEMECOINS: Set[str] = {
+    'DOGEUSDT', 'SHIBUSDT', 'PEPEUSDT', 'WIFUSDT', 'FLOKIUSDT', 'BONKUSDT'
+}
+
+# Dicionário que mapeia a palavra-chave da categoria para o Set de moedas
+CATEGORIES = {
+    'altcoins': ALTCOINS_L1_L2,
+    'defi': DEFI,
+    'memecoins': MEMECOINS,
+}
+
+def is_coin_in_whitelist(symbol: str, user_whitelist_str: str) -> bool:
+    """
+    Verifica se um símbolo de moeda está na whitelist de um usuário.
+
+    A whitelist pode conter:
+    - O keyword 'todas'.
+    - Símbolos específicos (ex: 'btcusdt').
+    - Keywords de categorias (ex: 'memecoins').
+    """
+    if not user_whitelist_str or 'todas' in user_whitelist_str.lower():
+        return True
+
+    # Normaliza a entrada do usuário: minúsculas, remove espaços, divide por vírgula
+    user_list = {item.strip() for item in user_whitelist_str.lower().split(',')}
+    
+    # 1. Verifica se o símbolo exato está na lista do usuário
+    if symbol.lower() in user_list:
+        return True
+
+    # 2. Verifica se alguma das categorias da lista do usuário contém o símbolo
+    for category_keyword in user_list:
+        if category_keyword in CATEGORIES and symbol in CATEGORIES[category_keyword]:
+            return True
+            
+    # Se nenhuma das condições acima for atendida, a moeda não está na whitelist
+    return False
 
 ========================================
 # Arquivo: tests/__init__.py
@@ -1718,7 +1776,13 @@ from .keyboards import (
     dashboard_menu_keyboard, settings_menu_keyboard, view_targets_keyboard, 
     bot_config_keyboard, performance_menu_keyboard)
 from utils.security import encrypt_data, decrypt_data
-from services.bybit_service import get_open_positions, get_account_info, close_partial_position, get_open_positions_with_pnl
+from services.bybit_service import (
+    get_open_positions, 
+    get_account_info, 
+    close_partial_position, 
+    get_open_positions_with_pnl,
+    get_market_price
+)
 from utils.config import ADMIN_ID
 from database.crud import get_user_by_id
 from core.trade_manager import _execute_trade
@@ -1730,6 +1794,7 @@ from core.trade_manager import execute_signal_for_all_users
 (WAITING_CODE, WAITING_API_KEY, WAITING_API_SECRET, CONFIRM_REMOVE_API) = range(4)
 (ASKING_ENTRY_PERCENT, ASKING_MAX_LEVERAGE, ASKING_MIN_CONFIDENCE) = range(10, 13)
 (ASKING_PROFIT_TARGET, ASKING_LOSS_LIMIT) = range(13, 15)
+ASKING_COIN_WHITELIST = 15
 
 logger = logging.getLogger(__name__)
 
@@ -1999,9 +2064,8 @@ async def my_positions_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         db.close()
 
 async def user_dashboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Exibe o painel com saldo focado em USDT, outras moedas relevantes e posições (com P/L ao vivo)."""
+    """Exibe o painel com saldo focado em USDT, outras moedas e posições."""
     query = update.callback_query
-
     try:
         await query.answer()
     except BadRequest as e:
@@ -2009,22 +2073,12 @@ async def user_dashboard_handler(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     await query.edit_message_text("Buscando informações do painel...")
-
     user_id = update.effective_user.id
     db = SessionLocal()
-
     try:
-        # use seu helper se existir; senão, pegue direto do DB:
-        try:
-            user = get_user_by_id(user_id)  # seu helper
-        except NameError:
-            user = db.query(User).filter_by(telegram_id=user_id).first()
-
+        user = get_user_by_id(user_id)
         if not user or not user.api_key_encrypted:
-            await query.edit_message_text(
-                "Você precisa configurar sua API primeiro.",
-                reply_markup=main_menu_keyboard(telegram_id=user_id)
-            )
+            await query.edit_message_text("Você precisa configurar sua API primeiro.", reply_markup=main_menu_keyboard(telegram_id=user_id))
             return
 
         api_key = decrypt_data(user.api_key_encrypted)
@@ -2032,46 +2086,40 @@ async def user_dashboard_handler(update: Update, context: ContextTypes.DEFAULT_T
 
         account_info, positions_info = await asyncio.gather(
             get_account_info(api_key, api_secret),
-            get_open_positions_with_pnl(api_key, api_secret)  # << P/L em tempo real
+            get_open_positions_with_pnl(api_key, api_secret)
         )
 
         message = "<b>ℹ️ Seu Painel de Controle</b>\n\n"
-
-        # --- Saldos ---
         message += "<b>Saldos na Carteira:</b>\n"
+
         if account_info.get("success"):
-            balances = account_info.get("data", [])
-            if balances and isinstance(balances, list):
-                coin_list = balances[0].get("coin", []) or []
-                usdt_balance_value = 0.0
-                other_coins_lines = []
+            balance_data = account_info.get("data", {})
+            coin_list = balance_data.get("coin_list", [])
+            
+            usdt_balance_value = 0.0
+            other_coins_lines = []
 
-                for c in coin_list:
-                    coin = (c.get("coin") or "").upper()
-                    wallet_balance = float(c.get("walletBalance") or 0)
-                    if coin == "USDT":
-                        usdt_balance_value = wallet_balance
-                    elif wallet_balance >= 0.1:
-                        other_coins_lines.append(f"- {coin}: {wallet_balance:.2f}")
+            for c in coin_list:
+                coin = (c.get("coin") or "").upper()
+                wallet_balance_str = c.get("walletBalance")
+                wallet_balance = float(wallet_balance_str) if wallet_balance_str else 0.0
 
-                message += f"<b>- USDT: {usdt_balance_value:.2f}</b>\n"
-                if other_coins_lines:
-                    message += "\n".join(other_coins_lines)
-                if not other_coins_lines and usdt_balance_value == 0.0:
-                    message += "Nenhum saldo relevante encontrado.\n"
-            else:
-                message += "Nenhuma moeda encontrada na carteira.\n"
+                if coin == "USDT":
+                    usdt_balance_value = wallet_balance
+                elif wallet_balance >= 0.1:
+                    other_coins_lines.append(f"- {coin}: {wallet_balance:.2f}")
+
+            message += f"<b>- USDT: {usdt_balance_value:.2f}</b>\n"
+            if other_coins_lines:
+                message += "\n".join(other_coins_lines)
+            elif usdt_balance_value == 0.0:
+                 message += "Nenhum saldo relevante encontrado.\n"
         else:
             message += f"Erro ao buscar saldo: {account_info.get('error')}\n"
 
-        message += "\n\n"
-
-        # --- Posições (com P/L ao vivo) ---
-        message += "<b>Posições Abertas:</b>\n"
+        message += "\n\n<b>Posições Abertas:</b>\n"
         if positions_info.get("success") and positions_info.get("data"):
             for p in positions_info["data"]:
-                # p vem de get_open_positions_with_pnl:
-                # {symbol, side ('LONG'/'SHORT'), size, entry_price, mark_price, unrealized_pnl, unrealized_pnl_pct}
                 side = (p.get("side") or "").upper()
                 arrow = "🔼" if side == "LONG" else "🔽"
                 symbol = p.get("symbol", "???")
@@ -2091,17 +2139,14 @@ async def user_dashboard_handler(update: Update, context: ContextTypes.DEFAULT_T
 
         message += "\n\n<i>⚠️ Este bot opera exclusivamente com pares USDT.</i>"
 
-        await query.edit_message_text(
-            message,
-            parse_mode="HTML",
-            reply_markup=dashboard_menu_keyboard()
-        )
+        await query.edit_message_text(message, parse_mode="HTML", reply_markup=dashboard_menu_keyboard())
 
     except Exception as e:
         logger.error(f"Erro ao montar o painel do usuário: {e}", exc_info=True)
         await query.edit_message_text("Ocorreu um erro ao buscar os dados do seu painel.")
     finally:
         db.close()
+
 
 # --- CANCELAMENTO ---
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -2481,7 +2526,17 @@ async def manual_close_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         api_key = decrypt_data(user.api_key_encrypted)
         api_secret = decrypt_data(user.api_secret_encrypted)
 
-        close_result = close_partial_position(
+        # --- NOVA LÓGICA ---
+        # 1. Pega o preço atual para calcular o P/L
+        price_result = await get_market_price(trade_to_close.symbol)
+        if not price_result.get("success"):
+            await context.bot.send_message(chat_id=user_id, text=f"⚠️ Não foi possível obter o preço atual de {trade_to_close.symbol} para calcular o P/L.")
+            current_price = trade_to_close.entry_price # Fallback
+        else:
+            current_price = price_result["price"]
+
+        # 2. Fecha a posição
+        close_result = await close_partial_position(
             api_key, 
             api_secret, 
             trade_to_close.symbol, 
@@ -2490,9 +2545,23 @@ async def manual_close_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         )
 
         if close_result.get("success"):
+            # 3. Calcula o P/L e formata a mensagem
+            pnl = (current_price - trade_to_close.entry_price) * trade_to_close.remaining_qty if trade_to_close.side == 'LONG' else (trade_to_close.entry_price - current_price) * trade_to_close.remaining_qty
+            
+            resultado_str = "LUCRO" if pnl >= 0 else "PREJUÍZO"
+            emoji = "✅" if pnl >= 0 else "🔻"
+            
+            message_text = (
+                f"{emoji} <b>Posição Fechada Manualmente ({resultado_str})</b>\n"
+                f"<b>Moeda:</b> {trade_to_close.symbol}\n"
+                f"<b>Resultado:</b> ${pnl:,.2f}"
+            )
+            
             trade_to_close.status = 'CLOSED_MANUAL'
             db.commit()
-            await query.edit_message_text(f"✅ Posição para {trade_to_close.symbol} fechada manualmente com sucesso!")
+            await query.edit_message_text(message_text, parse_mode='HTML')
+            # Atualiza a lista de posições após um pequeno delay
+            await asyncio.sleep(2)
             await my_positions_handler(update, context)
         else:
             error_msg = close_result.get('error')
@@ -2502,6 +2571,7 @@ async def manual_close_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             )
     finally:
         db.close()
+
 
 async def bot_config_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Exibe o menu de configuração do bot com o modo de aprovação atual."""
@@ -2748,6 +2818,71 @@ async def performance_menu_handler(update: Update, context: ContextTypes.DEFAULT
             reply_markup=performance_menu_keyboard()
         )
 
+# --- FLUXO DE CONFIGURAÇÃO DE WHITELIST ---
+
+async def ask_coin_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Pergunta ao usuário sua nova whitelist de moedas."""
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    
+    context.user_data['settings_message_id'] = query.message.message_id
+    
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter_by(telegram_id=user_id).first()
+        current_whitelist = user.coin_whitelist if user else 'todas'
+    finally:
+        db.close()
+
+    instructions = (
+        f"<b>✅ Whitelist de Moedas</b>\n\n"
+        f"Sua configuração atual é: <code>{current_whitelist}</code>\n\n"
+        f"Envie uma lista de moedas e/ou categorias separadas por vírgula.\n\n"
+        f"<b>Exemplos:</b>\n"
+        f"• <code>todas</code> (para operar todos os sinais)\n"
+        f"• <code>btcusdt, ethusdt, solusdt</code>\n"
+        f"• <code>memecoins, btcusdt</code> (opera moedas meme + BTC)\n\n"
+        f"<b>Categorias disponíveis:</b> <code>memecoins</code>, <code>altcoins</code>, <code>defi</code>."
+    )
+    
+    await query.edit_message_text(text=instructions, parse_mode='HTML')
+    return ASKING_COIN_WHITELIST
+
+async def receive_coin_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Recebe, valida e salva a nova whitelist."""
+    user_id = update.effective_user.id
+    message_id_to_edit = context.user_data.get('settings_message_id')
+    
+    # Apaga a mensagem do usuário para manter o chat limpo
+    await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id)
+
+    # Normaliza a entrada: remove espaços extras e converte para minúsculas
+    whitelist_text = update.message.text.lower().strip()
+    
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter_by(telegram_id=user_id).first()
+        if user:
+            user.coin_whitelist = whitelist_text
+            db.commit()
+            
+            feedback_text = (
+                f"✅ Whitelist de moedas atualizada para: <code>{whitelist_text}</code>"
+            )
+
+            await context.bot.edit_message_text(
+                chat_id=update.effective_chat.id,
+                message_id=message_id_to_edit,
+                text=feedback_text,
+                parse_mode='HTML',
+                reply_markup=settings_menu_keyboard(user)
+            )
+    finally:
+        db.close()
+
+    return ConversationHandler.END
+
 ========================================
 # Arquivo: bot/keyboards.py
 ========================================
@@ -2814,19 +2949,20 @@ def settings_menu_keyboard(user_settings):
     """
     Retorna o teclado do menu de configurações, mostrando os valores atuais.
     """
-    # Pega os valores do objeto do usuário
-    entry_percent = user_settings.entry_size_percent # Campo atualizado
+    entry_percent = user_settings.entry_size_percent
     max_leverage = user_settings.max_leverage
     min_confidence = user_settings.min_confidence
 
     keyboard = [
-        # --- BOTÃO ATUALIZADO ---
         [InlineKeyboardButton(f"Tamanho da Entrada: {entry_percent:.2f}%", callback_data='set_entry_percent')],
         [InlineKeyboardButton(f"Alavancagem Máxima: {max_leverage}x", callback_data='set_max_leverage')],
         [InlineKeyboardButton(f"Confiança Mínima (IA): {min_confidence:.2f}%", callback_data='set_min_confidence')],
+        # --- ADICIONE O NOVO BOTÃO AQUI ---
+        [InlineKeyboardButton("✅ Whitelist de Moedas", callback_data='set_coin_whitelist')],
         [InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data='back_to_main_menu')]
     ]
     return InlineKeyboardMarkup(keyboard)
+
 
 def bot_config_keyboard(user_settings):
     """
@@ -2887,6 +3023,139 @@ def performance_menu_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 ========================================
+# Arquivo: alembic/env.py
+========================================
+
+import os
+import sys
+from logging.config import fileConfig
+
+from sqlalchemy import engine_from_config
+from sqlalchemy import pool
+
+from alembic import context
+
+# Adiciona a raiz do projeto ao path para que possamos importar 'database.models'
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+from database.models import Base
+
+# this is the Alembic Config object, which provides
+# access to the values within the .ini file in use.
+config = context.config
+
+# Interpret the config file for Python logging.
+# This line sets up loggers basically.
+if config.config_file_name is not None:
+    fileConfig(config.config_file_name)
+
+# add your model's MetaData object here
+# for 'autogenerate' support
+# from myapp import mymodel
+# target_metadata = mymodel.Base.metadata
+target_metadata = Base.metadata
+
+# other values from the config, defined by the needs of env.py,
+# can be acquired:
+# my_important_option = config.get_main_option("my_important_option")
+# ... etc.
+
+
+def run_migrations_offline() -> None:
+    """Run migrations in 'offline' mode.
+
+    This configures the context with just a URL
+    and not an Engine, though an Engine is acceptable
+    here as well.  By skipping the Engine creation
+    we don't even need a DBAPI to be available.
+
+    Calls to context.execute() here emit the given string to the
+    script output.
+
+    """
+    url = config.get_main_option("sqlalchemy.url")
+    context.configure(
+        url=url,
+        target_metadata=target_metadata,
+        literal_binds=True,
+        dialect_opts={"paramstyle": "named"},
+    )
+
+    with context.begin_transaction():
+        context.run_migrations()
+
+
+def run_migrations_online() -> None:
+    """Run migrations in 'online' mode.
+
+    In this scenario we need to create an Engine
+    and associate a connection with the context.
+
+    """
+    # --- INÍCIO DA MODIFICAÇÃO ---
+    # Pega a configuração do alembic.ini
+    configuration = config.get_section(config.config_ini_section, {})
+    # Tenta pegar a URL de uma variável de ambiente, se não existir, usa a do .ini
+    url = os.getenv('DATABASE_URL', configuration['sqlalchemy.url'])
+    configuration['sqlalchemy.url'] = url
+    
+    connectable = engine_from_config(
+        configuration, # Usa a configuração modificada
+        prefix="sqlalchemy.",
+        poolclass=pool.NullPool,
+    )
+
+    with connectable.connect() as connection:
+        context.configure(
+            connection=connection, target_metadata=target_metadata
+        )
+
+        with context.begin_transaction():
+            context.run_migrations()
+
+
+if context.is_offline_mode():
+    run_migrations_offline()
+else:
+    run_migrations_online()
+
+
+========================================
+# Arquivo: alembic/versions/09d80b6e64de_add_coin_whitelist_to_users.py
+========================================
+
+# Arquivo: alembic/versions/09d80b6e64de_add_coin_whitelist_to_users.py
+
+"""add_coin_whitelist_to_users
+
+Revision ID: 09d80b6e64de
+Revises: 
+Create Date: 2025-08-22 12:03:06.123456
+
+"""
+from alembic import op
+import sqlalchemy as sa
+
+
+# revision identifiers, used by Alembic.
+revision = '09d80b6e64de'
+down_revision = None
+branch_labels = None
+depends_on = None
+
+
+def upgrade() -> None:
+    # ### commands auto generated by Alembic - please adjust! ###
+    op.add_column('users', sa.Column('coin_whitelist', sa.String(), server_default='todas', nullable=False))
+    # ### end Alembic commands ###
+
+
+def downgrade() -> None:
+    # ### commands auto generated by Alembic - please adjust! ###
+    op.drop_column('users', 'coin_whitelist')
+    # ### end Alembic commands ###
+
+========================================
 # Arquivo: services/__init__.py
 ========================================
 
@@ -2898,14 +3167,15 @@ def performance_menu_keyboard():
 
 import logging
 import asyncio
-from typing import Dict
-from datetime import datetime, time
+from typing import Dict, Any
+from datetime import datetime, time, timedelta
 from pybit.unified_trading import HTTP
 from pybit.exceptions import InvalidRequestError
 from database.models import User
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 
 logger = logging.getLogger(__name__)
+INSTRUMENT_INFO_CACHE: Dict[str, Any] = {}
 
 def _round_down_to_step(value: Decimal, step: Decimal) -> Decimal:
     # arredonda para baixo no múltiplo do step
@@ -2918,24 +3188,46 @@ def _round_down_to_tick(price: Decimal, tick: Decimal) -> Decimal:
         return price
     return (price // tick) * tick
 
-def _get_symbol_filters(session: HTTP, symbol: str):
+async def get_instrument_info(symbol: str) -> Dict[str, Any]:
     """
-    Busca os filtros de preço/quantidade do símbolo (tickSize, qtyStep, minOrderQty).
-    Retorna (tick: Decimal, step: Decimal, min_qty: Decimal)
+    Busca as regras de um instrumento (símbolo) da Bybit, usando um cache em memória.
+    Retorna um dicionário com as regras ou um erro.
     """
-    resp = session.get_instruments_info(category="linear", symbol=symbol)
-    if resp.get("retCode") != 0:
-        raise RuntimeError(f"Falha ao obter instruments_info: {resp.get('retMsg')}")
-    lst = ((resp.get("result") or {}).get("list") or [])
-    if not lst:
-        raise RuntimeError("instruments_info vazio para símbolo")
-    info = lst[0]
-    price_filter = (info.get("priceFilter") or {})
-    lot_filter = (info.get("lotSizeFilter") or {})
-    tick = Decimal(str(price_filter.get("tickSize", "0.0001")))
-    step = Decimal(str(lot_filter.get("qtyStep", "0.001")))
-    min_qty = Decimal(str(lot_filter.get("minOrderQty", "0")))
-    return tick, step, min_qty
+    if symbol in INSTRUMENT_INFO_CACHE:
+        return INSTRUMENT_INFO_CACHE[symbol]
+
+    def _sync_call():
+        try:
+            session = HTTP(testnet=False)
+            response = session.get_instruments_info(category="linear", symbol=symbol)
+            
+            if response.get("retCode") != 0:
+                return {"success": False, "error": response.get("retMsg")}
+            
+            instrument_list = response.get("result", {}).get("list", [])
+            if not instrument_list:
+                return {"success": False, "error": f"Símbolo {symbol} não encontrado na Bybit."}
+
+            info = instrument_list[0]
+            lot_size_filter = info.get("lotSizeFilter", {})
+            price_filter = info.get("priceFilter", {})
+
+            rules = {
+                "success": True,
+                "status": info.get("status"),
+                "qtyStep": Decimal(lot_size_filter.get("qtyStep", "0")),
+                "minOrderQty": Decimal(lot_size_filter.get("minOrderQty", "0")),
+                "minNotionalValue": Decimal(lot_size_filter.get("minOrderIv", "0")),
+                "tickSize": Decimal(price_filter.get("tickSize", "0")),
+            }
+            INSTRUMENT_INFO_CACHE[symbol] = rules
+            return rules
+        except Exception as e:
+            logger.error(f"Exceção em get_instrument_info para {symbol}: {e}", exc_info=True)
+            return {"success": False, "error": str(e)}
+
+    return await asyncio.to_thread(_sync_call)
+
 
 # Função auxiliar síncrona, não precisa de 'async'
 def get_session(api_key: str, api_secret: str) -> HTTP:
@@ -2947,103 +3239,113 @@ def get_session(api_key: str, api_secret: str) -> HTTP:
     )
 
 async def get_account_info(api_key: str, api_secret: str) -> dict:
-    """Busca informações da conta de forma assíncrona."""
+    """Busca o saldo da conta, retornando dados detalhados incluindo a lista de moedas."""
     def _sync_call():
         try:
             session = get_session(api_key, api_secret)
             response = session.get_wallet_balance(accountType="UNIFIED")
+
             if response.get('retCode') == 0:
-                return {"success": True, "data": response['result']['list']}
-            return {"success": False, "data": [], "error": response.get('retMsg', 'Erro desconhecido')}
+                account_data_list = response['result'].get('list', [])
+                if not account_data_list:
+                    return {"success": False, "data": {}, "error": "Lista de contas vazia na resposta da API."}
+                
+                account_data = account_data_list[0]
+                
+                equity_str = account_data.get('totalEquity')
+                total_equity = float(equity_str) if equity_str else 0.0
+                coin_list = account_data.get('coin', [])
+
+                available_balance_usdt = 0.0
+                for coin_balance in coin_list:
+                    if coin_balance.get('coin') == 'USDT':
+                        available_str = coin_balance.get('availableToWithdraw')
+                        available_balance_usdt = float(available_str) if available_str else 0.0
+                        break
+                
+                return {
+                    "success": True, 
+                    "data": {
+                        "total_equity": total_equity,
+                        "available_balance_usdt": available_balance_usdt,
+                        "coin_list": coin_list  # <-- Retornando a lista completa
+                    }
+                }
+            return {"success": False, "data": {}, "error": response.get('retMsg', 'Erro desconhecido')}
         except Exception as e:
             logger.error(f"Exceção em get_account_info: {e}", exc_info=True)
-            return {"success": False, "data": [], "error": str(e)}
+            return {"success": False, "data": {}, "error": str(e)}
+
     return await asyncio.to_thread(_sync_call)
 
+
 async def place_order(api_key: str, api_secret: str, signal_data: dict, user_settings: User, balance: float) -> dict:
-    """Abre uma nova posição a mercado (Market) respeitando qtyStep/minOrderQty da Bybit."""
-    def _sync_call():
-        from decimal import Decimal
+    """Abre uma nova posição a mercado (Market) com validação completa."""
+    async def pre_flight_checks():
+        symbol = signal_data['coin']
+        if symbol not in INSTRUMENT_INFO_CACHE:
+            await get_instrument_info(symbol)
+        return INSTRUMENT_INFO_CACHE.get(symbol)
+
+    def _sync_call(instrument_rules: Dict[str, Any]):
         try:
-            session = get_session(api_key, api_secret)
-
             symbol = signal_data['coin']
-            order_type = (signal_data.get('order_type') or '').upper()
-            side = "Buy" if order_type == 'LONG' else "Sell"
-            leverage = str(user_settings.max_leverage)
 
-            # preço de referência do sinal para sizing (não é enviado na ordem Market)
+            if not instrument_rules or not instrument_rules.get("success"):
+                return instrument_rules or {"success": False, "error": f"Regras para {symbol} não encontradas."}
+            if instrument_rules["status"] != "Trading":
+                return {"success": False, "error": f"O símbolo {symbol} não está ativo para negociação ({instrument_rules['status']})."}
+
+            session = get_session(api_key, api_secret)
+            side = "Buy" if (signal_data.get('order_type') or '').upper() == 'LONG' else "Sell"
+            leverage = Decimal(str(user_settings.max_leverage))
             entry_price = Decimal(str(signal_data['entries'][0]))
-            stop_loss_price = signal_data.get('stop_loss')
-            take_profit_price = (signal_data.get('targets') or [None])[0]
+            margin_in_dollars = Decimal(str(balance)) * (Decimal(str(user_settings.entry_size_percent)) / Decimal("100"))
+            notional_value = margin_in_dollars * leverage
+            
+            if entry_price <= 0: return {"success": False, "error": f"Preço de entrada inválido: {entry_price}"}
 
-            # ----- filtros do símbolo (tick/step/minQty) -----
+            qty_raw = notional_value / entry_price
+            qty_adj = _round_down_to_step(qty_raw, instrument_rules["qtyStep"])
+
+            if qty_adj < instrument_rules["minOrderQty"]:
+                return {"success": False, "error": f"Qtd. ajustada ({qty_adj:f}) é menor que a mínima permitida ({instrument_rules['minOrderQty']:f}) para {symbol}."}
+            
+            final_notional_value = qty_adj * entry_price
+            if final_notional_value < instrument_rules["minNotionalValue"]:
+                return {"success": False, "error": f"Valor total da ordem (${final_notional_value:.2f}) é menor que o mínimo permitido de ${instrument_rules['minNotionalValue']:.2f}."}
+
+            # --- LÓGICA CORRIGIDA ---
+            payload = {
+                "category": "linear", "symbol": symbol, "side": side,
+                "orderType": "Market", "qty": str(qty_adj),
+                "takeProfit": str((signal_data.get('targets') or [None])[0]),
+                "stopLoss": str(signal_data.get('stop_loss')),
+            }
+
             try:
-                tick, step, min_qty = _get_symbol_filters(session, symbol)
-            except Exception as e:
-                logger.warning(f"[bybit_service] Falha ao obter filtros para {symbol}, usando defaults. Erro: {e}")
-                tick, step, min_qty = Decimal("0.0001"), Decimal("0.001"), Decimal("0")
-
-            # ----- sizing em dólares -> qty (contratos) -----
-            entry_percent = Decimal(str(user_settings.entry_size_percent))
-            balance_dec = Decimal(str(balance))
-            position_size_dollars = balance_dec * (entry_percent / Decimal("100"))
-
-            if entry_price <= 0:
-                return {"success": False, "error": f"Preço de entrada inválido para sizing: {entry_price}"}
-
-            qty_raw = position_size_dollars / entry_price
-            qty_dec = _round_down_to_step(qty_raw, step)
-
-            if qty_dec <= 0:
-                return {"success": False, "error": f"Quantidade após ajuste ficou zero (raw={qty_raw}, step={step})."}
-
-            if qty_dec < min_qty:
-                # eleva ao mínimo permitido
-                qty_dec = min_qty
-
-            logger.info(
-                f"Calculando ORDEM A MERCADO para {symbol}: "
-                f"Side={side}, Qty={qty_dec} (step={step}, minQty={min_qty}), "
-                f"posSize=${position_size_dollars}, refPrice={entry_price}"
-            )
-
-            # ----- alavancagem -----
-            try:
-                session.set_leverage(category="linear", symbol=symbol, buyLeverage=leverage, sellLeverage=leverage)
+                session.set_leverage(category="linear", symbol=symbol, buyLeverage=str(leverage), sellLeverage=str(leverage))
             except InvalidRequestError as e:
                 if "leverage not modified" in str(e).lower():
                     logger.warning(f"Alavancagem para {symbol} já está correta. Continuando...")
                 else:
-                    raise
+                    return {"success": False, "error": str(e)} # Retorna outros erros de alavancagem
 
-            # ----- envio da Market -----
-            payload = {
-                "category": "linear",
-                "symbol": symbol,
-                "side": side,
-                "orderType": "Market",
-                "qty": str(qty_dec),
-                "isLeverage": 1,
-            }
-            if take_profit_price is not None:
-                payload["takeProfit"] = str(take_profit_price)
-            if stop_loss_price is not None:
-                payload["stopLoss"] = str(stop_loss_price)
-
-            logger.info(f"[bybit_service] Enviando MARKET {payload}")
-            response = session.place_order(**payload)
-
+            response = session.place_order(**{k: v for k, v in payload.items() if v is not None})
             if response.get('retCode') == 0:
                 return {"success": True, "data": response['result']}
-            else:
-                return {"success": False, "error": response.get('retMsg')}
-
+            return {"success": False, "error": response.get('retMsg')}
+        
         except Exception as e:
             logger.error(f"Exceção ao abrir ordem (Market): {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
-    return await asyncio.to_thread(_sync_call)
+    try:
+        rules = await pre_flight_checks()
+        return await asyncio.to_thread(_sync_call, rules)
+    except Exception as e:
+        logger.error(f"Exceção em place_order (async): {e}", exc_info=True)
+        return {"success": False, "error": str(e)}
 
 
 async def get_market_price(symbol: str) -> dict:
@@ -3063,34 +3365,34 @@ async def get_market_price(symbol: str) -> dict:
     return await asyncio.to_thread(_sync_call)
 
 async def close_partial_position(api_key: str, api_secret: str, symbol: str, qty_to_close: float, side: str) -> dict:
-    """Fecha parte de uma posição com Market/ReduceOnly, respeitando qtyStep/minQty.
-       Se qty <= 0 após ajuste, ignora silenciosamente (não trata como erro)."""
-    def _sync_call():
-        from decimal import Decimal
+    """Fecha parte de uma posição com Market/ReduceOnly, usando o novo sistema de regras."""
+    async def pre_flight_checks():
+        if symbol not in INSTRUMENT_INFO_CACHE:
+            await get_instrument_info(symbol)
+        return INSTRUMENT_INFO_CACHE.get(symbol)
+
+    def _sync_call(instrument_rules: Dict[str, Any]):
         try:
+            # 1. VALIDAÇÃO DAS REGRAS
+            if not instrument_rules or not instrument_rules.get("success"):
+                return instrument_rules or {"success": False, "error": f"Regras para {symbol} não encontradas."}
+
             session = get_session(api_key, api_secret)
             close_side = "Sell" if side == 'LONG' else "Buy"
 
-            # filtros do símbolo
-            try:
-                _, step, min_qty = _get_symbol_filters(session, symbol)
-            except Exception as e:
-                logger.warning(f"[bybit_service] (close_partial) Falha ao obter filtros de {symbol}, usando defaults. Erro: {e}")
-                step, min_qty = Decimal("0.001"), Decimal("0")
-
+            # 2. CÁLCULO DE QUANTIDADE
             qty_raw = Decimal(str(qty_to_close))
-            qty_adj = _round_down_to_step(qty_raw, step)
+            qty_adj = _round_down_to_step(qty_raw, instrument_rules["qtyStep"])
 
-            logger.info(f"[bybit_service] close_partial {symbol}: raw={qty_raw}, step={step}, minQty={min_qty} => adj={qty_adj}")
+            logger.info(f"[bybit_service] close_partial {symbol}: raw={qty_raw}, step={instrument_rules['qtyStep']}, minQty={instrument_rules['minOrderQty']} => adj={qty_adj}")
 
-            # nada a fechar? trate como sucesso silencioso
-            if qty_adj <= 0:
-                return {"success": True, "skipped": True, "reason": "qty_after_step_is_zero"}
+            if qty_adj < instrument_rules["minOrderQty"]:
+                # Se a quantidade a ser fechada for menor que o mínimo, ignoramos a operação
+                # Isso não é um erro, apenas não há o que fazer.
+                logger.warning(f"Quantidade a fechar para {symbol} ({qty_adj:f}) é menor que o mínimo permitido. Ignorando fechamento parcial.")
+                return {"success": True, "skipped": True, "reason": "qty_less_than_min_order_qty"}
 
-            # se ainda ficou abaixo do mínimo, eleva para minQty (caso haja posição suficiente)
-            if qty_adj < min_qty:
-                qty_adj = min_qty
-
+            # 3. EXECUÇÃO
             response = session.place_order(
                 category="linear", symbol=symbol, side=close_side,
                 orderType="Market", qty=str(qty_adj), reduceOnly=True
@@ -3103,7 +3405,13 @@ async def close_partial_position(api_key: str, api_secret: str, symbol: str, qty
         except Exception as e:
             logger.error(f"Exceção ao fechar posição parcial: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
-    return await asyncio.to_thread(_sync_call)
+
+    try:
+        rules = await pre_flight_checks()
+        return await asyncio.to_thread(_sync_call, rules)
+    except Exception as e:
+        logger.error(f"Exceção em close_partial_position (async): {e}", exc_info=True)
+        return {"success": False, "error": str(e)}
 
 
 async def modify_position_stop_loss(api_key: str, api_secret: str, symbol: str, new_stop_loss: float) -> dict:
@@ -3167,104 +3475,73 @@ async def get_daily_pnl(api_key: str, api_secret: str) -> dict:
 
 # --- FUNÇÃO PARA ENVIAR ORDEM LIMITE ---
 async def place_limit_order(api_key: str, api_secret: str, signal_data: dict, user_settings: User, balance: float) -> dict:
-    """Envia uma nova ordem limite para a Bybit (respeita limit_price + aplica tick/step)."""
-    def _sync_call():
+    """Envia uma nova ordem limite para a Bybit com validação completa."""
+    async def pre_flight_checks():
+        symbol = signal_data['coin']
+        if symbol not in INSTRUMENT_INFO_CACHE:
+            await get_instrument_info(symbol)
+        return INSTRUMENT_INFO_CACHE.get(symbol)
+
+    def _sync_call(instrument_rules: Dict[str, Any]):
         try:
-            session = get_session(api_key, api_secret)
             symbol = signal_data['coin']
-            order_type = (signal_data.get('order_type') or '').upper()
-            side = "Buy" if order_type == 'LONG' else "Sell"
-            leverage = str(user_settings.max_leverage)
+            
+            if not instrument_rules or not instrument_rules.get("success"):
+                return instrument_rules or {"success": False, "error": f"Regras para {symbol} não encontradas."}
+            if instrument_rules["status"] != "Trading":
+                return {"success": False, "error": f"O símbolo {symbol} não está ativo para negociação ({instrument_rules['status']})."}
 
-            # ---------- (A) DEFINIÇÃO DO PREÇO LIMIT ----------
-            # 1) Usa limit_price vindo do trade_manager se presente:
-            price = signal_data.get('limit_price')
-            # 2) Senão, decide aqui com base na faixa de entries:
-            if price is None:
-                entries = (signal_data.get('entries') or [])[:2]
-                if len(entries) == 0:
-                    return {"success": False, "error": "Sem preços de entrada válidos para LIMIT"}
-                elif len(entries) == 1:
-                    price = float(entries[0])
-                else:
-                    lo = float(min(entries[0], entries[1]))
-                    hi = float(max(entries[0], entries[1]))
-                    price = lo if order_type == "LONG" else hi
+            session = get_session(api_key, api_secret)
+            side = "Buy" if (signal_data.get('order_type') or '').upper() == 'LONG' else "Sell"
+            leverage = Decimal(str(user_settings.max_leverage))
+            price = Decimal(str(signal_data.get('limit_price')))
+            price_adj = (price // instrument_rules["tickSize"]) * instrument_rules["tickSize"]
+            margin_in_dollars = Decimal(str(balance)) * (Decimal(str(user_settings.entry_size_percent)) / Decimal("100"))
+            notional_value = margin_in_dollars * leverage
 
-            # TP/SL (opcionais)
-            stop_loss_price = signal_data.get('stop_loss')
-            take_profit_price = (signal_data.get('targets') or [None])[0]
+            if price_adj <= 0: return {"success": False, "error": f"Preço de entrada inválido após ajuste: {price_adj}"}
+            
+            qty_raw = notional_value / price_adj
+            qty_adj = _round_down_to_step(qty_raw, instrument_rules["qtyStep"])
+            
+            if qty_adj < instrument_rules["minOrderQty"]:
+                return {"success": False, "error": f"Qtd. ajustada ({qty_adj:f}) é menor que a mínima permitida ({instrument_rules['minOrderQty']:f}) para {symbol}."}
+            final_notional_value = qty_adj * price_adj
+            if final_notional_value < instrument_rules["minNotionalValue"]:
+                return {"success": False, "error": f"Valor total da ordem (${final_notional_value:.2f}) é menor que o mínimo permitido de ${instrument_rules['minNotionalValue']:.2f}."}
 
-            # ---------- (B) BUSCA DE FILTROS (tick/step) E AJUSTES ----------
-            try:
-                tick, step, min_qty = _get_symbol_filters(session, symbol)
-            except Exception as e:
-                logger.warning(f"[bybit_service] Falha ao obter filtros do símbolo, usando defaults. Erro: {e}")
-                # Defaults conservadores para não travar (ajuste se preferir forçar erro)
-                tick, step, min_qty = Decimal("0.0001"), Decimal("0.001"), Decimal("0")
-
-            # Ajuste do preço ao tick
-            price_dec = _round_down_to_tick(Decimal(str(price)), tick)
-
-            # ---------- Cálculo de quantidade (usa preço já ajustado) ----------
-            entry_percent = user_settings.entry_size_percent
-            position_size_dollars = Decimal(str(balance)) * (Decimal(str(entry_percent)) / Decimal("100"))
-            if price_dec <= 0:
-                return {"success": False, "error": f"Preço inválido após ajuste: {price_dec}"}
-
-            qty_raw = position_size_dollars / price_dec
-            qty_dec = _round_down_to_step(qty_raw, step)
-
-            # Garante minQty e > 0
-            if qty_dec <= 0:
-                return {"success": False, "error": f"Quantidade calculada é zero/negativa (raw={qty_raw}, step={step})."}
-            if qty_dec < min_qty:
-                # tenta elevar ao mínimo permitido
-                qty_dec = min_qty
-
-            # ---------- Logs e alavancagem ----------
-            logger.info(
-                f"Calculando ORDEM LIMITE para {symbol}: "
-                f"Side={side}, Qty={qty_dec}, Price={price_dec} "
-                f"(tick={tick}, step={step}, minQty={min_qty}, posSize=${position_size_dollars})"
-            )
+            # --- LÓGICA CORRIGIDA ---
+            payload = {
+                "category": "linear", "symbol": symbol, "side": side,
+                "orderType": "Limit", "qty": str(qty_adj), "price": str(price_adj),
+                "takeProfit": str((signal_data.get('targets') or [None])[0]),
+                "stopLoss": str(signal_data.get('stop_loss')),
+            }
 
             try:
-                session.set_leverage(category="linear", symbol=symbol, buyLeverage=leverage, sellLeverage=leverage)
+                session.set_leverage(category="linear", symbol=symbol, buyLeverage=str(leverage), sellLeverage=str(leverage))
             except InvalidRequestError as e:
                 if "leverage not modified" in str(e).lower():
                     logger.warning(f"Alavancagem para {symbol} já está correta. Continuando...")
                 else:
-                    raise
+                    return {"success": False, "error": str(e)}
 
-            # ---------- Envio da ordem ----------
-            payload = {
-                "category": "linear",
-                "symbol": symbol,
-                "side": side,
-                "orderType": "Limit",
-                "qty": str(qty_dec),
-                "price": str(price_dec),
-                "isLeverage": 1,
-            }
-            if take_profit_price is not None:
-                payload["takeProfit"] = str(take_profit_price)
-            if stop_loss_price is not None:
-                payload["stopLoss"] = str(stop_loss_price)
-
-            logger.info(f"[bybit_service] Enviando LIMIT {payload}")
-            response = session.place_order(**payload)
-
+            response = session.place_order(**{k: v for k, v in payload.items() if v is not None})
             if response.get('retCode') == 0:
                 return {"success": True, "data": response['result']}
-            else:
-                return {"success": False, "error": response.get('retMsg')}
+            return {"success": False, "error": response.get('retMsg')}
 
         except Exception as e:
-            logger.error(f"Exceção ao enviar ordem limite: {e}", exc_info=True)
+            logger.error(f"Exceção ao abrir ordem (Limit): {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
-    return await asyncio.to_thread(_sync_call)
+    try:
+        rules = await pre_flight_checks()
+        return await asyncio.to_thread(_sync_call, rules)
+    except Exception as e:
+        logger.error(f"Exceção em place_limit_order (async): {e}", exc_info=True)
+        return {"success": False, "error": str(e)}
+
 
 # --- FUNÇÃO PARA VERIFICAR STATUS DE UMA ORDEM ---
 async def get_order_status(api_key: str, api_secret: str, order_id: str, symbol: str) -> dict:
@@ -3325,40 +3602,64 @@ async def cancel_order(api_key: str, api_secret: str, order_id: str, symbol: str
 async def get_closed_pnl_breakdown(api_key: str, api_secret: str, start_time: datetime, end_time: datetime) -> dict:
     """
     Retorna o P/L total e contagem de ganhos/perdas no período informado.
-    Usa o endpoint oficial de closed PnL.
+    Usa o endpoint oficial de closed PnL e pagina os resultados se o período for > 7 dias.
     """
     def _sync_call():
         try:
             session = get_session(api_key, api_secret)
-            resp = session.get_closed_pnl(
-                category="linear",
-                startTime=int(start_time.timestamp() * 1000),
-                endTime=int(end_time.timestamp() * 1000),
-                limit=200,
-            )
-            if resp.get("retCode") != 0:
-                return {"success": False, "error": resp.get("retMsg", "erro")}
-            items = resp.get("result", {}).get("list", []) or []
-            total = 0.0
-            wins = 0
-            losses = 0
-            for it in items:
+
+            total_pnl = 0.0
+            total_wins = 0
+            total_losses = 0
+            all_items = []
+
+            current_start = start_time
+
+            while current_start < end_time:
+                # Calcula o fim da janela atual, limitado a 7 dias ou ao fim do período total
+                current_end = min(current_start + timedelta(days=7), end_time)
+
+                logger.info(f"[bybit_service] Buscando PnL de {current_start.strftime('%Y-%m-%d')} a {current_end.strftime('%Y-%m-%d')}")
+
+                resp = session.get_closed_pnl(
+                    category="linear",
+                    startTime=int(current_start.timestamp() * 1000),
+                    endTime=int(current_end.timestamp() * 1000),
+                    limit=200,
+                )
+
+                if resp.get("retCode") != 0:
+                    error_msg = resp.get("retMsg", f"Erro desconhecido na paginação de PnL (start={current_start})")
+                    logger.error(f"Erro da API Bybit em get_closed_pnl_breakdown: {error_msg}")
+                    # Retorna o erro da primeira falha
+                    return {"success": False, "error": error_msg}
+
+                items = resp.get("result", {}).get("list", []) or []
+                all_items.extend(items)
+
+                # Avança o início da próxima janela
+                current_start += timedelta(days=7)
+
+            # Processa a lista completa de itens coletados
+            for it in all_items:
                 pnl = float(it.get("closedPnl", 0) or 0)
-                total += pnl
+                total_pnl += pnl
                 if pnl > 0:
-                    wins += 1
+                    total_wins += 1
                 elif pnl < 0:
-                    losses += 1
+                    total_losses += 1
+
             return {
                 "success": True,
-                "total_pnl": total,
-                "wins": wins,
-                "losses": losses,
-                "trades": len(items),
+                "total_pnl": total_pnl,
+                "wins": total_wins,
+                "losses": total_losses,
+                "trades": len(all_items),
             }
         except Exception as e:
             logger.error(f"Exceção em get_closed_pnl_breakdown: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
+
     return await asyncio.to_thread(_sync_call)
 
 
@@ -3412,6 +3713,32 @@ async def get_open_positions_with_pnl(api_key: str, api_secret: str) -> dict:
             return {"success": False, "error": str(e)}
     return await asyncio.to_thread(_sync_call)
 
+# Adicione esta nova função em services/bybit_service.py
+# Pode ser adicionada após a função modify_position_stop_loss
+
+async def get_specific_position_size(api_key: str, api_secret: str, symbol: str) -> float:
+    """
+    Busca o tamanho (size) de uma posição específica aberta na Bybit.
+    Retorna 0.0 se a posição não existir.
+    """
+    def _sync_call():
+        try:
+            session = get_session(api_key, api_secret)
+            # Usamos o filtro de símbolo para buscar apenas a posição de interesse
+            response = session.get_positions(category="linear", symbol=symbol)
+            
+            if response.get('retCode') == 0:
+                position_list = response.get('result', {}).get('list', [])
+                if position_list and position_list[0]:
+                    # Retorna o tamanho da primeira (e única) posição na lista
+                    return float(position_list[0].get('size', 0.0))
+            # Se a lista estiver vazia ou houver erro, a posição não existe ou não foi encontrada
+            return 0.0
+        except Exception as e:
+            logger.error(f"Exceção em get_specific_position_size para {symbol}: {e}", exc_info=True)
+            return 0.0 # Em caso de erro, assumimos que não há posição para evitar fechamentos indevidos
+
+    return await asyncio.to_thread(_sync_call)
 
 ========================================
 # Arquivo: services/notification_service.py
