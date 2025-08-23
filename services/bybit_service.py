@@ -539,9 +539,6 @@ async def get_open_positions_with_pnl(api_key: str, api_secret: str) -> dict:
             return {"success": False, "error": str(e)}
     return await asyncio.to_thread(_sync_call)
 
-# Adicione esta nova função em services/bybit_service.py
-# Pode ser adicionada após a função modify_position_stop_loss
-
 async def get_specific_position_size(api_key: str, api_secret: str, symbol: str) -> float:
     """
     Busca o tamanho (size) de uma posição específica aberta na Bybit.
@@ -583,4 +580,21 @@ async def get_order_history(api_key: str, api_secret: str, order_id: str) -> dic
             logger.error(f"Exceção em get_order_history: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
+    return await asyncio.to_thread(_sync_call)
+
+async def modify_position_take_profit(api_key: str, api_secret: str, symbol: str, new_take_profit: float) -> dict:
+    """Modifica o Take Profit de uma posição aberta."""
+    def _sync_call():
+        try:
+            session = get_session(api_key, api_secret)
+            response = session.set_trading_stop(
+                category="linear", symbol=symbol, takeProfit=str(new_take_profit)
+            )
+            if response.get('retCode') == 0:
+                return {"success": True, "data": response['result']}
+            else:
+                return {"success": False, "error": response.get('retMsg')}
+        except Exception as e:
+            logger.error(f"Exceção ao modificar Take Profit: {e}", exc_info=True)
+            return {"success": False, "error": str(e)}
     return await asyncio.to_thread(_sync_call)

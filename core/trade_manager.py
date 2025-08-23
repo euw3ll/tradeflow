@@ -45,47 +45,48 @@ async def _execute_trade(signal_data: dict, user: User, application: Application
     order_result = await place_order(api_key, api_secret, signal_data, user, balance)
     
     if order_result.get("success"):
-        initial_order_data = order_result['data']
-        order_id = initial_order_data['orderId']
+        order_data = order_result['data']
+        order_id = order_data['orderId']
         
-        # --- LÓGICA DE CORREÇÃO ---
-        await asyncio.sleep(2) # Espera 2 segundos para a ordem ser preenchida
-        
+        await asyncio.sleep(2)
         final_order_data_result = await get_order_history(api_key, api_secret, order_id)
-        
         if not final_order_data_result.get("success"):
             await application.bot.send_message(chat_id=user.telegram_id, text=f"⚠️ Ordem {signal_data['coin']} enviada, mas falha ao confirmar detalhes. Verifique na corretora.")
             return
-
         final_order_data = final_order_data_result['data']
-        # --- FIM DA LÓGICA DE CORREÇÃO ---
         
         symbol = signal_data['coin']
         side = signal_data['order_type']
         leverage = user.max_leverage
-        
-        # Usa os dados finais e mais precisos
         qty = float(final_order_data.get('cumExecQty', 0))
         entry_price = float(final_order_data.get('avgPrice', 0))
         
         if qty == 0 or entry_price == 0:
-            await application.bot.send_message(chat_id=user.telegram_id, text=f"⚠️ Ordem {symbol} enviada, mas a execução reportou quantidade/preço zerado. Verifique na corretora.")
+            await application.bot.send_message(chat_id=user.telegram_id, text=f"⚠️ Ordem {symbol} enviada, mas a execução reportou quantidade/preço zerado.")
             return
             
         margin = (qty * entry_price) / leverage if leverage > 0 else 0
         stop_loss = signal_data['stop_loss']
-        take_profit = (signal_data.get('targets') or [None])[0]
+        
+        # --- LÓGICA DE NOTIFICAÇÃO CORRIGIDA ---
+        all_targets = signal_data.get('targets') or []
+        take_profit_1 = all_targets[0] if all_targets else "N/A"
+        num_targets = len(all_targets)
 
         new_trade = Trade(
             user_telegram_id=user.telegram_id, order_id=order_id,
             symbol=symbol, side=side, qty=qty, entry_price=entry_price,
             stop_loss=stop_loss, current_stop_loss=stop_loss,
-            initial_targets=signal_data['targets'], status='ACTIVE',
+            initial_targets=all_targets, status='ACTIVE', # Garante que todos os alvos sejam salvos
             remaining_qty=qty
         )
         db.add(new_trade)
         logger.info(f"Trade {order_id} para o usuário {user.telegram_id} salvo no DB com dados de execução.")
         
+        tp_text = f"${float(take_profit_1):,.4f}" if isinstance(take_profit_1, (int, float)) else take_profit_1
+        if num_targets > 1:
+            tp_text += f" (de {num_targets} alvos)"
+
         message = (
             f"📈 <b>Ordem a Mercado Aberta!</b>\n\n"
             f"  - 📊 <b>Tipo:</b> {side} | <b>Alavancagem:</b> {leverage}x\n"
@@ -94,13 +95,12 @@ async def _execute_trade(signal_data: dict, user: User, application: Application
             f"  - 💵 <b>Preço de Entrada:</b> ${entry_price:,.4f}\n"
             f"  - 💰 <b>Margem:</b> ${margin:,.2f}\n"
             f"  - 🛡️ <b>Stop Loss:</b> ${stop_loss:,.4f}\n"
-            f"  - 🎯 <b>Take Profit 1:</b> ${take_profit:,.4f}"
+            f"  - 🎯 <b>Take Profit 1:</b> {tp_text}"
         )
         await application.bot.send_message(chat_id=user.telegram_id, text=message, parse_mode='HTML')
     else:
         error_msg = order_result.get('error')
         await application.bot.send_message(chat_id=user.telegram_id, text=f"❌ <b>Falha ao Abrir Ordem</b>\n<b>Moeda:</b> {signal_data['coin']}\n<b>Motivo:</b> {error_msg}", parse_mode='HTML')
-
 
 async def execute_signal_for_all_users(signal_data: dict, application: Application, db: Session, source_name: str):
     signal_type = signal_data.get("type")
