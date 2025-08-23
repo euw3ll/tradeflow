@@ -113,6 +113,8 @@ async def check_pending_orders_for_user(application: Application, user: User, db
             )
 
 
+# SUBSTITUA a função check_active_trades_for_user inteira por esta:
+
 async def check_active_trades_for_user(application: Application, user: User, db: Session):
     """Verifica e gerencia os trades ativos de UM usuário específico."""
     active_trades = db.query(Trade).filter(
@@ -127,11 +129,24 @@ async def check_active_trades_for_user(application: Application, user: User, db:
 
     for trade in active_trades:
         live_position_size = await get_specific_position_size(api_key, api_secret, trade.symbol)
+        
+        # --- LÓGICA DE NOTIFICAÇÃO DE FANTASMA ADICIONADA AQUI ---
         if live_position_size <= 0:
             logger.info(f"[tracker] Posição fantasma detectada para {trade.symbol}. Marcando como fechada.")
             trade.status = 'CLOSED_GHOST'
             trade.remaining_qty = 0.0
-            continue
+            
+            # Notifica o usuário sobre a limpeza
+            message_text = (
+                f"ℹ️ Posição em <b>{trade.symbol}</b> não foi encontrada na Bybit "
+                f"e foi removida do monitoramento."
+            )
+            await application.bot.send_message(
+                chat_id=user.telegram_id, 
+                text=message_text, 
+                parse_mode='HTML'
+            )
+            continue # Pula para o próximo trade
 
         price_result = await get_market_price(trade.symbol)
         if not price_result.get("success"):
@@ -140,7 +155,7 @@ async def check_active_trades_for_user(application: Application, user: User, db:
         current_price = price_result["price"]
         reached_tp = False
 
-        # --- TAKE PROFIT ---
+        # --- LÓGICA DE TAKE PROFIT (JÁ ATUALIZADA) ---
         if trade.initial_targets:
             next_target_price = trade.initial_targets[0]
             if (trade.side == 'LONG' and current_price >= next_target_price) or \
@@ -150,10 +165,8 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                 close_result = await close_partial_position(api_key, api_secret, trade.symbol, qty_to_close, trade.side)
 
                 if close_result.get("success") and not close_result.get("skipped"):
-                    # --- NOVA LÓGICA DE NOTIFICAÇÃO DE LUCRO ---
                     profit = (next_target_price - trade.entry_price) * qty_to_close if trade.side == 'LONG' else (trade.entry_price - next_target_price) * qty_to_close
                     
-                    # Atualiza o trade no DB
                     trade.remaining_qty = live_position_size - qty_to_close
                     remaining_targets = trade.initial_targets[1:]
                     trade.initial_targets = remaining_targets
@@ -179,14 +192,13 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                     await application.bot.send_message(chat_id=user.telegram_id, text=message_text, parse_mode='HTML')
                     reached_tp = True
 
-        # --- STOP LOSS ---
+        # --- LÓGICA DE STOP LOSS (JÁ ATUALIZADA) ---
         if not reached_tp:
             stop_hit = (
                 (trade.side == 'LONG' and current_price <= trade.current_stop_loss) or
                 (trade.side == 'SHORT' and current_price >= trade.current_stop_loss)
             )
             if stop_hit:
-                # --- NOVA LÓGICA DE NOTIFICAÇÃO DE PREJUÍZO ---
                 loss = (trade.current_stop_loss - trade.entry_price) * live_position_size if trade.side == 'LONG' else (trade.entry_price - trade.current_stop_loss) * live_position_size
                 
                 trade.status = 'CLOSED_LOSS'
@@ -199,7 +211,6 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                     f"A posição foi completamente fechada."
                 )
                 await application.bot.send_message(chat_id=user.telegram_id, text=message_text, parse_mode='HTML')
-
 
 
 async def run_tracker(application: Application):
