@@ -118,22 +118,40 @@ async def get_account_info(api_key: str, api_secret: str) -> dict:
     return await asyncio.to_thread(_sync_call)
 
 async def place_order(api_key: str, api_secret: str, signal_data: dict, user_settings: User, balance: float) -> dict:
-    """Abre uma nova posição a mercado (Market) com validação completa."""
+    """Abre uma nova posição a mercado (Market) com validação completa, incluindo verificação de SL contra o preço atual."""
+    symbol = signal_data['coin']
+    
+    # --- NOVA VERIFICAÇÃO DE PRÉ-VOO ---
+    # Buscamos o preço de mercado ANTES de qualquer outra coisa
+    price_check = await get_market_price(symbol)
+    if not price_check.get("success"):
+        return {"success": False, "error": f"Não foi possível obter o preço de mercado atual para {symbol}."}
+    current_market_price = Decimal(str(price_check["price"]))
+    
+    # Validamos o Stop Loss do sinal contra o preço atual
+    side = "Buy" if (signal_data.get('order_type') or '').upper() == 'LONG' else "Sell"
+    stop_loss_price = Decimal(str(signal_data.get('stop_loss')))
+
+    if side == 'Buy' and stop_loss_price >= current_market_price:
+        return {"success": False, "error": f"Stop Loss ({stop_loss_price}) inválido para LONG. Deve ser menor que o preço atual ({current_market_price})."}
+    if side == 'Sell' and stop_loss_price <= current_market_price:
+        return {"success": False, "error": f"Stop Loss ({stop_loss_price}) inválido para SHORT. Deve ser maior que o preço atual ({current_market_price})."}
+    
+    # Se a validação passou, continuamos para a lógica de execução síncrona
     async def pre_flight_checks():
-        symbol = signal_data['coin']
         if symbol not in INSTRUMENT_INFO_CACHE: await get_instrument_info(symbol)
         return INSTRUMENT_INFO_CACHE.get(symbol)
 
     def _sync_call(instrument_rules: Dict[str, Any]):
         try:
-            symbol = signal_data['coin']
             if not instrument_rules or not instrument_rules.get("success"): return instrument_rules or {"success": False, "error": f"Regras para {symbol} não encontradas."}
             if instrument_rules["status"] != "Trading": return {"success": False, "error": f"O símbolo {symbol} não está ativo para negociação ({instrument_rules['status']})."}
 
             session = get_session(api_key, api_secret)
-            side = "Buy" if (signal_data.get('order_type') or '').upper() == 'LONG' else "Sell"
             leverage = Decimal(str(user_settings.max_leverage))
-            entry_price = Decimal(str(signal_data['entries'][0]))
+            
+            # Usamos o preço de mercado que acabamos de buscar para o cálculo
+            entry_price = current_market_price
             
             margin_in_dollars = Decimal(str(balance)) * (Decimal(str(user_settings.entry_size_percent)) / Decimal("100"))
             notional_value = margin_in_dollars * leverage
@@ -150,7 +168,7 @@ async def place_order(api_key: str, api_secret: str, signal_data: dict, user_set
             
             payload = {
                 "category": "linear", "symbol": symbol, "side": side, "orderType": "Market", "qty": str(qty_adj),
-                "takeProfit": str((signal_data.get('targets') or [None])[0]), "stopLoss": str(signal_data.get('stop_loss')),
+                "takeProfit": str((signal_data.get('targets') or [None])[0]), "stopLoss": str(stop_loss_price),
             }
             try:
                 session.set_leverage(category="linear", symbol=symbol, buyLeverage=str(leverage), sellLeverage=str(leverage))
