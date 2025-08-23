@@ -299,7 +299,7 @@ async def my_positions_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         db.close()
 
 async def user_dashboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Exibe o painel com um resumo visual dos saldos da carteira."""
+    """Exibe o painel financeiro com um resumo visual e completo dos saldos da carteira."""
     query = update.callback_query
     try:
         await query.answer()
@@ -321,41 +321,42 @@ async def user_dashboard_handler(update: Update, context: ContextTypes.DEFAULT_T
 
         account_info = await get_account_info(api_key, api_secret)
 
-        message = "<b>Dashboard Financeiro</b> 📊\n\n"
+        message = "<b>Meu Painel Financeiro</b> 📊\n\n"
         
         if account_info.get("success"):
             balance_data = account_info.get("data", {})
             total_equity = balance_data.get("total_equity", 0.0)
-            available_balance = balance_data.get("available_balance_usdt", 0.0)
             
-            # Formatação visual dos saldos
-            message += (
-                f"💰 <b>Patrimônio Total:</b> ${total_equity:,.2f} USDT\n"
-                f"💸 <b>Saldo Disponível para Trade:</b> ${available_balance:,.2f} USDT\n\n"
-            )
-            
-            # Lista de outras moedas relevantes
-            coin_list = balance_data.get("coin_list", [])
-            other_coins_lines = []
-            for c in coin_list:
-                coin = (c.get("coin") or "").upper()
-                wallet_balance_str = c.get("walletBalance")
-                wallet_balance = float(wallet_balance_str) if wallet_balance_str else 0.0
-                usd_value_str = c.get("usdValue")
-                usd_value = float(usd_value_str) if usd_value_str else 0.0
+            message += f"💰 <b>Patrimônio Total:</b> ${total_equity:,.2f} USDT\n\n"
+            message += "<b>Saldos em Carteira:</b>\n"
 
-                # Exibe outras moedas se o valor em USD for maior que $1.00
-                if coin != "USDT" and usd_value > 1.0:
-                    other_coins_lines.append(f"  - {coin}: {wallet_balance:g} (~${usd_value:,.2f})")
+            coin_list = balance_data.get("coin_list", [])
+            wallet_lines = []
+            usdt_found = False
+
+            if coin_list:
+                for c in coin_list:
+                    coin = (c.get("coin") or "").upper()
+                    wallet_balance_str = c.get("walletBalance")
+                    wallet_balance = float(wallet_balance_str) if wallet_balance_str else 0.0
+
+                    # Exibe apenas moedas com saldo significativo
+                    if wallet_balance > 0.00001:
+                        if coin == "USDT":
+                            wallet_lines.append(f"  - <b>{coin}: {wallet_balance:,.2f}</b>")
+                            usdt_found = True
+                        else:
+                            wallet_lines.append(f"  - {coin}: {wallet_balance:g}")
             
-            if other_coins_lines:
-                message += "<b>Outros Ativos em Carteira:</b>\n"
-                message += "\n".join(other_coins_lines)
+            if wallet_lines:
+                message += "\n".join(wallet_lines)
+            else:
+                message += "Nenhum saldo encontrado.\n"
             
         else:
             message += f"❌ Erro ao buscar saldo: {account_info.get('error')}\n"
 
-        message += "\n\n<i>Use o menu 'Minhas Posições' para ver os detalhes dos seus trades. Este bot opera exclusivamente com pares USDT.</i>"
+        message += "\n\n⚠️ <i>Este bot opera exclusivamente com pares USDT.</i>"
 
         await query.edit_message_text(message, parse_mode="HTML", reply_markup=dashboard_menu_keyboard())
 
