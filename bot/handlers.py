@@ -298,9 +298,8 @@ async def my_positions_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     finally:
         db.close()
 
-
 async def user_dashboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Exibe o painel com um resumo dos saldos da carteira."""
+    """Exibe o painel com um resumo visual dos saldos da carteira."""
     query = update.callback_query
     try:
         await query.answer()
@@ -322,38 +321,41 @@ async def user_dashboard_handler(update: Update, context: ContextTypes.DEFAULT_T
 
         account_info = await get_account_info(api_key, api_secret)
 
-        message = "<b>ℹ️ Seu Painel de Controle</b>\n\n"
-        message += "<b>Saldos na Carteira:</b>\n"
-
+        message = "<b>Dashboard Financeiro</b> 📊\n\n"
+        
         if account_info.get("success"):
             balance_data = account_info.get("data", {})
-            coin_list = balance_data.get("coin_list", [])
+            total_equity = balance_data.get("total_equity", 0.0)
+            available_balance = balance_data.get("available_balance_usdt", 0.0)
             
-            usdt_balance_value = 0.0
+            # Formatação visual dos saldos
+            message += (
+                f"💰 <b>Patrimônio Total:</b> ${total_equity:,.2f} USDT\n"
+                f"💸 <b>Saldo Disponível para Trade:</b> ${available_balance:,.2f} USDT\n\n"
+            )
+            
+            # Lista de outras moedas relevantes
+            coin_list = balance_data.get("coin_list", [])
             other_coins_lines = []
-
             for c in coin_list:
                 coin = (c.get("coin") or "").upper()
                 wallet_balance_str = c.get("walletBalance")
                 wallet_balance = float(wallet_balance_str) if wallet_balance_str else 0.0
+                usd_value_str = c.get("usdValue")
+                usd_value = float(usd_value_str) if usd_value_str else 0.0
 
-                if coin == "USDT":
-                    usdt_balance_value = wallet_balance
-                # --- LÓGICA CORRIGIDA AQUI ---
-                # A verificação complexa que usava 'price_result' foi trocada
-                # por uma verificação simples para exibir apenas saldos relevantes.
-                elif wallet_balance > 0.01:
-                    other_coins_lines.append(f"- {coin}: {wallet_balance:g}")
-
-            message += f"<b>- USDT: {usdt_balance_value:,.2f}</b>\n"
+                # Exibe outras moedas se o valor em USD for maior que $1.00
+                if coin != "USDT" and usd_value > 1.0:
+                    other_coins_lines.append(f"  - {coin}: {wallet_balance:g} (~${usd_value:,.2f})")
+            
             if other_coins_lines:
+                message += "<b>Outros Ativos em Carteira:</b>\n"
                 message += "\n".join(other_coins_lines)
-            elif usdt_balance_value == 0.0:
-                 message += "Nenhum saldo relevante encontrado.\n"
+            
         else:
-            message += f"Erro ao buscar saldo: {account_info.get('error')}\n"
+            message += f"❌ Erro ao buscar saldo: {account_info.get('error')}\n"
 
-        message += "\n\n<i>Use o menu 'Minhas Posições' para ver os detalhes dos seus trades.</i>"
+        message += "\n\n<i>Use o menu 'Minhas Posições' para ver os detalhes dos seus trades. Este bot opera exclusivamente com pares USDT.</i>"
 
         await query.edit_message_text(message, parse_mode="HTML", reply_markup=dashboard_menu_keyboard())
 
@@ -362,7 +364,6 @@ async def user_dashboard_handler(update: Update, context: ContextTypes.DEFAULT_T
         await query.edit_message_text("Ocorreu um erro ao buscar os dados do seu painel.")
     finally:
         db.close()
-
 
 # --- CANCELAMENTO ---
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:

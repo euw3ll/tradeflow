@@ -1,56 +1,56 @@
-# imports no topo
-from services.bybit_service import get_closed_pnl_breakdown
+from services.bybit_service import get_closed_pnl_breakdown, get_account_info
 from utils.security import decrypt_data
 from database.session import SessionLocal
 from database.models import Trade, User
 from datetime import datetime
 import logging
+import asyncio
 
 logger = logging.getLogger(__name__)
 
 async def generate_performance_report(user_id: int, start_dt: datetime, end_dt: datetime) -> str:
-    """
-    Gera relatório do período usando o closed PnL da Bybit (fonte de verdade)
-    e mostra contagem de ganhos/perdas e hit rate. Usa DB apenas como apoio.
-    """
+    """Gera relatório de desempenho, incluindo a rentabilidade sobre o patrimônio."""
     db = SessionLocal()
     try:
         user = db.query(User).filter_by(telegram_id=user_id).first()
         if not user or not user.api_key_encrypted:
-            return "Você precisa ter uma chave de API configurada para ver o desempenho financeiro."
+            return "Você precisa ter uma chave de API configurada para ver o desempenho."
 
         api_key = decrypt_data(user.api_key_encrypted)
         api_secret = decrypt_data(user.api_secret_encrypted)
 
-        # dados oficiais da corretora
-        br = await get_closed_pnl_breakdown(api_key, api_secret, start_dt, end_dt)
-        if not br.get("success"):
-            logger.error(f"get_closed_pnl_breakdown falhou: {br.get('error')}")
-            return "Não foi possível calcular seu desempenho agora."
+        # Busca os dados de P/L e o saldo da conta em paralelo
+        pnl_result, account_info = await asyncio.gather(
+            get_closed_pnl_breakdown(api_key, api_secret, start_dt, end_dt),
+            get_account_info(api_key, api_secret)
+        )
 
-        total = br["total_pnl"]
-        wins = br["wins"]
-        losses = br["losses"]
-        trades = br["trades"]
+        if not pnl_result.get("success"):
+            return f"Não foi possível calcular seu desempenho: {pnl_result.get('error')}"
+
+        total_pnl = pnl_result["total_pnl"]
+        wins = pnl_result["wins"]
+        losses = pnl_result["losses"]
+        trades = pnl_result["trades"]
         hit_rate = (wins / trades * 100.0) if trades else 0.0
-
-        # (opcional) também buscamos no DB só para exibir um “Total de Trades” local, se quiser
-        closed_trades_db = db.query(Trade).filter(
-            Trade.user_telegram_id == user_id,
-            Trade.status.like('%CLOSED%'),
-            Trade.created_at >= start_dt,
-            Trade.created_at <= end_dt
-        ).count()
-
-        lucro_str = f"📈 <b>Lucro:</b> ${total:.2f}" if total >= 0 else f"📉 <b>Prejuízo:</b> ${abs(total):.2f}"
+        
+        # --- NOVO CÁLCULO DE RENTABILIDADE ---
+        rentabilidade_str = ""
+        if account_info.get("success"):
+            total_equity = account_info.get("data", {}).get("total_equity", 0.0)
+            if total_equity > 0:
+                rentabilidade = (total_pnl / total_equity) * 100
+                rentabilidade_str = f"🚀 <b>Rentabilidade:</b> {rentabilidade:+.2f}%\n\n"
+        
+        lucro_str = f"📈 <b>Lucro:</b> ${total_pnl:,.2f}" if total_pnl >= 0 else f"📉 <b>Prejuízo:</b> ${abs(total_pnl):,.2f}"
 
         msg = (
             f"<b>📊 Desempenho do Período</b>\n"
             f"<i>De {start_dt:%d/%m/%Y} a {end_dt:%d/%m/%Y}</i>\n\n"
+            f"{rentabilidade_str}"
             f"{lucro_str}\n\n"
-            f"📊 <b>Taxa de Acerto:</b> {hit_rate:.2f}%\n"
-            f"📦 <b>Total de Trades:</b> {trades} "
-            f"(local: {closed_trades_db})\n"
+            f"🎯 <b>Taxa de Acerto:</b> {hit_rate:.2f}%\n"
+            f"📦 <b>Total de Trades:</b> {trades}\n"
             f"  - Ganhos: {wins}\n"
             f"  - Perdas: {losses}\n"
         )

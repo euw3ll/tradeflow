@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 
 async def check_pending_orders_for_user(application: Application, user: User, db: Session):
-    """Verifica as ordens limite pendentes de UM usuário específico."""
+    """Verifica as ordens limite pendentes e envia notificação detalhada na execução."""
     pending_orders = db.query(PendingSignal).filter_by(user_telegram_id=user.telegram_id).all()
     if not pending_orders:
         return
@@ -29,10 +29,7 @@ async def check_pending_orders_for_user(application: Application, user: User, db
     for order in pending_orders:
         status_result = await get_order_status(api_key, api_secret, order.order_id, order.symbol)
         if not status_result.get("success"):
-            logger.error(
-                f"Falha ao obter status da ordem {order.order_id} "
-                f"para o usuário {user.telegram_id}: {status_result.get('error')}"
-            )
+            logger.error(f"Falha ao obter status da ordem {order.order_id}: {status_result.get('error')}")
             continue
 
         order_data = status_result["data"] or {}
@@ -41,76 +38,53 @@ async def check_pending_orders_for_user(application: Application, user: User, db
         if order_status == 'Filled':
             logger.info(f"Ordem Limite {order.order_id} EXECUTADA para o usuário {user.telegram_id}.")
             signal_data = order.signal_data or {}
-
-            # Fallbacks robustos
-            avg_price = order_data.get('avgPrice')
-            if avg_price:
-                entry_price = float(avg_price)
-            else:
-                # usa limit_price salvo no signal_data (trade_manager já injeta) ou a 1ª entry
-                entry_price = float(signal_data.get('limit_price') or signal_data.get('entries', [0])[0])
-
-            cum_exec_qty = float(order_data.get('cumExecQty', 0.0))
-            if cum_exec_qty <= 0:
-                # Segurança: se por algum motivo a exchange marcou Filled mas qty veio 0,
-                # tratamos como cancelado para não criar Trade inconsistente.
-                logger.warning(
-                    f"[tracker] Ordem {order.order_id} marcada como Filled, "
-                    f"mas cumExecQty=0. Removendo ordem pendente sem criar Trade."
-                )
+            
+            qty = float(order_data.get('cumExecQty', 0.0))
+            entry_price = float(order_data.get('avgPrice', 0.0))
+            
+            if qty <= 0 or entry_price <= 0:
+                logger.warning(f"Ordem {order.order_id} Filled, mas com qty/preço zerado. Removendo.")
                 db.delete(order)
-                await application.bot.send_message(
-                    chat_id=user.telegram_id,
-                    text=(
-                        f"ℹ️ Sua ordem limite para <b>{order.symbol}</b> foi finalizada na corretora, "
-                        f"mas sem execução reportada. Removida do monitoramento."
-                    ),
-                    parse_mode='HTML'
-                )
+                await application.bot.send_message(chat_id=user.telegram_id, text=f"ℹ️ Sua ordem limite para <b>{order.symbol}</b> foi finalizada sem execução reportada.", parse_mode='HTML')
                 continue
 
+            # --- LÓGICA DE NOTIFICAÇÃO DETALHADA ---
+            side = signal_data.get('order_type')
+            leverage = user.max_leverage
+            margin = (qty * entry_price) / leverage if leverage > 0 else 0
+            stop_loss = signal_data.get('stop_loss')
+            all_targets = signal_data.get('targets') or []
+            take_profit_1 = all_targets[0] if all_targets else "N/A"
+            num_targets = len(all_targets)
+            tp_text = f"${float(take_profit_1):,.4f}" if isinstance(take_profit_1, (int, float)) else take_profit_1
+            if num_targets > 1:
+                tp_text += f" (de {num_targets} alvos)"
+            
             new_trade = Trade(
-                user_telegram_id=order.user_telegram_id,
-                order_id=order.order_id,
-                symbol=signal_data.get('coin', order.symbol),
-                side=signal_data.get('order_type'),
-                qty=cum_exec_qty,
-                entry_price=entry_price,
-                stop_loss=signal_data.get('stop_loss'),
-                current_stop_loss=signal_data.get('stop_loss'),
-                initial_targets=signal_data.get('targets') or [],
-                status='ACTIVE',
-                remaining_qty=cum_exec_qty
+                user_telegram_id=order.user_telegram_id, order_id=order.order_id,
+                symbol=order.symbol, side=side, qty=qty, entry_price=entry_price,
+                stop_loss=stop_loss, current_stop_loss=stop_loss,
+                initial_targets=all_targets, status='ACTIVE', remaining_qty=qty
             )
             db.add(new_trade)
             db.delete(order)
-            await application.bot.send_message(
-                chat_id=user.telegram_id,
-                text=(
-                    f"📈 <b>Ordem Limite Executada!</b>\n"
-                    f"<b>Moeda:</b> {order.symbol}\n"
-                    f"<b>Preço médio:</b> {entry_price}"
-                ),
-                parse_mode='HTML'
+            
+            message = (
+                f"📈 <b>Ordem Limite Executada!</b>\n\n"
+                f"  - 📊 <b>Tipo:</b> {side} | <b>Alavancagem:</b> {leverage}x\n"
+                f"  - 💎 <b>Moeda:</b> {order.symbol}\n"
+                f"  - 🔢 <b>Quantidade:</b> {qty:g}\n"
+                f"  - 💵 <b>Preço de Entrada:</b> ${entry_price:,.4f}\n"
+                f"  - 💰 <b>Margem:</b> ${margin:,.2f}\n"
+                f"  - 🛡️ <b>Stop Loss:</b> ${stop_loss:,.4f}\n"
+                f"  - 🎯 <b>Take Profit 1:</b> {tp_text}"
             )
+            await application.bot.send_message(chat_id=user.telegram_id, text=message, parse_mode='HTML')
 
         elif order_status in {'Cancelled', 'Deactivated', 'Rejected'}:
             logger.info(f"Ordem Limite {order.order_id} do usuário {user.telegram_id} foi '{order_status}'. Removendo.")
             db.delete(order)
-            await application.bot.send_message(
-                chat_id=user.telegram_id,
-                text=(
-                    f"ℹ️ Sua ordem limite para <b>{order.symbol}</b> foi "
-                    f"'<b>{order_status}</b>' pela corretora e removida do monitoramento."
-                ),
-                parse_mode='HTML'
-            )
-        else:
-            # Estados como 'New', 'PartiallyFilled', etc.: apenas seguir monitorando.
-            logger.debug(
-                f"[tracker] Ordem {order.order_id} estado='{order_status}' para {user.telegram_id}. "
-                f"Seguir monitorando."
-            )
+            await application.bot.send_message(chat_id=user.telegram_id, text=f"ℹ️ Sua ordem limite para <b>{order.symbol}</b> foi '<b>{order_status}</b>' e removida do monitoramento.", parse_mode='HTML')
 
 async def check_active_trades_for_user(application: Application, user: User, db: Session):
     """Verifica e gerencia os trades ativos, com lógica robusta contra race conditions."""
