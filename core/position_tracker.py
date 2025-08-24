@@ -90,8 +90,7 @@ async def check_pending_orders_for_user(application: Application, user: User, db
 
 
 async def check_active_trades_for_user(application: Application, user: User, db: Session):
-    """Verifica e gerencia os trades ativos, usando a função detetive para fechamentos."""
-    # (Esta função permanece com a mesma lógica que implementamos anteriormente, mas adicionei um fallback para o Trailing Stop)
+    """Verifica e gerencia os trades ativos, com logs detalhados para o Trailing Stop."""
     active_trades = db.query(Trade).filter(
         Trade.user_telegram_id == user.telegram_id,
         ~Trade.status.like('%CLOSED%')
@@ -151,6 +150,9 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                         logger.error(f"TRADE {trade.symbol}: Falha ao mover SL para Break-Even. Erro: {sl_result.get('error', 'desconhecido')}")
             
             elif user.stop_strategy == 'TRAILING_STOP':
+                # --- INÍCIO DA ADIÇÃO DE LOGS ---
+                log_prefix = f"[Trailing Stop {trade.symbol}]"
+
                 if trade.trail_high_water_mark is None:
                     trade.trail_high_water_mark = trade.entry_price
                 
@@ -161,17 +163,15 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                     new_hwm = current_price
                 
                 if new_hwm != trade.trail_high_water_mark:
+                    logger.info(f"{log_prefix} Novo pico de preço: ${new_hwm:.4f}")
                     trade.trail_high_water_mark = new_hwm
                 
-                # --- INÍCIO DO AJUSTE PARA POSIÇÕES SINCRONIZADAS ---
                 trail_distance = 0
                 if trade.stop_loss is not None and trade.entry_price is not None:
                     trail_distance = abs(trade.entry_price - trade.stop_loss)
                 else:
-                    # Fallback para posições sincronizadas sem SL original: usa 2% do preço de entrada como distância.
                     trail_distance = trade.entry_price * 0.02
-                # --- FIM DO AJUSTE ---
-
+                
                 potential_new_sl = 0.0
                 if trade.side == 'LONG':
                     potential_new_sl = trade.trail_high_water_mark - trail_distance
@@ -183,18 +183,29 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                     is_improvement = True
                 elif trade.side == 'SHORT' and potential_new_sl < trade.current_stop_loss:
                     is_improvement = True
+
+                # Log detalhado para diagnóstico
+                logger.info(
+                    f"{log_prefix} Preço Atual: ${current_price:.4f} | "
+                    f"Stop Atual: ${trade.current_stop_loss:.4f} | "
+                    f"Pico: ${trade.trail_high_water_mark:.4f} | "
+                    f"Distância: ${trail_distance:.4f} | "
+                    f"Novo SL Potencial: ${potential_new_sl:.4f} | "
+                    f"É Melhoria?: {is_improvement}"
+                )
+                # --- FIM DA ADIÇÃO DE LOGS ---
                 
                 if is_improvement:
-                    logger.info(f"TRADE {trade.symbol}: Estratégia TRAILING_STOP. Movendo SL para ${potential_new_sl:.4f}")
+                    logger.info(f"{log_prefix} MELHORIA DETECTADA! Movendo Stop Loss para ${potential_new_sl:.4f}")
                     sl_result = await modify_position_stop_loss(api_key, api_secret, trade.symbol, potential_new_sl)
                     if sl_result.get("success"):
                         trade.current_stop_loss = potential_new_sl
                         msg = f"📈 <b>Trailing Stop Ajustado</b>\n\nO Stop Loss de <b>{trade.symbol}</b> foi atualizado para <b>${potential_new_sl:.4f}</b> para proteger seus lucros."
                         await application.bot.send_message(chat_id=user.telegram_id, text=msg, parse_mode='HTML')
                     else:
-                        logger.error(f"TRADE {trade.symbol}: Falha ao mover Trailing SL. Erro: {sl_result.get('error', 'desconhecido')}")
+                        logger.error(f"{log_prefix} Falha ao mover Trailing SL. Erro: {sl_result.get('error', 'desconhecido')}")
         else:
-            # Lógica "detetive" (permanece inalterada)
+            # Lógica "detetive"
             logger.info(f"[tracker] Posição para {trade.symbol} não encontrada. Usando o detetive...")
             closed_info_result = await get_last_closed_trade_info(api_key, api_secret, trade.symbol)
             if closed_info_result.get("success"):
