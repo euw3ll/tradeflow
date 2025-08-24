@@ -64,11 +64,19 @@ def settings_menu_keyboard(user_settings):
     max_leverage = user_settings.max_leverage
     min_confidence = user_settings.min_confidence
 
+    # --- INÍCIO DA NOVA LÓGICA ---
+    # Define o texto do botão de estratégia de stop dinamicamente
+    if user_settings.stop_strategy == 'TRAILING_STOP':
+        strategy_text = "Estratégia de Stop: Trailing Stop 📈"
+    else:
+        strategy_text = "Estratégia de Stop: Break-Even 🛡️"
+    # --- FIM DA NOVA LÓGICA ---
+
     keyboard = [
         [InlineKeyboardButton(f"Tamanho da Entrada: {entry_percent:.2f}%", callback_data='set_entry_percent')],
         [InlineKeyboardButton(f"Alavancagem Máxima: {max_leverage}x", callback_data='set_max_leverage')],
         [InlineKeyboardButton(f"Confiança Mínima (IA): {min_confidence:.2f}%", callback_data='set_min_confidence')],
-        # --- ADICIONE O NOVO BOTÃO AQUI ---
+        [InlineKeyboardButton(strategy_text, callback_data='set_stop_strategy')], # <-- NOVO BOTÃO
         [InlineKeyboardButton("✅ Whitelist de Moedas", callback_data='set_coin_whitelist')],
         [InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data='back_to_main_menu')]
     ]

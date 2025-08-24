@@ -725,6 +725,39 @@ async def receive_min_confidence(update: Update, context: ContextTypes.DEFAULT_T
         
         return ASKING_MIN_CONFIDENCE
     
+async def toggle_stop_strategy_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Alterna a estratégia de stop loss do usuário entre Break-Even e Trailing Stop."""
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.telegram_id == user_id).first()
+        if user:
+            # Lógica para alternar a estratégia
+            if user.stop_strategy == 'BREAK_EVEN':
+                user.stop_strategy = 'TRAILING_STOP'
+            else:
+                user.stop_strategy = 'BREAK_EVEN'
+            db.commit()
+            
+            # Atualiza o menu para refletir a mudança imediatamente
+            await query.edit_message_text(
+                "<b>⚙️ Configurações de Trade</b>\n\n"
+                "Aqui você pode definir seus parâmetros de risco e automação.",
+                parse_mode='HTML',
+                reply_markup=settings_menu_keyboard(user)
+            )
+    except BadRequest as e:
+        if "Message is not modified" in str(e):
+            # Ignora o erro se a mensagem não mudou (cliques rápidos)
+            pass
+        else:
+            logger.error(f"Erro ao editar mensagem em toggle_stop_strategy: {e}")
+    finally:
+        db.close()
+    
 async def execute_manual_close_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Lida com a EXECUÇÃO do fechamento manual após a confirmação."""
     query = update.callback_query
