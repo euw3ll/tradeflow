@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from telegram.ext import Application
 from sqlalchemy.orm import Session
 from database.session import SessionLocal
@@ -8,7 +9,7 @@ from services.bybit_service import (
     get_market_price, close_partial_position,
     modify_position_stop_loss, get_order_status,
     get_specific_position_size, modify_position_take_profit,
-    get_last_closed_trade_info
+    get_last_closed_trade_info, get_open_positions_with_pnl
 )
 from services.notification_service import send_notification
 from utils.security import decrypt_data
@@ -19,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 async def check_pending_orders_for_user(application: Application, user: User, db: Session):
     """Verifica as ordens limite pendentes e envia notificação detalhada na execução."""
+    # (Esta função permanece inalterada)
     pending_orders = db.query(PendingSignal).filter_by(user_telegram_id=user.telegram_id).all()
     if not pending_orders:
         return
@@ -49,7 +51,6 @@ async def check_pending_orders_for_user(application: Application, user: User, db
                 await application.bot.send_message(chat_id=user.telegram_id, text=f"ℹ️ Sua ordem limite para <b>{order.symbol}</b> foi finalizada sem execução reportada.", parse_mode='HTML')
                 continue
 
-            # --- LÓGICA DE NOTIFICAÇÃO DETALHADA ---
             side = signal_data.get('order_type')
             leverage = user.max_leverage
             margin = (qty * entry_price) / leverage if leverage > 0 else 0
@@ -87,8 +88,10 @@ async def check_pending_orders_for_user(application: Application, user: User, db
             db.delete(order)
             await application.bot.send_message(chat_id=user.telegram_id, text=f"ℹ️ Sua ordem limite para <b>{order.symbol}</b> foi '<b>{order_status}</b>' e removida do monitoramento.", parse_mode='HTML')
 
+
 async def check_active_trades_for_user(application: Application, user: User, db: Session):
     """Verifica e gerencia os trades ativos, usando a função detetive para fechamentos."""
+    # (Esta função permanece com a mesma lógica que implementamos anteriormente, mas adicionei um fallback para o Trailing Stop)
     active_trades = db.query(Trade).filter(
         Trade.user_telegram_id == user.telegram_id,
         ~Trade.status.like('%CLOSED%')
@@ -103,7 +106,6 @@ async def check_active_trades_for_user(application: Application, user: User, db:
         live_position_size = await get_specific_position_size(api_key, api_secret, trade.symbol)
 
         if live_position_size > 0:
-            # --- CENÁRIO 1: POSIÇÃO ABERTA (LÓGICA EXISTENTE) ---
             price_result = await get_market_price(trade.symbol)
             if not price_result.get("success"): continue
             current_price = price_result["price"]
@@ -135,7 +137,6 @@ async def check_active_trades_for_user(application: Application, user: User, db:
             if targets_hit_this_run:
                 trade.initial_targets = [t for t in trade.initial_targets if t not in targets_hit_this_run]
 
-            # --- INÍCIO DA LÓGICA DE ESTRATÉGIA DE STOP ---
             if user.stop_strategy == 'BREAK_EVEN':
                 if targets_hit_this_run and not trade.is_breakeven:
                     new_stop_loss = trade.entry_price
@@ -162,12 +163,19 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                 if new_hwm != trade.trail_high_water_mark:
                     trade.trail_high_water_mark = new_hwm
                 
-                trail_distance = abs(trade.entry_price - trade.stop_loss)
-                
+                # --- INÍCIO DO AJUSTE PARA POSIÇÕES SINCRONIZADAS ---
+                trail_distance = 0
+                if trade.stop_loss is not None and trade.entry_price is not None:
+                    trail_distance = abs(trade.entry_price - trade.stop_loss)
+                else:
+                    # Fallback para posições sincronizadas sem SL original: usa 2% do preço de entrada como distância.
+                    trail_distance = trade.entry_price * 0.02
+                # --- FIM DO AJUSTE ---
+
                 potential_new_sl = 0.0
                 if trade.side == 'LONG':
                     potential_new_sl = trade.trail_high_water_mark - trail_distance
-                else: # SHORT
+                else:
                     potential_new_sl = trade.trail_high_water_mark + trail_distance
 
                 is_improvement = False
@@ -185,23 +193,17 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                         await application.bot.send_message(chat_id=user.telegram_id, text=msg, parse_mode='HTML')
                     else:
                         logger.error(f"TRADE {trade.symbol}: Falha ao mover Trailing SL. Erro: {sl_result.get('error', 'desconhecido')}")
-            # --- FIM DA LÓGICA DE ESTRATÉGIA DE STOP ---
-
         else:
-            # --- CENÁRIO 2: POSIÇÃO FECHADA - USANDO O DETETIVE ---
+            # Lógica "detetive" (permanece inalterada)
             logger.info(f"[tracker] Posição para {trade.symbol} não encontrada. Usando o detetive...")
-            
             closed_info_result = await get_last_closed_trade_info(api_key, api_secret, trade.symbol)
-
             if closed_info_result.get("success"):
                 closed_data = closed_info_result["data"]
                 pnl = float(closed_data.get("closedPnl", 0.0))
                 closing_reason = closed_data.get("exitType", "Unknown")
-
                 trade.closed_at = func.now()
                 trade.closed_pnl = pnl
                 trade.remaining_qty = 0.0
-                
                 message_text = ""
                 if closing_reason == "TakeProfit":
                     trade.status = 'CLOSED_PROFIT'
@@ -213,13 +215,11 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                     else:
                         trade.status = 'CLOSED_LOSS'
                         message_text = f"🛑 <b>Stop Loss Atingido</b>\n<b>Moeda:</b> {trade.symbol}\n<b>Prejuízo Realizado:</b> ${pnl:,.2f}"
-                else: # Outros motivos (Liquidação, Manual, etc.)
+                else: 
                     trade.status = 'CLOSED_GHOST'
                     message_text = f"ℹ️ Posição em <b>{trade.symbol}</b> foi fechada na corretora.\n<b>Resultado:</b> ${pnl:,.2f}"
-
                 await application.bot.send_message(chat_id=user.telegram_id, text=message_text, parse_mode='HTML')
             else:
-                # Fallback se o detetive falhar
                 trade.status = 'CLOSED_GHOST'; trade.closed_at = func.now(); trade.closed_pnl = 0.0
                 trade.remaining_qty = 0.0
                 message_text = f"ℹ️ Posição em <b>{trade.symbol}</b> não foi encontrada na Bybit e foi removida do monitoramento."
@@ -231,6 +231,59 @@ async def run_tracker(application: Application):
     while True:
         db = SessionLocal()
         try:
+            # --- INÍCIO DA NOVA LÓGICA DE SINCRONIZAÇÃO ---
+            all_api_users_for_sync = db.query(User).filter(User.api_key_encrypted.isnot(None)).all()
+            for user in all_api_users_for_sync:
+                sync_api_key = decrypt_data(user.api_key_encrypted)
+                sync_api_secret = decrypt_data(user.api_secret_encrypted)
+                
+                # 1. Busca posições abertas na Bybit
+                bybit_positions_result = await get_open_positions_with_pnl(sync_api_key, sync_api_secret)
+                if not bybit_positions_result.get("success"):
+                    logger.error(f"Sincronização: Falha ao buscar posições da Bybit para o usuário {user.telegram_id}. Pulando.")
+                    continue
+                
+                bybit_positions = {pos['symbol']: pos for pos in bybit_positions_result.get('data', [])}
+                
+                # 2. Busca trades ativos no banco de dados
+                db_trades = db.query(Trade).filter(Trade.user_telegram_id == user.telegram_id, ~Trade.status.like('%CLOSED%')).all()
+                db_symbols = {trade.symbol for trade in db_trades}
+                
+                # 3. Compara e identifica posições órfãs
+                symbols_to_add = set(bybit_positions.keys()) - db_symbols
+                
+                if symbols_to_add:
+                    logger.warning(f"Sincronização: {len(symbols_to_add)} posições órfãs encontradas para o usuário {user.telegram_id}. Adotando-as.")
+                    for symbol in symbols_to_add:
+                        pos_data = bybit_positions[symbol]
+                        
+                        # Cria um novo registro de Trade para a posição órfã
+                        new_trade = Trade(
+                            user_telegram_id=user.telegram_id,
+                            order_id=f"sync_{symbol}_{int(time.time())}",  # Gera um ID de ordem único
+                            symbol=symbol,
+                            side=pos_data['side'],
+                            qty=pos_data['size'],
+                            remaining_qty=pos_data['size'],
+                            entry_price=pos_data['entry'],
+                            status='ACTIVE_SYNCED', # Status especial para indicar que foi sincronizada
+                            stop_loss=None, # Não conhecemos o SL original
+                            initial_targets=[], # Não conhecemos os alvos originais
+                            current_stop_loss=pos_data.get('stop_loss', 0.0) # Tenta obter da API, se disponível
+                        )
+                        db.add(new_trade)
+                        
+                        # 4. Notifica o usuário
+                        message = (
+                            f"⚠️ <b>Posição Sincronizada</b> ⚠️\n\n"
+                            f"Uma posição em <b>{symbol}</b> foi encontrada aberta na Bybit sem um registro local e foi adicionada ao monitoramento.\n\n"
+                            f"<b>Atenção:</b> O bot não conhece os alvos ou o stop loss originais do sinal. O gerenciamento será feito com base na sua estratégia de stop loss configurada."
+                        )
+                        await application.bot.send_message(chat_id=user.telegram_id, text=message, parse_mode='HTML')
+            
+            db.commit() # Salva as novas posições sincronizadas no banco
+            # --- FIM DA NOVA LÓGICA DE SINCRONIZAÇÃO ---
+
             all_users = db.query(User).filter(User.api_key_encrypted.isnot(None)).all()
             if not all_users:
                 logger.info("Rastreador: Nenhum usuário com API para verificar.")
@@ -239,8 +292,7 @@ async def run_tracker(application: Application):
                 for user in all_users:
                     await check_pending_orders_for_user(application, user, db)
                     await check_active_trades_for_user(application, user, db)
-
-                # commit das modificações (Trades atualizados, remoção de Pending, etc.)
+                
                 db.commit()
 
         except Exception as e:
