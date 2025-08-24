@@ -87,7 +87,7 @@ async def check_pending_orders_for_user(application: Application, user: User, db
             await application.bot.send_message(chat_id=user.telegram_id, text=f"ℹ️ Sua ordem limite para <b>{order.symbol}</b> foi '<b>{order_status}</b>' e removida do monitoramento.", parse_mode='HTML')
 
 async def check_active_trades_for_user(application: Application, user: User, db: Session):
-    """Verifica e gerencia os trades ativos, com lógica robusta contra race conditions."""
+    """Verifica e gerencia os trades ativos, com lógica de Stop Gain e P/L."""
     active_trades = db.query(Trade).filter(
         Trade.user_telegram_id == user.telegram_id,
         ~Trade.status.like('%CLOSED%')
@@ -99,15 +99,12 @@ async def check_active_trades_for_user(application: Application, user: User, db:
     api_secret = decrypt_data(user.api_secret_encrypted)
 
     for trade in active_trades:
-        # Pega os dados essenciais uma vez no início do loop
         price_result = await get_market_price(trade.symbol)
-        live_position_size = await get_specific_position_size(api_key, api_secret, trade.symbol)
-
         if not price_result.get("success"):
             continue
         current_price = price_result["price"]
 
-        # --- NOVA LÓGICA REESTRUTURADA ---
+        live_position_size = await get_specific_position_size(api_key, api_secret, trade.symbol)
 
         # CENÁRIO 1: A POSIÇÃO AINDA ESTÁ ABERTA NA CORRETORA
         if live_position_size > 0:
@@ -134,7 +131,21 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                             trade.status = 'ACTIVE_TP_HIT'
                             next_tp_price = remaining_targets[0]
                             await modify_position_take_profit(api_key, api_secret, trade.symbol, next_tp_price)
-                            message_text = f"💰 <b>Take Profit Atingido! (LUCRO)</b>\n<b>Moeda:</b> {trade.symbol}\n<b>Lucro Parcial:</b> ${profit:,.2f}\n<b>Próximo Alvo:</b> ${next_tp_price:,.4f}"
+                            
+                            # --- LÓGICA DE STOP GAIN (MOVE TO BREAK-EVEN) ---
+                            # Se o stop ainda estiver no valor original, move para a entrada
+                            if trade.current_stop_loss == trade.stop_loss:
+                                await modify_position_stop_loss(api_key, api_secret, trade.symbol, trade.entry_price)
+                                trade.current_stop_loss = trade.entry_price
+                                logger.info(f"Stop Loss para {trade.symbol} movido para o preço de entrada (Break-Even): {trade.entry_price}")
+                            
+                            message_text = (
+                                f"💰 <b>Take Profit Atingido! (LUCRO)</b>\n"
+                                f"<b>Moeda:</b> {trade.symbol}\n"
+                                f"<b>Lucro Parcial:</b> ${profit:,.2f}\n"
+                                f"<b>Próximo Alvo:</b> ${next_tp_price:,.4f}\n"
+                                f"🛡️ <i>Stop Loss movido para a entrada.</i>"
+                            )
                         
                         await application.bot.send_message(chat_id=user.telegram_id, text=message_text, parse_mode='HTML')
                         continue
@@ -145,10 +156,17 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                 (trade.side == 'SHORT' and current_price >= trade.current_stop_loss)
             )
             if stop_hit:
-                loss = abs(trade.current_stop_loss - trade.entry_price) * live_position_size
-                trade.status = 'CLOSED_LOSS'; trade.closed_at = func.now(); trade.closed_pnl = -loss
+                pnl = (trade.current_stop_loss - trade.entry_price) * live_position_size if trade.side == 'LONG' else (trade.entry_price - trade.current_stop_loss) * live_position_size
+                
+                if pnl >= 0:
+                    trade.status = 'CLOSED_STOP_GAIN'
+                    message_text = f"✅ <b>Stop com Ganho Atingido!</b>\n<b>Moeda:</b> {trade.symbol}\n<b>Resultado:</b> ${pnl:,.2f}"
+                else:
+                    trade.status = 'CLOSED_LOSS'
+                    message_text = f"🛑 <b>Stop Loss Atingido (PREJUÍZO)</b>\n<b>Moeda:</b> {trade.symbol}\n<b>Prejuízo Realizado:</b> ${pnl:,.2f}"
+
+                trade.closed_at = func.now(); trade.closed_pnl = pnl
                 trade.remaining_qty = 0.0
-                message_text = f"🛑 <b>Stop Loss Atingido (PREJUÍZO)</b>\n<b>Moeda:</b> {trade.symbol}\n<b>Prejuízo Realizado:</b> ${-loss:,.2f}"
                 await application.bot.send_message(chat_id=user.telegram_id, text=message_text, parse_mode='HTML')
                 continue
 
@@ -162,7 +180,7 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                 if (trade.side == 'LONG' and current_price >= next_target_price) or \
                    (trade.side == 'SHORT' and current_price <= next_target_price):
                     
-                    profit = abs(next_target_price - trade.entry_price) * trade.qty # Usa a quantidade total do trade para o cálculo final
+                    profit = abs(next_target_price - trade.entry_price) * trade.qty
                     trade.status = 'CLOSED_PROFIT'; trade.closed_at = func.now(); trade.closed_pnl = profit
                     trade.remaining_qty = 0.0
                     message_text = f"🏆 <b>Alvo Final Atingido! (LUCRO)</b> 🏆\n<b>Moeda:</b> {trade.symbol}\n<b>Lucro Realizado:</b> ${profit:,.2f}\n<i>(Posição fechada pela corretora)</i>"
@@ -173,10 +191,16 @@ async def check_active_trades_for_user(application: Application, user: User, db:
             if (trade.side == 'LONG' and current_price <= trade.current_stop_loss) or \
                (trade.side == 'SHORT' and current_price >= trade.current_stop_loss):
                
-                loss = abs(trade.current_stop_loss - trade.entry_price) * trade.qty
-                trade.status = 'CLOSED_LOSS'; trade.closed_at = func.now(); trade.closed_pnl = -loss
+                pnl = (trade.current_stop_loss - trade.entry_price) * trade.qty if trade.side == 'LONG' else (trade.entry_price - trade.current_stop_loss) * trade.qty
+                if pnl >= 0:
+                    trade.status = 'CLOSED_STOP_GAIN'
+                    message_text = f"✅ <b>Stop com Ganho Atingido!</b>\n<b>Moeda:</b> {trade.symbol}\n<b>Resultado:</b> ${pnl:,.2f}\n<i>(Posição fechada pela corretora)</i>"
+                else:
+                    trade.status = 'CLOSED_LOSS'
+                    message_text = f"🛑 <b>Stop Loss Atingido (PREJUÍZO)</b>\n<b>Moeda:</b> {trade.symbol}\n<b>Prejuízo Realizado:</b> ${pnl:,.2f}\n<i>(Posição fechada pela corretora)</i>"
+                
+                trade.closed_at = func.now(); trade.closed_pnl = pnl
                 trade.remaining_qty = 0.0
-                message_text = f"🛑 <b>Stop Loss Atingido (PREJUÍZO)</b>\n<b>Moeda:</b> {trade.symbol}\n<b>Prejuízo Realizado:</b> ${-loss:,.2f}\n<i>(Posição fechada pela corretora)</i>"
                 await application.bot.send_message(chat_id=user.telegram_id, text=message_text, parse_mode='HTML')
                 continue
 
