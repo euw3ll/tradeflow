@@ -24,14 +24,14 @@ def _round_down_to_tick(price: Decimal, tick: Decimal) -> Decimal:
 async def get_instrument_info(symbol: str) -> Dict[str, Any]:
     """
     Busca as regras de um instrumento (símbolo) da Bybit, usando um cache em memória.
-    Retorna um dicionário com as regras ou um erro.
     """
     if symbol in INSTRUMENT_INFO_CACHE:
         return INSTRUMENT_INFO_CACHE[symbol]
 
     def _sync_call():
         try:
-            session = HTTP(testnet=False)
+            # Sessão não autenticada com timeout e retentativas
+            session = HTTP(testnet=False, timeout=30, retries=3)
             response = session.get_instruments_info(category="linear", symbol=symbol)
             
             if response.get("retCode") != 0:
@@ -68,7 +68,9 @@ def get_session(api_key: str, api_secret: str) -> HTTP:
     return HTTP(
         testnet=False,
         api_key=api_key,
-        api_secret=api_secret
+        api_secret=api_secret,
+        timeout=30,
+        retries=3
     )
 
 async def get_account_info(api_key: str, api_secret: str) -> dict:
