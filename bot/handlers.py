@@ -2,6 +2,7 @@ import logging
 import asyncio
 import pytz
 from database.models import PendingSignal
+from services.signal_parser import SignalType
 from services.bybit_service import place_limit_order, get_account_info
 from datetime import datetime, time, timedelta 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -23,7 +24,7 @@ from services.bybit_service import (
 )
 from utils.config import ADMIN_ID
 from database.crud import get_user_by_id
-from core.trade_manager import _execute_trade
+from core.trade_manager import _execute_trade, _execute_limit_order_for_user
 from core.performance_service import generate_performance_report
 from core.trade_manager import execute_signal_for_all_users
 from sqlalchemy.sql import func
@@ -838,34 +839,33 @@ async def toggle_approval_mode_handler(update: Update, context: ContextTypes.DEF
         db.close()
 
 async def handle_signal_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lida com a aprovação ou rejeição de um sinal por um usuário específico."""
     query = update.callback_query
     await query.answer()
+    user_id = update.effective_user.id
 
-    ### ALTERAÇÃO INICIADA ###
-    # A linha abaixo estava incorreta e não extraía a ação ('approve') corretamente.
-    # A nova linha usa `partition` para dividir a string de forma mais confiável.
-    # Ex: 'approve_signal_123' se torna ('approve', '_signal_', '123')
     action, _, signal_id_str = query.data.partition('_signal_')
-    ### ALTERAÇÃO FINALIZADA ###
-
     signal_id = int(signal_id_str)
     
     db = SessionLocal()
     try:
-        signal_to_process = db.query(SignalForApproval).filter_by(id=signal_id).first()
+        # Busca o sinal pendente para ESTE usuário específico
+        signal_to_process = db.query(SignalForApproval).filter_by(id=signal_id, user_telegram_id=user_id).first()
         if not signal_to_process:
             await query.edit_message_text("Este sinal já foi processado ou expirou.")
             return
 
+        user = db.query(User).filter_by(telegram_id=user_id).first()
+        signal_data = signal_to_process.signal_data
+        
         if action == 'approve':
-            await query.edit_message_text("✅ **Entrada Aprovada!** Replicando a ordem para todos os usuários...")
+            await query.edit_message_text("✅ **Entrada Aprovada!** Posicionando sua ordem...")
             
-            await execute_signal_for_all_users(
-                signal_data=signal_to_process.signal_data,
-                application=context.application,
-                db=db,
-                source_name=signal_to_process.source_name
-            )
+            # Executa o trade apenas para este usuário
+            if signal_data.get("type") == SignalType.MARKET:
+                await _execute_trade(signal_data, user, context.application, db, signal_to_process.source_name)
+            elif signal_data.get("type") == SignalType.LIMIT:
+                await _execute_limit_order_for_user(signal_data, user, context.application, db)
             
         elif action == 'reject':
             await query.edit_message_text("❌ **Entrada Rejeitada.** O sinal foi descartado.")
