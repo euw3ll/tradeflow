@@ -246,13 +246,12 @@ async def run_tracker(application: Application):
     while True:
         db = SessionLocal()
         try:
-            # --- INÍCIO DA NOVA LÓGICA DE SINCRONIZAÇÃO ---
+            # --- LÓGICA DE SINCRONIZAÇÃO APRIMORADA ---
             all_api_users_for_sync = db.query(User).filter(User.api_key_encrypted.isnot(None)).all()
             for user in all_api_users_for_sync:
                 sync_api_key = decrypt_data(user.api_key_encrypted)
                 sync_api_secret = decrypt_data(user.api_secret_encrypted)
                 
-                # 1. Busca posições abertas na Bybit
                 bybit_positions_result = await get_open_positions_with_pnl(sync_api_key, sync_api_secret)
                 if not bybit_positions_result.get("success"):
                     logger.error(f"Sincronização: Falha ao buscar posições da Bybit para o usuário {user.telegram_id}. Pulando.")
@@ -260,35 +259,42 @@ async def run_tracker(application: Application):
                 
                 bybit_positions = {pos['symbol']: pos for pos in bybit_positions_result.get('data', [])}
                 
-                # 2. Busca trades ativos no banco de dados
-                db_trades = db.query(Trade).filter(Trade.user_telegram_id == user.telegram_id, ~Trade.status.like('%CLOSED%')).all()
-                db_symbols = {trade.symbol for trade in db_trades}
+                # --- INÍCIO DA LÓGICA CORRIGIDA ---
+                # 1. Busca trades ativos no banco de dados
+                db_active_trades = db.query(Trade).filter(Trade.user_telegram_id == user.telegram_id, ~Trade.status.like('%CLOSED%')).all()
+                db_active_symbols = {trade.symbol for trade in db_active_trades}
+
+                # 2. Busca ordens PENDENTES no banco de dados
+                db_pending_signals = db.query(PendingSignal).filter(PendingSignal.user_telegram_id == user.telegram_id).all()
+                db_pending_symbols = {signal.symbol for signal in db_pending_signals}
+
+                # 3. Une os dois conjuntos para ter uma visão completa dos símbolos conhecidos pelo bot
+                all_known_symbols = db_active_symbols.union(db_pending_symbols)
                 
-                # 3. Compara e identifica posições órfãs
-                symbols_to_add = set(bybit_positions.keys()) - db_symbols
+                # 4. Compara e identifica posições órfãs (apenas as que não estão em nenhuma das listas)
+                symbols_to_add = set(bybit_positions.keys()) - all_known_symbols
+                # --- FIM DA LÓGICA CORRIGIDA ---
                 
                 if symbols_to_add:
                     logger.warning(f"Sincronização: {len(symbols_to_add)} posições órfãs encontradas para o usuário {user.telegram_id}. Adotando-as.")
                     for symbol in symbols_to_add:
                         pos_data = bybit_positions[symbol]
                         
-                        # Cria um novo registro de Trade para a posição órfã
                         new_trade = Trade(
                             user_telegram_id=user.telegram_id,
-                            order_id=f"sync_{symbol}_{int(time.time())}",  # Gera um ID de ordem único
+                            order_id=f"sync_{symbol}_{int(time.time())}",
                             symbol=symbol,
                             side=pos_data['side'],
                             qty=pos_data['size'],
                             remaining_qty=pos_data['size'],
                             entry_price=pos_data['entry'],
-                            status='ACTIVE_SYNCED', # Status especial para indicar que foi sincronizada
-                            stop_loss=None, # Não conhecemos o SL original
-                            initial_targets=[], # Não conhecemos os alvos originais
-                            current_stop_loss=pos_data.get('stop_loss', 0.0) # Tenta obter da API, se disponível
+                            status='ACTIVE_SYNCED',
+                            stop_loss=None,
+                            initial_targets=[],
+                            current_stop_loss=pos_data.get('stop_loss', 0.0)
                         )
                         db.add(new_trade)
                         
-                        # 4. Notifica o usuário
                         message = (
                             f"⚠️ <b>Posição Sincronizada</b> ⚠️\n\n"
                             f"Uma posição em <b>{symbol}</b> foi encontrada aberta na Bybit sem um registro local e foi adicionada ao monitoramento.\n\n"
@@ -296,9 +302,9 @@ async def run_tracker(application: Application):
                         )
                         await application.bot.send_message(chat_id=user.telegram_id, text=message, parse_mode='HTML')
             
-            db.commit() # Salva as novas posições sincronizadas no banco
-            # --- FIM DA NOVA LÓGICA DE SINCRONIZAÇÃO ---
+            db.commit()
 
+            # Lógica principal de verificação (inalterada)
             all_users = db.query(User).filter(User.api_key_encrypted.isnot(None)).all()
             if not all_users:
                 logger.info("Rastreador: Nenhum usuário com API para verificar.")
