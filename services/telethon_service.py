@@ -81,58 +81,42 @@ async def list_channel_topics(channel_id: int):
 # Em vez de filtrar por regex no decorator, ouvimos TUDO e deixamos o parser decidir.
 from telethon import events
 
-@client.on(events.NewMessage)          # novas mensagens
-@client.on(events.MessageEdited)       # mensagens editadas (muitos canais editam depois)
+@client.on(events.NewMessage)
+@client.on(events.MessageEdited)
 async def signal_listener(event):
     """
-    Ouve TODAS as mensagens nos canais/grupos e:
-      - loga que chegou
-      - decide se é alvo monitorado
-      - tenta parsear
-      - loga 'é sinal' ou 'não é sinal'
-      - se for sinal, coloca na fila para processamento
+    Ouve TODAS as mensagens e processa APENAS as dos alvos monitorados.
     """
     global comm_queue
+    if not comm_queue: return
 
-    # sanity checks
-    if not isinstance(event, (events.NewMessage.Event, events.MessageEdited.Event)):
-        return
-    if not comm_queue:
-        return
-
-    # texto bruto (mais robusto do que event.text em alguns casos)
-    text = (getattr(event, "raw_text", None)
-            or getattr(getattr(event, "message", None), "message", None)
-            or "")
     chat_id = getattr(event, "chat_id", None)
     message_id = getattr(getattr(event, "message", None), "id", None)
     topic_id = event.reply_to.reply_to_msg_id if getattr(event, "reply_to", None) else None
+    text = (getattr(event, "raw_text", None) or getattr(getattr(event, "message", None), "message", None) or "")
 
-    # LOG: sempre que chega algo
-    preview = text.replace("\n", " ")[:120]
-    logger.info(f"📨 [Telethon] Mensagem recebida | chat_id={chat_id} | msg_id={message_id} | preview={preview!r}")
-
-    # Verifica se é um alvo monitorado (canal/tópico)
+    # 1. Primeiro, verifica se a mensagem é de um alvo monitorado
     monitored_targets = get_monitored_targets()
-    if not monitored_targets:
-        logger.info("⏭️ [Telethon] Não há alvos monitorados configurados.")
-        return
-
     is_target = any(
         (t.channel_id == chat_id and ((t.topic_id is None and topic_id is None) or t.topic_id == topic_id))
         for t in monitored_targets
     )
+
+    # 2. Se não for um alvo, a função termina silenciosamente.
     if not is_target:
-        logger.info(f"⏭️ [Telethon] Mensagem fora dos alvos monitorados (chat_id={chat_id}, topic_id={topic_id}).")
         return
 
-    # Evita duplicidade apenas quando JÁ identificamos como sinal
+    # --- LÓGICA DE LOG MOVIDA PARA CÁ ---
+    # 3. Agora que sabemos que a mensagem é importante, nós a registramos.
+    preview = text.replace("\n", " ")[:120]
+    logger.info(f"📨 [Telethon] Mensagem RELEVANTE recebida | chat_id={chat_id} | msg_id={message_id} | preview={preview!r}")
+
+    # O resto da lógica para evitar duplicidade e processar o sinal continua a mesma...
     if message_id in PROCESSED_MESSAGE_IDS:
-        logger.info(f"⏭️ [Telethon] Mensagem {message_id} já processada anteriormente. Ignorando duplicata/edição.")
+        logger.info(f"⏭️ [Telethon] Mensagem {message_id} já processada. Ignorando.")
         return
 
-    # Tenta parsear
-    from services.signal_parser import parse_signal  # import local p/ evitar ciclos
+    from services.signal_parser import parse_signal
     parsed = parse_signal(text)
 
     if parsed:
@@ -141,18 +125,14 @@ async def signal_listener(event):
             f"type={parsed.get('type')} coin={parsed.get('coin')} "
             f"order={parsed.get('order_type')} entries={parsed.get('entries')} sl={parsed.get('stop_loss')}"
         )
-        # marca como processado só quando for SINAL
         if message_id is not None:
             PROCESSED_MESSAGE_IDS.add(message_id)
 
-        # Enfileira para o processador com um source_name informativo
         await comm_queue.put({
             "action": "process_signal",
             "signal_text": text,
             "source_name": f"telegram:{chat_id}"
         })
-    else:
-        logger.debug("⏭️ [Telethon] Chegou mensagem aqui - não é sinal.")
 
 # --- Processador da Fila ---
 
