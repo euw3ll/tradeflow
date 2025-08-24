@@ -30,8 +30,8 @@ async def get_instrument_info(symbol: str) -> Dict[str, Any]:
 
     def _sync_call():
         try:
-            # Sessão não autenticada com timeout e retentativas
-            session = HTTP(testnet=False, timeout=30, retries=3)
+            # Sessão não autenticada com timeout (sem 'retries')
+            session = HTTP(testnet=False, timeout=30) # <-- CORRIGIDO AQUI
             response = session.get_instruments_info(category="linear", symbol=symbol)
             
             if response.get("retCode") != 0:
@@ -55,6 +55,7 @@ async def get_instrument_info(symbol: str) -> Dict[str, Any]:
             }
             INSTRUMENT_INFO_CACHE[symbol] = rules
             return rules
+    
         except Exception as e:
             logger.error(f"Exceção em get_instrument_info para {symbol}: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
@@ -69,9 +70,8 @@ def get_session(api_key: str, api_secret: str) -> HTTP:
         testnet=False,
         api_key=api_key,
         api_secret=api_secret,
-        timeout=30,
-        retries=3
-    )
+        timeout=30
+    ) # <-- CORRIGIDO AQUI
 
 async def get_account_info(api_key: str, api_secret: str) -> dict:
     """Busca o saldo da conta, calculando o saldo disponível para Contas Unificadas."""
@@ -181,7 +181,7 @@ async def place_order(api_key: str, api_secret: str, signal_data: dict, user_set
             response = session.place_order(**{k: v for k, v in payload.items() if v is not None})
             if response.get('retCode') == 0: return {"success": True, "data": response['result']}
             return {"success": False, "error": response.get('retMsg')}
-        
+      
         except Exception as e:
             logger.error(f"Exceção ao abrir ordem (Market): {e}", exc_info=True)
             return {"success": False, "error": str(e)}
@@ -596,6 +596,7 @@ async def get_order_history(api_key: str, api_secret: str, order_id: str) -> dic
                     return {"success": True, "data": order_list[0]}
                 return {"success": False, "error": "Ordem não encontrada no histórico."}
             return {"success": False, "error": response.get('retMsg')}
+        
         except Exception as e:
             logger.error(f"Exceção em get_order_history: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
