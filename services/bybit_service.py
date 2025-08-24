@@ -617,3 +617,36 @@ async def modify_position_take_profit(api_key: str, api_secret: str, symbol: str
             return {"success": False, "error": str(e)}
     return await asyncio.to_thread(_sync_call)
 
+async def get_last_closed_trade_info(api_key: str, api_secret: str, symbol: str) -> dict:
+    """
+    Função "Detetive": Busca o P/L fechado mais recente para um símbolo específico
+    para determinar o resultado de um trade que já fechou.
+    """
+    def _sync_call():
+        try:
+            session = get_session(api_key, api_secret)
+            # Busca o histórico da última hora, que é suficiente para encontrar o trade
+            end_time = datetime.now()
+            start_time = end_time - timedelta(hours=1)
+            
+            response = session.get_closed_pnl(
+                category="linear",
+                symbol=symbol,
+                startTime=int(start_time.timestamp() * 1000),
+                endTime=int(end_time.timestamp() * 1000),
+                limit=1  # Queremos apenas o trade mais recente
+            )
+
+            if response.get('retCode') == 0:
+                pnl_list = response.get('result', {}).get('list', [])
+                if pnl_list:
+                    # Retorna os dados do último trade fechado para este símbolo
+                    return {"success": True, "data": pnl_list[0]}
+                return {"success": False, "error": "Nenhum trade fechado encontrado para o símbolo na última hora."}
+            
+            return {"success": False, "error": response.get('retMsg')}
+        except Exception as e:
+            logger.error(f"Exceção em get_last_closed_trade_info: {e}", exc_info=True)
+            return {"success": False, "error": str(e)}
+
+    return await asyncio.to_thread(_sync_call)

@@ -1,5 +1,6 @@
 import logging
 import asyncio
+import pytz
 from database.models import PendingSignal
 from services.bybit_service import place_limit_order, get_account_info
 from datetime import datetime, time, timedelta 
@@ -991,29 +992,32 @@ async def receive_loss_limit(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # --- MENU DE DESEMPENHO ---
 
 async def performance_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Exibe o painel de desempenho e lida com a seleção de período."""
+    """Exibe o painel de desempenho e lida com a seleção de período, usando o fuso horário de SP."""
     query = update.callback_query
     await query.answer()
 
     user_id = query.from_user.id
     
+    # --- LÓGICA DE FUSO HORÁRIO CORRIGIDA ---
+    br_timezone = pytz.timezone("America/Sao_Paulo")
+    now_br = datetime.now(br_timezone)
+    
     callback_data = query.data
-    now = datetime.now()
     start_dt, end_dt = None, None
 
     if callback_data == 'perf_today':
-        start_dt = datetime.combine(now.date(), time.min)
-        end_dt = now
+        start_dt = now_br.replace(hour=0, minute=0, second=0, microsecond=0)
+        end_dt = now_br
     elif callback_data == 'perf_yesterday':
-        yesterday = now.date() - timedelta(days=1)
-        start_dt = datetime.combine(yesterday, time.min)
-        end_dt = datetime.combine(yesterday, time.max)
+        yesterday = now_br.date() - timedelta(days=1)
+        start_dt = br_timezone.localize(datetime.combine(yesterday, time.min))
+        end_dt = br_timezone.localize(datetime.combine(yesterday, time.max))
     elif callback_data == 'perf_7_days':
-        start_dt = datetime.combine(now.date() - timedelta(days=6), time.min)
-        end_dt = now
+        start_dt = (now_br - timedelta(days=6)).replace(hour=0, minute=0, second=0, microsecond=0)
+        end_dt = now_br
     elif callback_data == 'perf_30_days':
-        start_dt = datetime.combine(now.date() - timedelta(days=29), time.min)
-        end_dt = now
+        start_dt = (now_br - timedelta(days=29)).replace(hour=0, minute=0, second=0, microsecond=0)
+        end_dt = now_br
 
     if start_dt and end_dt:
         await query.edit_message_text(
