@@ -201,12 +201,15 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                     if is_valid_to_set:
                         logger.info(f"{log_prefix} MELHORIA DETECTADA! Movendo Stop Loss para ${potential_new_sl:.4f}")
                         sl_result = await modify_position_stop_loss(api_key, api_secret, trade.symbol, potential_new_sl)
-                        if sl_result.get("success"):
-                            trade.current_stop_loss = potential_new_sl
-                            msg = f"📈 <b>Trailing Stop Ajustado</b>\n\nO Stop Loss de <b>{trade.symbol}</b> foi atualizado para <b>${potential_new_sl:.4f}</b> para proteger seus lucros."
-                            await application.bot.send_message(chat_id=user.telegram_id, text=msg, parse_mode='HTML')
-                        else:
-                            logger.error(f"{log_prefix} Falha ao mover Trailing SL. Erro: {sl_result.get('error', 'desconhecido')}")
+                    if sl_result.get("success"):
+                        # 1. ATUALIZA O ESTADO LOCAL PRIMEIRO para evitar reenvio.
+                        trade.current_stop_loss = potential_new_sl
+
+                        # 2. SÓ ENTÃO, ENVIA A NOTIFICAÇÃO.
+                        msg = f"📈 <b>Trailing Stop Ajustado</b>\n\nO Stop Loss de <b>{trade.symbol}</b> foi atualizado para <b>${potential_new_sl:.4f}</b> para proteger seus lucros."
+                        await application.bot.send_message(chat_id=user.telegram_id, text=msg, parse_mode='HTML')
+                    else:
+                        logger.error(f"{log_prefix} Falha ao mover Trailing SL. Erro: {sl_result.get('error', 'desconhecido')}")
         else:
             # Lógica "detetive" (inalterada)
             logger.info(f"[tracker] Posição para {trade.symbol} não encontrada. Usando o detetive...")
@@ -310,11 +313,13 @@ async def run_tracker(application: Application):
                 logger.info("Rastreador: Nenhum usuário com API para verificar.")
             else:
                 logger.info(f"Rastreador: Verificando assets para {len(all_users)} usuário(s).")
+                # CORREÇÃO: Laço 'for' indentado para pertencer ao bloco 'else'.
                 for user in all_users:
                     await check_pending_orders_for_user(application, user, db)
                     await check_active_trades_for_user(application, user, db)
-                
+
                 db.commit()
+
 
         except Exception as e:
             logger.critical(f"Erro crítico no loop do rastreador: {e}", exc_info=True)

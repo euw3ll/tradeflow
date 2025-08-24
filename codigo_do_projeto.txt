@@ -40,6 +40,7 @@ from bot.handlers import (
     ask_entry_percent, receive_entry_percent, ASKING_ENTRY_PERCENT,
     ask_max_leverage, receive_max_leverage, ASKING_MAX_LEVERAGE,
     ask_min_confidence, receive_min_confidence, ASKING_MIN_CONFIDENCE,
+    toggle_stop_strategy_handler,
     admin_menu, list_channels_handler, select_channel_to_monitor, select_topic_to_monitor,
     admin_view_targets_handler, back_to_admin_menu_handler,
     bot_config_handler, toggle_approval_mode_handler, handle_signal_approval, 
@@ -155,6 +156,8 @@ async def main():
     application.add_handler(CallbackQueryHandler(prompt_manual_close_handler, pattern='^confirm_close_'))
     application.add_handler(CallbackQueryHandler(execute_manual_close_handler, pattern='^execute_close_'))
 
+    application.add_handler(CallbackQueryHandler(toggle_stop_strategy_handler, pattern='^set_stop_strategy$'))
+
     application.add_handler(CallbackQueryHandler(performance_menu_handler, pattern='^perf_'))
     
     application.add_handler(CallbackQueryHandler(list_closed_trades_handler, pattern='^list_closed_trades$'))
@@ -240,6 +243,7 @@ class User(Base):
     daily_profit_target = Column(Float, default=0.0, nullable=False)
     daily_loss_limit = Column(Float, default=0.0, nullable=False)
     coin_whitelist = Column(String, default='todas', nullable=False)
+    stop_strategy = Column(String(20), default='BREAK_EVEN', nullable=False)
 
 class InviteCode(Base):
     __tablename__ = 'invite_codes'
@@ -272,6 +276,8 @@ class Trade(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     closed_at = Column(DateTime(timezone=True), nullable=True)
     closed_pnl = Column(Float, nullable=True)
+    is_breakeven = Column(Boolean, default=False, nullable=False)
+    trail_high_water_mark = Column(Float, nullable=True)
 
 class PendingSignal(Base):
     __tablename__ = 'pending_signals'
@@ -402,6 +408,7 @@ async def generate_performance_report(user_id: int, start_dt: datetime, end_dt: 
 
 import asyncio
 import logging
+import time
 from telegram.ext import Application
 from sqlalchemy.orm import Session
 from database.session import SessionLocal
@@ -410,7 +417,7 @@ from services.bybit_service import (
     get_market_price, close_partial_position,
     modify_position_stop_loss, get_order_status,
     get_specific_position_size, modify_position_take_profit,
-    get_last_closed_trade_info
+    get_last_closed_trade_info, get_open_positions_with_pnl
 )
 from services.notification_service import send_notification
 from utils.security import decrypt_data
@@ -421,6 +428,7 @@ logger = logging.getLogger(__name__)
 
 async def check_pending_orders_for_user(application: Application, user: User, db: Session):
     """Verifica as ordens limite pendentes e envia notificação detalhada na execução."""
+    # (Esta função permanece inalterada)
     pending_orders = db.query(PendingSignal).filter_by(user_telegram_id=user.telegram_id).all()
     if not pending_orders:
         return
@@ -451,7 +459,6 @@ async def check_pending_orders_for_user(application: Application, user: User, db
                 await application.bot.send_message(chat_id=user.telegram_id, text=f"ℹ️ Sua ordem limite para <b>{order.symbol}</b> foi finalizada sem execução reportada.", parse_mode='HTML')
                 continue
 
-            # --- LÓGICA DE NOTIFICAÇÃO DETALHADA ---
             side = signal_data.get('order_type')
             leverage = user.max_leverage
             margin = (qty * entry_price) / leverage if leverage > 0 else 0
@@ -489,8 +496,9 @@ async def check_pending_orders_for_user(application: Application, user: User, db
             db.delete(order)
             await application.bot.send_message(chat_id=user.telegram_id, text=f"ℹ️ Sua ordem limite para <b>{order.symbol}</b> foi '<b>{order_status}</b>' e removida do monitoramento.", parse_mode='HTML')
 
+
 async def check_active_trades_for_user(application: Application, user: User, db: Session):
-    """Verifica e gerencia os trades ativos, usando a função detetive para fechamentos."""
+    """Verifica e gerencia os trades ativos, com logs detalhados e lógica de stop aprimorada."""
     active_trades = db.query(Trade).filter(
         Trade.user_telegram_id == user.telegram_id,
         ~Trade.status.like('%CLOSED%')
@@ -505,28 +513,120 @@ async def check_active_trades_for_user(application: Application, user: User, db:
         live_position_size = await get_specific_position_size(api_key, api_secret, trade.symbol)
 
         if live_position_size > 0:
-            # --- CENÁRIO 1: POSIÇÃO ABERTA (LÓGICA EXISTENTE) ---
-            # (A lógica de TP/SL para posições abertas continua a mesma)
             price_result = await get_market_price(trade.symbol)
             if not price_result.get("success"): continue
             current_price = price_result["price"]
-            # ... (Lógica de TP e SL que já temos) ...
-
-        else:
-            # --- CENÁRIO 2: POSIÇÃO FECHADA - USANDO O DETETIVE ---
-            logger.info(f"[tracker] Posição para {trade.symbol} não encontrada. Usando o detetive...")
             
-            closed_info_result = await get_last_closed_trade_info(api_key, api_secret, trade.symbol)
+            # Lógica de Take Profit (inalterada)
+            targets_hit_this_run = []
+            if trade.initial_targets:
+                for target_price in trade.initial_targets:
+                    is_target_hit = False
+                    if trade.side == 'LONG' and current_price >= target_price: is_target_hit = True
+                    elif trade.side == 'SHORT' and current_price <= target_price: is_target_hit = True
+                    
+                    if is_target_hit:
+                        logger.info(f"TRADE {trade.symbol}: Alvo de TP em ${target_price:.4f} atingido!")
+                        num_remaining_targets = len(trade.initial_targets)
+                        num_already_hit = len(targets_hit_this_run)
+                        qty_to_close = trade.qty / (num_remaining_targets + num_already_hit)
+                        
+                        close_result = await close_partial_position(api_key, api_secret, trade.symbol, qty_to_close, trade.side)
+                        if close_result.get("success"):
+                            targets_hit_this_run.append(target_price)
+                            trade.remaining_qty -= qty_to_close
+                            msg = f"🎯 <b>Take Profit Atingido!</b>\n\n<b>Moeda:</b> {trade.symbol}\n<b>Alvo:</b> ${target_price:.4f}\nUma parte da sua posição foi fechada com lucro."
+                            await application.bot.send_message(chat_id=user.telegram_id, text=msg, parse_mode='HTML')
+                        else:
+                            logger.error(f"TRADE {trade.symbol}: Falha ao fechar posição parcial para o alvo ${target_price:.4f}. Erro: {close_result.get('error')}")
 
+            if targets_hit_this_run:
+                trade.initial_targets = [t for t in trade.initial_targets if t not in targets_hit_this_run]
+
+            # Lógica de Estratégia de Stop
+            if user.stop_strategy == 'BREAK_EVEN':
+                if targets_hit_this_run and not trade.is_breakeven:
+                    new_stop_loss = trade.entry_price
+                    # ... (lógica de break-even inalterada) ...
+                    sl_result = await modify_position_stop_loss(api_key, api_secret, trade.symbol, new_stop_loss)
+                    if sl_result.get("success"):
+                        trade.is_breakeven = True
+                        trade.current_stop_loss = new_stop_loss
+                        msg = f"🛡️ <b>Stop Loss Ajustado (Break-Even)</b>\n\nSua posição em <b>{trade.symbol}</b> foi protegida..."
+                        await application.bot.send_message(chat_id=user.telegram_id, text=msg, parse_mode='HTML')
+                    else:
+                        logger.error(f"TRADE {trade.symbol}: Falha ao mover SL para Break-Even. Erro: {sl_result.get('error', 'desconhecido')}")
+            
+            elif user.stop_strategy == 'TRAILING_STOP':
+                log_prefix = f"[Trailing Stop {trade.symbol}]"
+
+                if trade.trail_high_water_mark is None:
+                    trade.trail_high_water_mark = trade.entry_price
+                
+                new_hwm = trade.trail_high_water_mark
+                if trade.side == 'LONG' and current_price > new_hwm: new_hwm = current_price
+                elif trade.side == 'SHORT' and current_price < new_hwm: new_hwm = current_price
+                
+                if new_hwm != trade.trail_high_water_mark:
+                    logger.info(f"{log_prefix} Novo pico de preço: ${new_hwm:.4f}")
+                    trade.trail_high_water_mark = new_hwm
+                
+                trail_distance = 0
+                if trade.stop_loss is not None: trail_distance = abs(trade.entry_price - trade.stop_loss)
+                else: trail_distance = trade.entry_price * 0.02
+                
+                potential_new_sl = 0.0
+                if trade.side == 'LONG': potential_new_sl = trade.trail_high_water_mark - trail_distance
+                else: potential_new_sl = trade.trail_high_water_mark + trail_distance
+
+                is_improvement = False
+                if trade.side == 'LONG' and potential_new_sl > trade.current_stop_loss: is_improvement = True
+                elif trade.side == 'SHORT' and potential_new_sl < trade.current_stop_loss: is_improvement = True
+                
+                logger.info(
+                    f"{log_prefix} Preço Atual: ${current_price:.4f} | Stop Atual: ${trade.current_stop_loss:.4f} | "
+                    f"Pico: ${trade.trail_high_water_mark:.4f} | Distância: ${trail_distance:.4f} | "
+                    f"Novo SL Potencial: ${potential_new_sl:.4f} | É Melhoria?: {is_improvement}"
+                )
+                
+                if is_improvement:
+                    # --- INÍCIO DA NOVA VERIFICAÇÃO DE SEGURANÇA ---
+                    is_valid_to_set = True
+                    if trade.side == 'LONG' and potential_new_sl >= current_price:
+                        is_valid_to_set = False
+                        logger.warning(
+                            f"{log_prefix} O preço atual (${current_price:.4f}) já ultrapassou o novo SL ({potential_new_sl:.4f}). "
+                            f"A posição deveria ter sido parada. Ignorando o ajuste para evitar erro na API."
+                        )
+                    elif trade.side == 'SHORT' and potential_new_sl <= current_price:
+                        is_valid_to_set = False
+                        logger.warning(
+                            f"{log_prefix} O preço atual (${current_price:.4f}) já ultrapassou o novo SL ({potential_new_sl:.4f}). "
+                            f"A posição deveria ter sido parada. Ignorando o ajuste para evitar erro na API."
+                        )
+                    # --- FIM DA NOVA VERIFICAÇÃO DE SEGURANÇA ---
+
+                    if is_valid_to_set:
+                        logger.info(f"{log_prefix} MELHORIA DETECTADA! Movendo Stop Loss para ${potential_new_sl:.4f}")
+                        sl_result = await modify_position_stop_loss(api_key, api_secret, trade.symbol, potential_new_sl)
+                        if sl_result.get("success"):
+                            trade.current_stop_loss = potential_new_sl
+                            msg = f"📈 <b>Trailing Stop Ajustado</b>\n\nO Stop Loss de <b>{trade.symbol}</b> foi atualizado para <b>${potential_new_sl:.4f}</b> para proteger seus lucros."
+                            await application.bot.send_message(chat_id=user.telegram_id, text=msg, parse_mode='HTML')
+                        else:
+                            logger.error(f"{log_prefix} Falha ao mover Trailing SL. Erro: {sl_result.get('error', 'desconhecido')}")
+        else:
+            # Lógica "detetive" (inalterada)
+            logger.info(f"[tracker] Posição para {trade.symbol} não encontrada. Usando o detetive...")
+            # ... (código do detetive permanece o mesmo) ...
+            closed_info_result = await get_last_closed_trade_info(api_key, api_secret, trade.symbol)
             if closed_info_result.get("success"):
                 closed_data = closed_info_result["data"]
                 pnl = float(closed_data.get("closedPnl", 0.0))
                 closing_reason = closed_data.get("exitType", "Unknown")
-
                 trade.closed_at = func.now()
                 trade.closed_pnl = pnl
                 trade.remaining_qty = 0.0
-                
                 message_text = ""
                 if closing_reason == "TakeProfit":
                     trade.status = 'CLOSED_PROFIT'
@@ -538,13 +638,11 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                     else:
                         trade.status = 'CLOSED_LOSS'
                         message_text = f"🛑 <b>Stop Loss Atingido</b>\n<b>Moeda:</b> {trade.symbol}\n<b>Prejuízo Realizado:</b> ${pnl:,.2f}"
-                else: # Outros motivos (Liquidação, Manual, etc.)
+                else: 
                     trade.status = 'CLOSED_GHOST'
                     message_text = f"ℹ️ Posição em <b>{trade.symbol}</b> foi fechada na corretora.\n<b>Resultado:</b> ${pnl:,.2f}"
-
                 await application.bot.send_message(chat_id=user.telegram_id, text=message_text, parse_mode='HTML')
             else:
-                # Fallback se o detetive falhar
                 trade.status = 'CLOSED_GHOST'; trade.closed_at = func.now(); trade.closed_pnl = 0.0
                 trade.remaining_qty = 0.0
                 message_text = f"ℹ️ Posição em <b>{trade.symbol}</b> não foi encontrada na Bybit e foi removida do monitoramento."
@@ -556,6 +654,65 @@ async def run_tracker(application: Application):
     while True:
         db = SessionLocal()
         try:
+            # --- LÓGICA DE SINCRONIZAÇÃO APRIMORADA ---
+            all_api_users_for_sync = db.query(User).filter(User.api_key_encrypted.isnot(None)).all()
+            for user in all_api_users_for_sync:
+                sync_api_key = decrypt_data(user.api_key_encrypted)
+                sync_api_secret = decrypt_data(user.api_secret_encrypted)
+                
+                bybit_positions_result = await get_open_positions_with_pnl(sync_api_key, sync_api_secret)
+                if not bybit_positions_result.get("success"):
+                    logger.error(f"Sincronização: Falha ao buscar posições da Bybit para o usuário {user.telegram_id}. Pulando.")
+                    continue
+                
+                bybit_positions = {pos['symbol']: pos for pos in bybit_positions_result.get('data', [])}
+                
+                # --- INÍCIO DA LÓGICA CORRIGIDA ---
+                # 1. Busca trades ativos no banco de dados
+                db_active_trades = db.query(Trade).filter(Trade.user_telegram_id == user.telegram_id, ~Trade.status.like('%CLOSED%')).all()
+                db_active_symbols = {trade.symbol for trade in db_active_trades}
+
+                # 2. Busca ordens PENDENTES no banco de dados
+                db_pending_signals = db.query(PendingSignal).filter(PendingSignal.user_telegram_id == user.telegram_id).all()
+                db_pending_symbols = {signal.symbol for signal in db_pending_signals}
+
+                # 3. Une os dois conjuntos para ter uma visão completa dos símbolos conhecidos pelo bot
+                all_known_symbols = db_active_symbols.union(db_pending_symbols)
+                
+                # 4. Compara e identifica posições órfãs (apenas as que não estão em nenhuma das listas)
+                symbols_to_add = set(bybit_positions.keys()) - all_known_symbols
+                # --- FIM DA LÓGICA CORRIGIDA ---
+                
+                if symbols_to_add:
+                    logger.warning(f"Sincronização: {len(symbols_to_add)} posições órfãs encontradas para o usuário {user.telegram_id}. Adotando-as.")
+                    for symbol in symbols_to_add:
+                        pos_data = bybit_positions[symbol]
+                        
+                        new_trade = Trade(
+                            user_telegram_id=user.telegram_id,
+                            order_id=f"sync_{symbol}_{int(time.time())}",
+                            symbol=symbol,
+                            side=pos_data['side'],
+                            qty=pos_data['size'],
+                            remaining_qty=pos_data['size'],
+                            entry_price=pos_data['entry'],
+                            status='ACTIVE_SYNCED',
+                            stop_loss=None,
+                            initial_targets=[],
+                            current_stop_loss=pos_data.get('stop_loss', 0.0)
+                        )
+                        db.add(new_trade)
+                        
+                        message = (
+                            f"⚠️ <b>Posição Sincronizada</b> ⚠️\n\n"
+                            f"Uma posição em <b>{symbol}</b> foi encontrada aberta na Bybit sem um registro local e foi adicionada ao monitoramento.\n\n"
+                            f"<b>Atenção:</b> O bot não conhece os alvos ou o stop loss originais do sinal. O gerenciamento será feito com base na sua estratégia de stop loss configurada."
+                        )
+                        await application.bot.send_message(chat_id=user.telegram_id, text=message, parse_mode='HTML')
+            
+            db.commit()
+
+            # Lógica principal de verificação (inalterada)
             all_users = db.query(User).filter(User.api_key_encrypted.isnot(None)).all()
             if not all_users:
                 logger.info("Rastreador: Nenhum usuário com API para verificar.")
@@ -564,8 +721,7 @@ async def run_tracker(application: Application):
                 for user in all_users:
                     await check_pending_orders_for_user(application, user, db)
                     await check_active_trades_for_user(application, user, db)
-
-                # commit das modificações (Trades atualizados, remoção de Pending, etc.)
+                
                 db.commit()
 
         except Exception as e:
@@ -1735,7 +1891,6 @@ from utils.config import ADMIN_ID
 from database.crud import get_user_by_id
 from core.trade_manager import _execute_trade, _execute_limit_order_for_user
 from core.performance_service import generate_performance_report
-from core.trade_manager import execute_signal_for_all_users
 from sqlalchemy.sql import func
 
 
@@ -2435,6 +2590,39 @@ async def receive_min_confidence(update: Update, context: ContextTypes.DEFAULT_T
         
         return ASKING_MIN_CONFIDENCE
     
+async def toggle_stop_strategy_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Alterna a estratégia de stop loss do usuário entre Break-Even e Trailing Stop."""
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.telegram_id == user_id).first()
+        if user:
+            # Lógica para alternar a estratégia
+            if user.stop_strategy == 'BREAK_EVEN':
+                user.stop_strategy = 'TRAILING_STOP'
+            else:
+                user.stop_strategy = 'BREAK_EVEN'
+            db.commit()
+            
+            # Atualiza o menu para refletir a mudança imediatamente
+            await query.edit_message_text(
+                "<b>⚙️ Configurações de Trade</b>\n\n"
+                "Aqui você pode definir seus parâmetros de risco e automação.",
+                parse_mode='HTML',
+                reply_markup=settings_menu_keyboard(user)
+            )
+    except BadRequest as e:
+        if "Message is not modified" in str(e):
+            # Ignora o erro se a mensagem não mudou (cliques rápidos)
+            pass
+        else:
+            logger.error(f"Erro ao editar mensagem em toggle_stop_strategy: {e}")
+    finally:
+        db.close()
+    
 async def execute_manual_close_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Lida com a EXECUÇÃO do fechamento manual após a confirmação."""
     query = update.callback_query
@@ -2963,11 +3151,19 @@ def settings_menu_keyboard(user_settings):
     max_leverage = user_settings.max_leverage
     min_confidence = user_settings.min_confidence
 
+    # --- INÍCIO DA NOVA LÓGICA ---
+    # Define o texto do botão de estratégia de stop dinamicamente
+    if user_settings.stop_strategy == 'TRAILING_STOP':
+        strategy_text = "Estratégia de Stop: Trailing Stop 📈"
+    else:
+        strategy_text = "Estratégia de Stop: Break-Even 🛡️"
+    # --- FIM DA NOVA LÓGICA ---
+
     keyboard = [
         [InlineKeyboardButton(f"Tamanho da Entrada: {entry_percent:.2f}%", callback_data='set_entry_percent')],
         [InlineKeyboardButton(f"Alavancagem Máxima: {max_leverage}x", callback_data='set_max_leverage')],
         [InlineKeyboardButton(f"Confiança Mínima (IA): {min_confidence:.2f}%", callback_data='set_min_confidence')],
-        # --- ADICIONE O NOVO BOTÃO AQUI ---
+        [InlineKeyboardButton(strategy_text, callback_data='set_stop_strategy')], # <-- NOVO BOTÃO
         [InlineKeyboardButton("✅ Whitelist de Moedas", callback_data='set_coin_whitelist')],
         [InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data='back_to_main_menu')]
     ]
@@ -3042,7 +3238,6 @@ def confirm_manual_close_keyboard(trade_id: int):
         ],
     ]
     return InlineKeyboardMarkup(keyboard)
-
 
 ========================================
 # Arquivo: alembic/env.py
@@ -3140,6 +3335,90 @@ if context.is_offline_mode():
     run_migrations_offline()
 else:
     run_migrations_online()
+
+
+========================================
+# Arquivo: alembic/versions/6a9989511a3b_adiciona_estrategia_de_stop_e_high_.py
+========================================
+
+"""Adiciona estrategia de stop e high water mark
+
+Revision ID: 6a9989511a3b
+Revises: 72957ba18a40 # Verifique se este é o ID da sua migração anterior (a do is_breakeven)
+Create Date: 2025-08-24 04:30:00.000000
+
+"""
+from typing import Sequence, Union
+
+from alembic import op
+import sqlalchemy as sa
+
+
+# revision identifiers, used by Alembic.
+revision: str = '6a9989511a3b'
+down_revision: Union[str, Sequence[str], None] = '72957ba18a40' # Verifique o ID da revisão anterior aqui
+branch_labels: Union[str, Sequence[str], None] = None
+depends_on: Union[str, Sequence[str], None] = None
+
+
+def upgrade() -> None:
+    # ### commands auto generated by Alembic - please adjust! ###
+    with op.batch_alter_table('trades', schema=None) as batch_op:
+        batch_op.add_column(sa.Column('trail_high_water_mark', sa.Float(), nullable=True))
+
+    with op.batch_alter_table('users', schema=None) as batch_op:
+        # CORREÇÃO: Adicionado server_default para compatibilidade com SQLite
+        batch_op.add_column(sa.Column('stop_strategy', sa.String(length=20), nullable=False, server_default='BREAK_EVEN'))
+
+    # ### end Alembic commands ###
+
+
+def downgrade() -> None:
+    # ### commands auto generated by Alembic - please adjust! ###
+    with op.batch_alter_table('users', schema=None) as batch_op:
+        batch_op.drop_column('stop_strategy')
+
+    with op.batch_alter_table('trades', schema=None) as batch_op:
+        batch_op.drop_column('trail_high_water_mark')
+
+    # ### end Alembic commands ###
+
+========================================
+# Arquivo: alembic/versions/72957ba18a40_adiciona_is_breakeven_na_tabela_de_.py
+========================================
+
+"""Adiciona is_breakeven na tabela de trades
+
+Revision ID: 72957ba18a40
+Revises: 77721795cc18
+Create Date: 2025-08-24 01:07:45.256965
+
+"""
+from typing import Sequence, Union
+
+from alembic import op
+import sqlalchemy as sa
+
+
+# revision identifiers, used by Alembic.
+revision: str = '72957ba18a40'
+down_revision: Union[str, Sequence[str], None] = '77721795cc18'
+branch_labels: Union[str, Sequence[str], None] = None
+depends_on: Union[str, Sequence[str], None] = None
+
+
+def upgrade() -> None:
+    """Upgrade schema."""
+    # ### commands auto generated by Alembic - please adjust! ###
+    op.add_column('trades', sa.Column('is_breakeven', sa.Boolean(), nullable=False))
+    # ### end Alembic commands ###
+
+
+def downgrade() -> None:
+    """Downgrade schema."""
+    # ### commands auto generated by Alembic - please adjust! ###
+    op.drop_column('trades', 'is_breakeven')
+    # ### end Alembic commands ###
 
 
 ========================================
@@ -3304,8 +3583,8 @@ async def get_instrument_info(symbol: str) -> Dict[str, Any]:
 
     def _sync_call():
         try:
-            # Sessão não autenticada com timeout e retentativas
-            session = HTTP(testnet=False, timeout=30, retries=3)
+            # Sessão não autenticada com timeout (sem 'retries')
+            session = HTTP(testnet=False, timeout=30) # <-- CORRIGIDO AQUI
             response = session.get_instruments_info(category="linear", symbol=symbol)
             
             if response.get("retCode") != 0:
@@ -3329,6 +3608,7 @@ async def get_instrument_info(symbol: str) -> Dict[str, Any]:
             }
             INSTRUMENT_INFO_CACHE[symbol] = rules
             return rules
+    
         except Exception as e:
             logger.error(f"Exceção em get_instrument_info para {symbol}: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
@@ -3343,9 +3623,8 @@ def get_session(api_key: str, api_secret: str) -> HTTP:
         testnet=False,
         api_key=api_key,
         api_secret=api_secret,
-        timeout=30,
-        retries=3
-    )
+        timeout=30
+    ) # <-- CORRIGIDO AQUI
 
 async def get_account_info(api_key: str, api_secret: str) -> dict:
     """Busca o saldo da conta, calculando o saldo disponível para Contas Unificadas."""
@@ -3455,7 +3734,7 @@ async def place_order(api_key: str, api_secret: str, signal_data: dict, user_set
             response = session.place_order(**{k: v for k, v in payload.items() if v is not None})
             if response.get('retCode') == 0: return {"success": True, "data": response['result']}
             return {"success": False, "error": response.get('retMsg')}
-        
+      
         except Exception as e:
             logger.error(f"Exceção ao abrir ordem (Market): {e}", exc_info=True)
             return {"success": False, "error": str(e)}
@@ -3535,21 +3814,42 @@ async def close_partial_position(api_key: str, api_secret: str, symbol: str, qty
 
 
 async def modify_position_stop_loss(api_key: str, api_secret: str, symbol: str, new_stop_loss: float) -> dict:
-    """Modifica o Stop Loss de uma posição aberta de forma assíncrona."""
-    def _sync_call():
-        try:
+    """Modifica o Stop Loss de uma posição aberta, garantindo a precisão do preço (tick size)."""
+    try:
+        # --- INÍCIO DA NOVA LÓGICA ---
+        # 1. Busca as regras do instrumento para obter o tickSize (deve usar o cache)
+        instrument_rules = await get_instrument_info(symbol)
+        if not instrument_rules.get("success"):
+            error_msg = instrument_rules.get("error", f"Regras do instrumento {symbol} não encontradas.")
+            logger.error(f"Falha ao obter regras para {symbol} antes de modificar SL: {error_msg}")
+            return {"success": False, "error": error_msg}
+
+        # 2. Arredonda o preço do stop loss para o tick size correto
+        tick_size = instrument_rules.get("tickSize", Decimal("0"))
+        sl_price_decimal = Decimal(str(new_stop_loss))
+        rounded_sl_price = _round_down_to_tick(sl_price_decimal, tick_size)
+        
+        logger.info(f"Modificando SL para {symbol}: Original: {sl_price_decimal}, Arredondado ({tick_size}): {rounded_sl_price}")
+        # --- FIM DA NOVA LÓGICA ---
+
+        # 3. Executa a chamada à API em uma thread separada
+        def _sync_call():
             session = get_session(api_key, api_secret)
             response = session.set_trading_stop(
-                category="linear", symbol=symbol, stopLoss=str(new_stop_loss)
+                category="linear",
+                symbol=symbol,
+                stopLoss=str(rounded_sl_price)  # Usa o valor arredondado e validado
             )
             if response.get('retCode') == 0:
                 return {"success": True, "data": response['result']}
             else:
                 return {"success": False, "error": response.get('retMsg')}
-        except Exception as e:
-            logger.error(f"Exceção ao modificar Stop Loss: {e}", exc_info=True)
-            return {"success": False, "error": str(e)}
-    return await asyncio.to_thread(_sync_call)
+        
+        return await asyncio.to_thread(_sync_call)
+
+    except Exception as e:
+        logger.error(f"Exceção na lógica de modificar Stop Loss para {symbol}: {e}", exc_info=True)
+        return {"success": False, "error": str(e)}
 
 async def get_open_positions(api_key: str, api_secret: str) -> dict:
     return await get_open_positions_with_pnl(api_key, api_secret)
@@ -3870,6 +4170,7 @@ async def get_order_history(api_key: str, api_secret: str, order_id: str) -> dic
                     return {"success": True, "data": order_list[0]}
                 return {"success": False, "error": "Ordem não encontrada no histórico."}
             return {"success": False, "error": response.get('retMsg')}
+        
         except Exception as e:
             logger.error(f"Exceção em get_order_history: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
@@ -3895,32 +4196,59 @@ async def modify_position_take_profit(api_key: str, api_secret: str, symbol: str
 
 async def get_last_closed_trade_info(api_key: str, api_secret: str, symbol: str) -> dict:
     """
-    Função "Detetive": Busca o P/L fechado mais recente para um símbolo específico
-    para determinar o resultado de um trade que já fechou.
+    Função "Detetive" aprimorada: cruza dados de PnL e histórico de ordens
+    para determinar com mais precisão o resultado de um trade que já fechou.
     """
     def _sync_call():
         try:
             session = get_session(api_key, api_secret)
-            # Busca o histórico da última hora, que é suficiente para encontrar o trade
             end_time = datetime.now()
-            start_time = end_time - timedelta(hours=1)
+            start_time = end_time - timedelta(hours=2) # Aumenta a janela para 2h por segurança
             
-            response = session.get_closed_pnl(
+            # 1. Busca o PnL fechado mais recente para obter o PnL e o ID da ordem de fechamento
+            pnl_response = session.get_closed_pnl(
                 category="linear",
                 symbol=symbol,
                 startTime=int(start_time.timestamp() * 1000),
                 endTime=int(end_time.timestamp() * 1000),
-                limit=1  # Queremos apenas o trade mais recente
+                limit=1
             )
 
-            if response.get('retCode') == 0:
-                pnl_list = response.get('result', {}).get('list', [])
-                if pnl_list:
-                    # Retorna os dados do último trade fechado para este símbolo
-                    return {"success": True, "data": pnl_list[0]}
-                return {"success": False, "error": "Nenhum trade fechado encontrado para o símbolo na última hora."}
+            if pnl_response.get('retCode') != 0 or not pnl_response.get('result', {}).get('list'):
+                return {"success": False, "error": "Nenhum PnL fechado encontrado para o símbolo recentemente."}
             
-            return {"success": False, "error": response.get('retMsg')}
+            pnl_data = pnl_response['result']['list'][0]
+            closing_order_id = pnl_data.get('orderId')
+            
+            # Prepara o resultado final com os dados do PnL
+            final_data = {
+                "closedPnl": pnl_data.get('closedPnl', 0.0),
+                "exitType": "Unknown" # Começa com 'Unknown' como fallback
+            }
+
+            if not closing_order_id:
+                logger.warning(f"Detetive: PnL encontrado para {symbol}, mas sem orderId. Retornando 'Unknown'.")
+                return {"success": True, "data": final_data}
+
+            # 2. Busca os detalhes da ordem de fechamento para obter o motivo real
+            order_hist_response = session.get_order_history(
+                category="linear",
+                orderId=closing_order_id
+            )
+
+            if order_hist_response.get('retCode') == 0 and order_hist_response.get('result', {}).get('list'):
+                order_data = order_hist_response['result']['list'][0]
+                stop_order_type = order_data.get('stopOrderType', '').strip()
+
+                if stop_order_type == 'TakeProfit':
+                    final_data['exitType'] = 'TakeProfit'
+                elif stop_order_type == 'StopLoss':
+                    final_data['exitType'] = 'StopLoss'
+                # Outros tipos de ordens (como fechamento manual via ordem a mercado) não terão stopOrderType.
+                # Nesses casos, o fallback 'Unknown' será mantido, o que é o comportamento esperado.
+            
+            return {"success": True, "data": final_data}
+
         except Exception as e:
             logger.error(f"Exceção em get_last_closed_trade_info: {e}", exc_info=True)
             return {"success": False, "error": str(e)}

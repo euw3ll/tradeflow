@@ -600,7 +600,7 @@ async def get_specific_position_size(api_key: str, api_secret: str, symbol: str)
             return 0.0
         except Exception as e:
             logger.error(f"Exceção em get_specific_position_size para {symbol}: {e}", exc_info=True)
-            return 0.0 # Em caso de erro, assumimos que não há posição para evitar fechamentos indevidos
+            return None # Em caso de erro, assumimos que não há posição para evitar fechamentos indevidos
 
     return await asyncio.to_thread(_sync_call)
     
