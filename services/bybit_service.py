@@ -622,32 +622,59 @@ async def modify_position_take_profit(api_key: str, api_secret: str, symbol: str
 
 async def get_last_closed_trade_info(api_key: str, api_secret: str, symbol: str) -> dict:
     """
-    Função "Detetive": Busca o P/L fechado mais recente para um símbolo específico
-    para determinar o resultado de um trade que já fechou.
+    Função "Detetive" aprimorada: cruza dados de PnL e histórico de ordens
+    para determinar com mais precisão o resultado de um trade que já fechou.
     """
     def _sync_call():
         try:
             session = get_session(api_key, api_secret)
-            # Busca o histórico da última hora, que é suficiente para encontrar o trade
             end_time = datetime.now()
-            start_time = end_time - timedelta(hours=1)
+            start_time = end_time - timedelta(hours=2) # Aumenta a janela para 2h por segurança
             
-            response = session.get_closed_pnl(
+            # 1. Busca o PnL fechado mais recente para obter o PnL e o ID da ordem de fechamento
+            pnl_response = session.get_closed_pnl(
                 category="linear",
                 symbol=symbol,
                 startTime=int(start_time.timestamp() * 1000),
                 endTime=int(end_time.timestamp() * 1000),
-                limit=1  # Queremos apenas o trade mais recente
+                limit=1
             )
 
-            if response.get('retCode') == 0:
-                pnl_list = response.get('result', {}).get('list', [])
-                if pnl_list:
-                    # Retorna os dados do último trade fechado para este símbolo
-                    return {"success": True, "data": pnl_list[0]}
-                return {"success": False, "error": "Nenhum trade fechado encontrado para o símbolo na última hora."}
+            if pnl_response.get('retCode') != 0 or not pnl_response.get('result', {}).get('list'):
+                return {"success": False, "error": "Nenhum PnL fechado encontrado para o símbolo recentemente."}
             
-            return {"success": False, "error": response.get('retMsg')}
+            pnl_data = pnl_response['result']['list'][0]
+            closing_order_id = pnl_data.get('orderId')
+            
+            # Prepara o resultado final com os dados do PnL
+            final_data = {
+                "closedPnl": pnl_data.get('closedPnl', 0.0),
+                "exitType": "Unknown" # Começa com 'Unknown' como fallback
+            }
+
+            if not closing_order_id:
+                logger.warning(f"Detetive: PnL encontrado para {symbol}, mas sem orderId. Retornando 'Unknown'.")
+                return {"success": True, "data": final_data}
+
+            # 2. Busca os detalhes da ordem de fechamento para obter o motivo real
+            order_hist_response = session.get_order_history(
+                category="linear",
+                orderId=closing_order_id
+            )
+
+            if order_hist_response.get('retCode') == 0 and order_hist_response.get('result', {}).get('list'):
+                order_data = order_hist_response['result']['list'][0]
+                stop_order_type = order_data.get('stopOrderType', '').strip()
+
+                if stop_order_type == 'TakeProfit':
+                    final_data['exitType'] = 'TakeProfit'
+                elif stop_order_type == 'StopLoss':
+                    final_data['exitType'] = 'StopLoss'
+                # Outros tipos de ordens (como fechamento manual via ordem a mercado) não terão stopOrderType.
+                # Nesses casos, o fallback 'Unknown' será mantido, o que é o comportamento esperado.
+            
+            return {"success": True, "data": final_data}
+
         except Exception as e:
             logger.error(f"Exceção em get_last_closed_trade_info: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
