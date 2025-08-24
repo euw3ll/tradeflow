@@ -26,7 +26,6 @@ from utils.config import ADMIN_ID
 from database.crud import get_user_by_id
 from core.trade_manager import _execute_trade, _execute_limit_order_for_user
 from core.performance_service import generate_performance_report
-from core.trade_manager import execute_signal_for_all_users
 from sqlalchemy.sql import func
 
 

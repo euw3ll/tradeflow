@@ -50,6 +50,7 @@ class Trade(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     closed_at = Column(DateTime(timezone=True), nullable=True)
     closed_pnl = Column(Float, nullable=True)
+    is_breakeven = Column(Boolean, default=False, nullable=False)
 
 class PendingSignal(Base):
     __tablename__ = 'pending_signals'
