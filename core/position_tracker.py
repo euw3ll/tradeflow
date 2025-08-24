@@ -90,7 +90,7 @@ async def check_pending_orders_for_user(application: Application, user: User, db
 
 
 async def check_active_trades_for_user(application: Application, user: User, db: Session):
-    """Verifica e gerencia os trades ativos, com logs detalhados para o Trailing Stop."""
+    """Verifica e gerencia os trades ativos, com logs detalhados e lógica de stop aprimorada."""
     active_trades = db.query(Trade).filter(
         Trade.user_telegram_id == user.telegram_id,
         ~Trade.status.like('%CLOSED%')
@@ -109,14 +109,13 @@ async def check_active_trades_for_user(application: Application, user: User, db:
             if not price_result.get("success"): continue
             current_price = price_result["price"]
             
+            # Lógica de Take Profit (inalterada)
             targets_hit_this_run = []
             if trade.initial_targets:
                 for target_price in trade.initial_targets:
                     is_target_hit = False
-                    if trade.side == 'LONG' and current_price >= target_price:
-                        is_target_hit = True
-                    elif trade.side == 'SHORT' and current_price <= target_price:
-                        is_target_hit = True
+                    if trade.side == 'LONG' and current_price >= target_price: is_target_hit = True
+                    elif trade.side == 'SHORT' and current_price <= target_price: is_target_hit = True
                     
                     if is_target_hit:
                         logger.info(f"TRADE {trade.symbol}: Alvo de TP em ${target_price:.4f} atingido!")
@@ -136,77 +135,82 @@ async def check_active_trades_for_user(application: Application, user: User, db:
             if targets_hit_this_run:
                 trade.initial_targets = [t for t in trade.initial_targets if t not in targets_hit_this_run]
 
+            # Lógica de Estratégia de Stop
             if user.stop_strategy == 'BREAK_EVEN':
                 if targets_hit_this_run and not trade.is_breakeven:
                     new_stop_loss = trade.entry_price
-                    logger.info(f"TRADE {trade.symbol}: Estratégia BREAK_EVEN. Movendo SL para ${new_stop_loss:.4f}")
+                    # ... (lógica de break-even inalterada) ...
                     sl_result = await modify_position_stop_loss(api_key, api_secret, trade.symbol, new_stop_loss)
                     if sl_result.get("success"):
                         trade.is_breakeven = True
                         trade.current_stop_loss = new_stop_loss
-                        msg = f"🛡️ <b>Stop Loss Ajustado (Break-Even)</b>\n\nSua posição em <b>{trade.symbol}</b> foi protegida. O Stop Loss foi movido para o preço de entrada (<b>${new_stop_loss:.4f}</b>)."
+                        msg = f"🛡️ <b>Stop Loss Ajustado (Break-Even)</b>\n\nSua posição em <b>{trade.symbol}</b> foi protegida..."
                         await application.bot.send_message(chat_id=user.telegram_id, text=msg, parse_mode='HTML')
                     else:
                         logger.error(f"TRADE {trade.symbol}: Falha ao mover SL para Break-Even. Erro: {sl_result.get('error', 'desconhecido')}")
             
             elif user.stop_strategy == 'TRAILING_STOP':
-                # --- INÍCIO DA ADIÇÃO DE LOGS ---
                 log_prefix = f"[Trailing Stop {trade.symbol}]"
 
                 if trade.trail_high_water_mark is None:
                     trade.trail_high_water_mark = trade.entry_price
                 
                 new_hwm = trade.trail_high_water_mark
-                if trade.side == 'LONG' and current_price > new_hwm:
-                    new_hwm = current_price
-                elif trade.side == 'SHORT' and current_price < new_hwm:
-                    new_hwm = current_price
+                if trade.side == 'LONG' and current_price > new_hwm: new_hwm = current_price
+                elif trade.side == 'SHORT' and current_price < new_hwm: new_hwm = current_price
                 
                 if new_hwm != trade.trail_high_water_mark:
                     logger.info(f"{log_prefix} Novo pico de preço: ${new_hwm:.4f}")
                     trade.trail_high_water_mark = new_hwm
                 
                 trail_distance = 0
-                if trade.stop_loss is not None and trade.entry_price is not None:
-                    trail_distance = abs(trade.entry_price - trade.stop_loss)
-                else:
-                    trail_distance = trade.entry_price * 0.02
+                if trade.stop_loss is not None: trail_distance = abs(trade.entry_price - trade.stop_loss)
+                else: trail_distance = trade.entry_price * 0.02
                 
                 potential_new_sl = 0.0
-                if trade.side == 'LONG':
-                    potential_new_sl = trade.trail_high_water_mark - trail_distance
-                else:
-                    potential_new_sl = trade.trail_high_water_mark + trail_distance
+                if trade.side == 'LONG': potential_new_sl = trade.trail_high_water_mark - trail_distance
+                else: potential_new_sl = trade.trail_high_water_mark + trail_distance
 
                 is_improvement = False
-                if trade.side == 'LONG' and potential_new_sl > trade.current_stop_loss:
-                    is_improvement = True
-                elif trade.side == 'SHORT' and potential_new_sl < trade.current_stop_loss:
-                    is_improvement = True
-
-                # Log detalhado para diagnóstico
+                if trade.side == 'LONG' and potential_new_sl > trade.current_stop_loss: is_improvement = True
+                elif trade.side == 'SHORT' and potential_new_sl < trade.current_stop_loss: is_improvement = True
+                
                 logger.info(
-                    f"{log_prefix} Preço Atual: ${current_price:.4f} | "
-                    f"Stop Atual: ${trade.current_stop_loss:.4f} | "
-                    f"Pico: ${trade.trail_high_water_mark:.4f} | "
-                    f"Distância: ${trail_distance:.4f} | "
-                    f"Novo SL Potencial: ${potential_new_sl:.4f} | "
-                    f"É Melhoria?: {is_improvement}"
+                    f"{log_prefix} Preço Atual: ${current_price:.4f} | Stop Atual: ${trade.current_stop_loss:.4f} | "
+                    f"Pico: ${trade.trail_high_water_mark:.4f} | Distância: ${trail_distance:.4f} | "
+                    f"Novo SL Potencial: ${potential_new_sl:.4f} | É Melhoria?: {is_improvement}"
                 )
-                # --- FIM DA ADIÇÃO DE LOGS ---
                 
                 if is_improvement:
-                    logger.info(f"{log_prefix} MELHORIA DETECTADA! Movendo Stop Loss para ${potential_new_sl:.4f}")
-                    sl_result = await modify_position_stop_loss(api_key, api_secret, trade.symbol, potential_new_sl)
-                    if sl_result.get("success"):
-                        trade.current_stop_loss = potential_new_sl
-                        msg = f"📈 <b>Trailing Stop Ajustado</b>\n\nO Stop Loss de <b>{trade.symbol}</b> foi atualizado para <b>${potential_new_sl:.4f}</b> para proteger seus lucros."
-                        await application.bot.send_message(chat_id=user.telegram_id, text=msg, parse_mode='HTML')
-                    else:
-                        logger.error(f"{log_prefix} Falha ao mover Trailing SL. Erro: {sl_result.get('error', 'desconhecido')}")
+                    # --- INÍCIO DA NOVA VERIFICAÇÃO DE SEGURANÇA ---
+                    is_valid_to_set = True
+                    if trade.side == 'LONG' and potential_new_sl >= current_price:
+                        is_valid_to_set = False
+                        logger.warning(
+                            f"{log_prefix} O preço atual (${current_price:.4f}) já ultrapassou o novo SL ({potential_new_sl:.4f}). "
+                            f"A posição deveria ter sido parada. Ignorando o ajuste para evitar erro na API."
+                        )
+                    elif trade.side == 'SHORT' and potential_new_sl <= current_price:
+                        is_valid_to_set = False
+                        logger.warning(
+                            f"{log_prefix} O preço atual (${current_price:.4f}) já ultrapassou o novo SL ({potential_new_sl:.4f}). "
+                            f"A posição deveria ter sido parada. Ignorando o ajuste para evitar erro na API."
+                        )
+                    # --- FIM DA NOVA VERIFICAÇÃO DE SEGURANÇA ---
+
+                    if is_valid_to_set:
+                        logger.info(f"{log_prefix} MELHORIA DETECTADA! Movendo Stop Loss para ${potential_new_sl:.4f}")
+                        sl_result = await modify_position_stop_loss(api_key, api_secret, trade.symbol, potential_new_sl)
+                        if sl_result.get("success"):
+                            trade.current_stop_loss = potential_new_sl
+                            msg = f"📈 <b>Trailing Stop Ajustado</b>\n\nO Stop Loss de <b>{trade.symbol}</b> foi atualizado para <b>${potential_new_sl:.4f}</b> para proteger seus lucros."
+                            await application.bot.send_message(chat_id=user.telegram_id, text=msg, parse_mode='HTML')
+                        else:
+                            logger.error(f"{log_prefix} Falha ao mover Trailing SL. Erro: {sl_result.get('error', 'desconhecido')}")
         else:
-            # Lógica "detetive"
+            # Lógica "detetive" (inalterada)
             logger.info(f"[tracker] Posição para {trade.symbol} não encontrada. Usando o detetive...")
+            # ... (código do detetive permanece o mesmo) ...
             closed_info_result = await get_last_closed_trade_info(api_key, api_secret, trade.symbol)
             if closed_info_result.get("success"):
                 closed_data = closed_info_result["data"]

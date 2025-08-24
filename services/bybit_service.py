@@ -261,21 +261,42 @@ async def close_partial_position(api_key: str, api_secret: str, symbol: str, qty
 
 
 async def modify_position_stop_loss(api_key: str, api_secret: str, symbol: str, new_stop_loss: float) -> dict:
-    """Modifica o Stop Loss de uma posição aberta de forma assíncrona."""
-    def _sync_call():
-        try:
+    """Modifica o Stop Loss de uma posição aberta, garantindo a precisão do preço (tick size)."""
+    try:
+        # --- INÍCIO DA NOVA LÓGICA ---
+        # 1. Busca as regras do instrumento para obter o tickSize (deve usar o cache)
+        instrument_rules = await get_instrument_info(symbol)
+        if not instrument_rules.get("success"):
+            error_msg = instrument_rules.get("error", f"Regras do instrumento {symbol} não encontradas.")
+            logger.error(f"Falha ao obter regras para {symbol} antes de modificar SL: {error_msg}")
+            return {"success": False, "error": error_msg}
+
+        # 2. Arredonda o preço do stop loss para o tick size correto
+        tick_size = instrument_rules.get("tickSize", Decimal("0"))
+        sl_price_decimal = Decimal(str(new_stop_loss))
+        rounded_sl_price = _round_down_to_tick(sl_price_decimal, tick_size)
+        
+        logger.info(f"Modificando SL para {symbol}: Original: {sl_price_decimal}, Arredondado ({tick_size}): {rounded_sl_price}")
+        # --- FIM DA NOVA LÓGICA ---
+
+        # 3. Executa a chamada à API em uma thread separada
+        def _sync_call():
             session = get_session(api_key, api_secret)
             response = session.set_trading_stop(
-                category="linear", symbol=symbol, stopLoss=str(new_stop_loss)
+                category="linear",
+                symbol=symbol,
+                stopLoss=str(rounded_sl_price)  # Usa o valor arredondado e validado
             )
             if response.get('retCode') == 0:
                 return {"success": True, "data": response['result']}
             else:
                 return {"success": False, "error": response.get('retMsg')}
-        except Exception as e:
-            logger.error(f"Exceção ao modificar Stop Loss: {e}", exc_info=True)
-            return {"success": False, "error": str(e)}
-    return await asyncio.to_thread(_sync_call)
+        
+        return await asyncio.to_thread(_sync_call)
+
+    except Exception as e:
+        logger.error(f"Exceção na lógica de modificar Stop Loss para {symbol}: {e}", exc_info=True)
+        return {"success": False, "error": str(e)}
 
 async def get_open_positions(api_key: str, api_secret: str) -> dict:
     return await get_open_positions_with_pnl(api_key, api_secret)
