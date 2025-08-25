@@ -98,6 +98,7 @@ async def _execute_trade(signal_data: dict, user: User, application: Application
             symbol=symbol, side=side, qty=qty, entry_price=entry_price,
             stop_loss=stop_loss, current_stop_loss=stop_loss,
             initial_targets=all_targets,
+            total_initial_targets=num_targets,
             status='ACTIVE',
             remaining_qty=qty
         )

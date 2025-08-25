@@ -47,6 +47,7 @@ class Trade(Base):
     stop_loss = Column(Float)
     current_stop_loss = Column(Float)
     initial_targets = Column(JSON)
+    total_initial_targets = Column(Integer, nullable=True)
     status = Column(String, default='ACTIVE')
     remaining_qty = Column(Float)
     created_at = Column(DateTime(timezone=True), server_default=func.now())

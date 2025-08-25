@@ -70,8 +70,8 @@ def get_session(api_key: str, api_secret: str) -> HTTP:
         testnet=False,
         api_key=api_key,
         api_secret=api_secret,
-        timeout=30
-    ) # <-- CORRIGIDO AQUI
+        timeout=30 # <-- VALOR DO TIMEOUT AUMENTADO
+    )
 
 async def get_account_info(api_key: str, api_secret: str) -> dict:
     """Busca o saldo da conta, calculando o saldo disponível para Contas Unificadas."""
@@ -281,17 +281,26 @@ async def modify_position_stop_loss(api_key: str, api_secret: str, symbol: str, 
 
         # 3. Executa a chamada à API em uma thread separada
         def _sync_call():
-            session = get_session(api_key, api_secret)
-            response = session.set_trading_stop(
-                category="linear",
-                symbol=symbol,
-                stopLoss=str(rounded_sl_price)  # Usa o valor arredondado e validado
-            )
-            if response.get('retCode') == 0:
-                return {"success": True, "data": response['result']}
-            else:
-                return {"success": False, "error": response.get('retMsg')}
-        
+            try: # <-- NOVO BLOCO TRY
+                session = get_session(api_key, api_secret)
+                response = session.set_trading_stop(
+                    category="linear",
+                    symbol=symbol,
+                    stopLoss=str(rounded_sl_price)
+                )
+                if response.get('retCode') == 0:
+                    return {"success": True, "data": response['result']}
+                else:
+                    return {"success": False, "error": response.get('retMsg')}
+
+            except InvalidRequestError as e: # <-- CAPTURA DA EXCEÇÃO
+                # Erro comum quando o SL já está no lugar, não é uma falha real.
+                if "not modified" in str(e):
+                    logger.info(f"SL para {symbol} já está em ${rounded_sl_price}. Tratando como sucesso.")
+                    return {"success": True, "data": {"note": "not modified"}}
+                # Se for outro tipo de InvalidRequestError, relança o erro.
+                raise e
+
         return await asyncio.to_thread(_sync_call)
 
     except Exception as e:

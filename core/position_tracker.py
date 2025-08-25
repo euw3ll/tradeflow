@@ -18,37 +18,52 @@ from telegram.error import BadRequest
 
 logger = logging.getLogger(__name__)
 
-def _generate_trade_status_message(trade: Trade, status_title: str, pnl_data: dict = None) -> str:
-    """Gera o texto completo e atualizado para a mensagem de status de um trade."""
-    arrow = "⬆️" if trade.side == "LONG" else "⬇️"
+def _generate_trade_status_message(trade: Trade, status_title: str, pnl_data: dict = None, current_price: float = None) -> str:
+    """Gera o texto completo e atualizado para a mensagem de status de um trade no formato Dashboard."""
+    side_emoji = "⬆️" if trade.side == "LONG" else "⬇️"
     
-    pnl_info = ""
+    # --- Cabeçalho ---
+    message = f"{side_emoji} <b>{status_title}: {trade.side}</b>\n\n"
+    message += f"💎 <b>MOEDA:</b> {trade.symbol}\n\n"
+
+    # --- Seção de P/L e Margem ---
     if pnl_data:
         pnl = pnl_data.get("unrealized_pnl", 0.0)
         pnl_pct = pnl_data.get("unrealized_pnl_pct", 0.0)
-        pnl_info = f"  - 📈 <b>P/L Atual:</b> ${pnl:+.2f} ({pnl_pct:+.2f}%)\n"
+        margin = (trade.entry_price * trade.qty) / 10 # Assumindo alavancagem de 10x para margem
+        message += f"📈 <b>P/L Atual:</b> ${pnl:+.2f} ({pnl_pct:+.2f}%)\n"
+        message += f"💰 <b>Margem:</b> ${margin:,.2f}\n"
+    
+    message += " - - - - - - - - - - - - - - - - \n"
+    
+    # --- Seção da Posição ---
+    message += f"➡️ <b>Entrada:</b> ${trade.entry_price:,.4f}\n"
+    if current_price:
+        message += f"📊 <b>Preço Atual:</b> ${current_price:,.4f}\n"
+    message += f"📦 <b>Qtd. Restante:</b> {trade.remaining_qty:g}\n"
+    
+    message += " - - - - - - - - - - - - - - - - \n"
 
-    targets_info = ""
-    if trade.initial_targets:
-        next_target = trade.initial_targets[0]
-        remaining_count = len(trade.initial_targets)
-        targets_info = f"  - 🎯 <b>Próximo Alvo:</b> ${next_target:,.4f} ({remaining_count} restantes)\n"
-    else:
-        targets_info = "  - ✅ <b>Todos os alvos atingidos!</b>\n"
-
-    stop_loss_info = f"  - 🛡️ <b>Stop Loss:</b> ${trade.current_stop_loss:,.4f}"
+    # --- Seção de Risco ---
+    if trade.initial_targets and trade.total_initial_targets:
+        targets_hit = trade.total_initial_targets - len(trade.initial_targets)
+        next_target_num = targets_hit + 1
+        next_target_price = trade.initial_targets[0]
+        message += f"🎯 <b>Próximo Alvo (TP{next_target_num}):</b> ${next_target_price:,.4f}\n"
+    
+    sl_note = ""
     if trade.is_breakeven:
-        stop_loss_info += " (Break-Even)"
+        sl_note = " (Break-Even)"
+    
+    message += f"🛡️ <b>Stop Loss:</b> ${trade.current_stop_loss:,.4f}{sl_note}\n"
+    
+    message += " - - - - - - - - - - - - - - - - \n"
 
-    message = (
-        f"<b>{status_title}</b>\n\n"
-        f"{arrow} <b>{trade.symbol}</b>\n"
-        f"  - 💵 <b>Entrada:</b> ${trade.entry_price:,.4f}\n"
-        f"  - 📦 <b>Qtd. Restante:</b> {trade.remaining_qty:g}\n"
-        f"{pnl_info}"
-        f"{targets_info}"
-        f"{stop_loss_info}"
-    )
+    # --- Seção de Progresso ---
+    if trade.total_initial_targets:
+        targets_hit = trade.total_initial_targets - len(trade.initial_targets)
+        message += f"📊 <b>Alvos Atingidos:</b> {targets_hit} de {trade.total_initial_targets}\n"
+
     return message
 
 async def check_pending_orders_for_user(application: Application, user: User, db: Session):
@@ -113,7 +128,9 @@ async def check_pending_orders_for_user(application: Application, user: User, db
                 notification_message_id=sent_message.message_id, # <-- MUDANÇA AQUI
                 symbol=order.symbol, side=side, qty=qty, entry_price=entry_price,
                 stop_loss=stop_loss, current_stop_loss=stop_loss,
-                initial_targets=all_targets, status='ACTIVE', remaining_qty=qty
+                initial_targets=all_targets,
+                total_initial_targets=num_targets,
+                status='ACTIVE', remaining_qty=qty
             )
             db.add(new_trade)
             db.delete(order)
