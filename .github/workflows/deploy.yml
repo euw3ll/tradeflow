@@ -36,9 +36,11 @@ jobs:
             echo "Parando containers antigos..."
             sudo docker-compose down
 
-            echo "Reconstruindo e iniciando novos containers..."
-            # MUDANÇA AQUI: Adicionado --no-cache para forçar a reconstrução sem cache
-            sudo docker-compose up -d --build --no-cache
+            echo "Reconstruindo as imagens do Docker sem usar cache..."
+            sudo docker-compose build --no-cache
+
+            echo "Iniciando novos containers..."
+            sudo docker-compose up -d
 
             echo "Limpando imagens Docker antigas..."
             sudo docker image prune -af
