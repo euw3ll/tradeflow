@@ -289,9 +289,9 @@ async def get_market_price(symbol: str) -> dict:
 
 async def close_partial_position(api_key: str, api_secret: str, symbol: str, qty_to_close: float, side: str, position_idx: int) -> dict:
     """Fecha parte de uma posição com Market/ReduceOnly.
-    - Detecta automaticamente One-Way vs Hedge e aplica/omite positionIdx.
-    - Em erro 10001 (position idx not match), faz 1 retry alternando a estratégia.
-    - Logs estruturados do payload e do retry.
+    - Detecta One-Way vs Hedge e o lado REAL da posição no exchange.
+    - Usa o lado real para definir o 'close_side' correto (contrário da posição).
+    - Em 10001 (position idx not match), faz 1 retry alternando a estratégia.
     """
     async def pre_flight_checks():
         if symbol not in INSTRUMENT_INFO_CACHE:
@@ -304,8 +304,32 @@ async def close_partial_position(api_key: str, api_secret: str, symbol: str, qty
                 return instrument_rules or {"success": False, "error": f"Regras para {symbol} não encontradas."}
 
             session = get_session(api_key, api_secret)
-            close_side = "Sell" if side == 'LONG' else "Buy"
 
+            # === 0) Descobre a posição ATUAL no exchange (não confia no parâmetro 'side') ===
+            pos_resp = session.get_positions(category="linear", symbol=symbol)
+            if pos_resp.get("retCode") != 0:
+                return {"success": False, "error": pos_resp.get("retMsg", "Falha ao obter posições atuais")}
+            pos_items = (pos_resp.get("result", {}) or {}).get("list", []) or []
+            # Seleciona apenas posições com size > 0
+            pos_open = [p for p in pos_items if float(p.get("size") or 0) > 0]
+
+            if not pos_open:
+                logger.warning(f"[bybit_service] close_partial: nenhuma posição aberta em {symbol}. Nada a fechar.")
+                return {"success": True, "skipped": True, "reason": "no_open_position"}
+
+            # Em One-Way haverá 1 item; em Hedge podem existir 1 (apenas um lado) ou 2 (ambos os lados)
+            # Pegamos a posição que realmente está aberta (size>0). Se houver 2 (raro), fecharemos a que tiver size>0 condizente.
+            # Priorizamos a primeira por simplicidade (poderia somar qtys e fechar proporcional se preciso).
+            p0 = pos_open[0]
+            pos_side_api = (p0.get("side") or "").strip()  # "Buy" (LONG) ou "Sell" (SHORT)
+            pos_idx_api = int(p0.get("positionIdx") or 0)
+
+            # Lado correto para REDUZIR: contrário do lado da posição
+            # - Se posição atual é Buy (LONG) => close_side deve ser "Sell"
+            # - Se posição atual é Sell (SHORT) => close_side deve ser "Buy"
+            close_side = "Sell" if pos_side_api == "Buy" else "Buy"
+
+            # === 1) Ajusta qty pela regra do instrumento ===
             qty_raw = Decimal(str(qty_to_close))
             qty_adj = _round_down_to_step(qty_raw, instrument_rules["qtyStep"])
             logger.info(f"[bybit_service] close_partial {symbol}: raw={qty_raw}, step={instrument_rules['qtyStep']}, minQty={instrument_rules['minOrderQty']} => adj={qty_adj}")
@@ -314,11 +338,18 @@ async def close_partial_position(api_key: str, api_secret: str, symbol: str, qty
                 logger.warning(f"Quantidade a fechar para {symbol} ({qty_adj:f}) é menor que o mínimo permitido. Ignorando fechamento parcial.")
                 return {"success": True, "skipped": True, "reason": "qty_less_than_min_order_qty"}
 
+            # === 2) Resolve mode/idx automaticamente com base no LADO DE FECHAMENTO ===
             resolve = _resolve_position_index(session, symbol, close_side)
             mode = resolve.get("mode", "unknown")
             auto_idx = resolve.get("positionIdx", None)
-            logger.info(f"[bybit_service] resolver: symbol={symbol}, mode={mode}, auto_idx={auto_idx}, hint_idx={position_idx}, close_side={close_side}, details={resolve.get('details')}")
 
+            # Em hedge, se o resolver não retornou idx por algum motivo, usamos o idx da posição aberta (pos_idx_api)
+            if mode == "hedge" and auto_idx is None:
+                auto_idx = pos_idx_api if pos_idx_api in (1, 2) else (1 if close_side == "Sell" else 2)
+
+            logger.info(f"[bybit_service] resolver: symbol={symbol}, mode={mode}, pos_side_api={pos_side_api}, close_side={close_side}, auto_idx={auto_idx}, pos_idx_api={pos_idx_api}")
+
+            # === 3) Monta payload base ===
             payload = {
                 "category": "linear",
                 "symbol": symbol,
@@ -327,6 +358,7 @@ async def close_partial_position(api_key: str, api_secret: str, symbol: str, qty
                 "qty": str(qty_adj),
                 "reduceOnly": True,
             }
+            # Em Hedge, usar índice detectado; em One-Way, omitir
             if auto_idx is not None:
                 payload["positionIdx"] = auto_idx
 
@@ -334,37 +366,55 @@ async def close_partial_position(api_key: str, api_secret: str, symbol: str, qty
                 _safe_log_order_payload("close_partial:first_try", p)
                 return session.place_order(**p)
 
+            # === 4) Primeira tentativa ===
             try:
                 response = _try_place(payload)
                 if response.get('retCode') == 0:
                     return {"success": True, "data": response['result']}
                 msg = response.get('retMsg', '')
+                # Caso 110017 (reduce-only com mesmo lado da posição), tentamos inverter close_side (defensivo)
+                if "reduce-only order has same side" in msg.lower():
+                    raise InvalidRequestError(msg)
                 if "position idx not match" in msg.lower():
                     raise InvalidRequestError(msg)
                 return {"success": False, "error": msg}
 
             except InvalidRequestError as e:
                 text = str(e).lower()
-                if ("position idx not match" in text) or ("10001" in text):
-                    alt_payload = dict(payload)
+                alt_payload = dict(payload)
+                alt_strategy = None
+
+                if "reduce-only order has same side" in text or "110017" in text:
+                    # Defensive retry: inverte o lado de fechamento, pois a posição pode ter virado entre leitura e envio
+                    alt_payload["side"] = "Buy" if payload["side"] == "Sell" else "Sell"
+                    # Ajusta idx padrão em Hedge (1 => reduzir LONG/Buy, 2 => reduzir SHORT/Sell)
+                    if "positionIdx" in alt_payload:
+                        alt_payload["positionIdx"] = 1 if alt_payload["side"] == "Sell" else 2
+                    alt_strategy = f"flip_side_{payload['side']}_to_{alt_payload['side']}"
+                    logger.warning(f"[bybit_service] 110017 detectado para {symbol}. Retry invertendo lado: {alt_strategy}")
+
+                elif "position idx not match" in text or "10001" in text:
+                    # Estratégia da Etapa 2 (alternar presença do idx)
                     if "positionIdx" in alt_payload:
                         alt_payload.pop("positionIdx", None)
                         alt_strategy = "remove_positionIdx"
                     else:
-                        alt_payload["positionIdx"] = 1 if close_side == "Sell" else 2
+                        alt_payload["positionIdx"] = 1 if alt_payload["side"] == "Sell" else 2
                         alt_strategy = f"force_positionIdx_{alt_payload['positionIdx']}"
-
                     logger.warning(f"[bybit_service] 10001 detectado para {symbol}. Retry com '{alt_strategy}'.")
-                    try:
-                        _safe_log_order_payload("close_partial:retry", alt_payload)
-                        resp2 = session.place_order(**alt_payload)
-                        if resp2.get('retCode') == 0:
-                            logger.info(f"[bybit_service] retry sucesso para {symbol} com estratégia '{alt_strategy}'.")
-                            return {"success": True, "data": resp2['result'], "retry": True, "retry_strategy": alt_strategy}
-                        return {"success": False, "error": resp2.get('retMsg', 'Falha no retry 10001'), "retry": True, "retry_strategy": alt_strategy}
-                    except InvalidRequestError as e2:
-                        return {"success": False, "error": str(e2), "retry": True, "retry_strategy": alt_strategy}
-                return {"success": False, "error": str(e)}
+
+                else:
+                    return {"success": False, "error": str(e)}
+
+                try:
+                    _safe_log_order_payload("close_partial:retry", alt_payload)
+                    resp2 = session.place_order(**alt_payload)
+                    if resp2.get('retCode') == 0:
+                        logger.info(f"[bybit_service] retry sucesso para {symbol} com estratégia '{alt_strategy}'.")
+                        return {"success": True, "data": resp2['result'], "retry": True, "retry_strategy": alt_strategy}
+                    return {"success": False, "error": resp2.get('retMsg', 'Falha no retry'), "retry": True, "retry_strategy": alt_strategy}
+                except InvalidRequestError as e2:
+                    return {"success": False, "error": str(e2), "retry": True, "retry_strategy": alt_strategy}
 
         except Exception as e:
             logger.error(f"Exceção ao fechar posição parcial: {e}", exc_info=True)
