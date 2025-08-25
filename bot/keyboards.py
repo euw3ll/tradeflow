@@ -72,6 +72,8 @@ def settings_menu_keyboard(user_settings):
     entry_percent = user_settings.entry_size_percent
     max_leverage = user_settings.max_leverage
     min_confidence = user_settings.min_confidence
+    stop_gain_trigger = user_settings.stop_gain_trigger_pct
+    stop_gain_lock = user_settings.stop_gain_lock_pct
 
     # --- INÍCIO DA NOVA LÓGICA ---
     # Define o texto do botão de estratégia de stop dinamicamente
@@ -86,6 +88,8 @@ def settings_menu_keyboard(user_settings):
         [InlineKeyboardButton(f"Alavancagem Máxima: {max_leverage}x", callback_data='set_max_leverage')],
         [InlineKeyboardButton(f"Confiança Mínima (IA): {min_confidence:.2f}%", callback_data='set_min_confidence')],
         [InlineKeyboardButton(strategy_text, callback_data='set_stop_strategy')], # <-- NOVO BOTÃO
+        [InlineKeyboardButton(f"Gatilho Stop-Gain: {stop_gain_trigger:.2f}%", callback_data='set_stop_gain_trigger')],
+        [InlineKeyboardButton(f"Segurança Stop-Gain: {stop_gain_lock:.2f}%", callback_data='set_stop_gain_lock')],
         [InlineKeyboardButton("✅ Whitelist de Moedas", callback_data='set_coin_whitelist')],
         [InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data='back_to_main_menu')]
     ]

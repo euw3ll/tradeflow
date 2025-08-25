@@ -183,6 +183,39 @@ async def check_active_trades_for_user(application: Application, user: User, db:
             if not price_result.get("success"): continue
             current_price = price_result["price"]
             
+            # --- LÓGICA DE STOP-GAIN DINÂMICO ---
+            pnl_data = live_pnl_map.get(trade.symbol)
+            if pnl_data and user.stop_gain_trigger_pct > 0 and not trade.is_stop_gain_active and not trade.is_breakeven:
+                pnl_pct = pnl_data.get("unrealized_pnl_pct", 0.0) * 100 # Converte para percentual (ex: 1.5)
+
+                if pnl_pct >= user.stop_gain_trigger_pct:
+                    log_prefix = f"[Stop-Gain {trade.symbol}]"
+                    logger.info(f"{log_prefix} Gatilho de {user.stop_gain_trigger_pct}% atingido com P/L de {pnl_pct:.2f}%.")
+                    
+                    # Calcula o novo preço de stop que garante o lucro mínimo
+                    if trade.side == 'LONG':
+                        new_stop_loss = trade.entry_price * (1 + (user.stop_gain_lock_pct / 100))
+                    else: # SHORT
+                        new_stop_loss = trade.entry_price * (1 - (user.stop_gain_lock_pct / 100))
+
+                    # Valida se o novo stop é uma melhoria e é válido
+                    is_improvement = (trade.side == 'LONG' and new_stop_loss > trade.current_stop_loss) or \
+                                     (trade.side == 'SHORT' and new_stop_loss < trade.current_stop_loss)
+                    is_valid_to_set = (trade.side == 'LONG' and new_stop_loss < current_price) or \
+                                      (trade.side == 'SHORT' and new_stop_loss > current_price)
+
+                    if is_improvement and is_valid_to_set:
+                        sl_result = await modify_position_stop_loss(api_key, api_secret, trade.symbol, new_stop_loss)
+                        if sl_result.get("success"):
+                            trade.is_stop_gain_active = True
+                            trade.current_stop_loss = new_stop_loss
+                            message_was_edited = True
+                            status_title_update = f"💰 Stop-Gain Ativado (+{user.stop_gain_lock_pct:.2f}%)"
+                            logger.info(f"{log_prefix} Stop loss movido para ${new_stop_loss:.4f} para garantir +{user.stop_gain_lock_pct:.2f}% de lucro.")
+                        else:
+                            logger.error(f"{log_prefix} Falha ao mover SL para o nível de Stop-Gain. Erro: {sl_result.get('error', 'desconhecido')}")
+
+            # Lógica de Take Profit (continua abaixo)
             targets_hit_this_run = []
             if trade.initial_targets:
                 for target_price in trade.initial_targets:

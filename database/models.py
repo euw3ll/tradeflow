@@ -20,7 +20,8 @@ class User(Base):
     coin_whitelist = Column(String, default='todas', nullable=False)
     stop_strategy = Column(String(20), default='BREAK_EVEN', nullable=False)
     is_active = Column(Boolean, default=True, nullable=False)
-
+    stop_gain_trigger_pct = Column(Float, default=0.0, nullable=False)
+    stop_gain_lock_pct = Column(Float, default=0.0, nullable=False)
 
 class InviteCode(Base):
     __tablename__ = 'invite_codes'
@@ -57,6 +58,7 @@ class Trade(Base):
     closed_pnl = Column(Float, nullable=True)
     is_breakeven = Column(Boolean, default=False, nullable=False)
     trail_high_water_mark = Column(Float, nullable=True)
+    is_stop_gain_active = Column(Boolean, default=False, nullable=False)
 
 class PendingSignal(Base):
     __tablename__ = 'pending_signals'

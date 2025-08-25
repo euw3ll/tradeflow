@@ -34,6 +34,7 @@ from sqlalchemy.sql import func
 (WAITING_CODE, WAITING_API_KEY, WAITING_API_SECRET, CONFIRM_REMOVE_API) = range(4)
 (ASKING_ENTRY_PERCENT, ASKING_MAX_LEVERAGE, ASKING_MIN_CONFIDENCE) = range(10, 13)
 (ASKING_PROFIT_TARGET, ASKING_LOSS_LIMIT) = range(13, 15)
+ASKING_STOP_GAIN_TRIGGER, ASKING_STOP_GAIN_LOCK = range(16, 18)
 ASKING_COIN_WHITELIST = 15
 
 logger = logging.getLogger(__name__)
@@ -1253,3 +1254,76 @@ async def toggle_bot_status_handler(update: Update, context: ContextTypes.DEFAUL
             )
     finally:
         db.close()
+
+async def ask_stop_gain_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Pergunta o gatilho de ativação do Stop-Gain."""
+    query = update.callback_query
+    await query.answer()
+    context.user_data['settings_message_id'] = query.message.message_id
+    await query.edit_message_text(
+        "Envie o percentual de lucro para ATIVAR o Stop-Gain.\n\n"
+        "Exemplo: `1.5` para 1.5%. Se o lucro da posição atingir este valor, o stop será movido para um nível seguro.\n"
+        "Envie `0` para desativar."
+    )
+    return ASKING_STOP_GAIN_TRIGGER
+
+async def receive_stop_gain_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Recebe e salva o gatilho do Stop-Gain."""
+    user_id = update.effective_user.id
+    message_id_to_edit = context.user_data.get('settings_message_id')
+    await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id)
+    try:
+        value = float(update.message.text.replace(',', '.'))
+        if not (0 <= value <= 100): raise ValueError("Valor fora do range")
+
+        db = SessionLocal()
+        try:
+            user = db.query(User).filter_by(telegram_id=user_id).first()
+            user.stop_gain_trigger_pct = value
+            db.commit()
+            feedback = f"✅ Gatilho Stop-Gain atualizado para {value:.2f}%." if value > 0 else "✅ Stop-Gain desativado."
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit,
+                text=feedback, reply_markup=settings_menu_keyboard(user))
+        finally:
+            db.close()
+    except (ValueError, TypeError):
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit,
+            text="❌ Valor inválido. Envie um número (ex: 1.5).")
+        return ASKING_STOP_GAIN_TRIGGER
+    return ConversationHandler.END
+
+async def ask_stop_gain_lock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Pergunta o nível de segurança do Stop-Gain."""
+    query = update.callback_query
+    await query.answer()
+    context.user_data['settings_message_id'] = query.message.message_id
+    await query.edit_message_text(
+        "Envie o percentual de lucro MÍNIMO a ser garantido pelo Stop-Gain.\n\n"
+        "Exemplo: `0.5` para 0.5%. Após o gatilho ser ativado, o stop será movido para garantir este lucro."
+    )
+    return ASKING_STOP_GAIN_LOCK
+
+async def receive_stop_gain_lock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Recebe e salva o nível de segurança do Stop-Gain."""
+    user_id = update.effective_user.id
+    message_id_to_edit = context.user_data.get('settings_message_id')
+    await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id)
+    try:
+        value = float(update.message.text.replace(',', '.'))
+        if not (0 <= value <= 100): raise ValueError("Valor fora do range")
+
+        db = SessionLocal()
+        try:
+            user = db.query(User).filter_by(telegram_id=user_id).first()
+            user.stop_gain_lock_pct = value
+            db.commit()
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit,
+                text=f"✅ Nível de segurança do Stop-Gain atualizado para {value:.2f}%.",
+                reply_markup=settings_menu_keyboard(user))
+        finally:
+            db.close()
+    except (ValueError, TypeError):
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit,
+            text="❌ Valor inválido. Envie um número (ex: 0.5).")
+        return ASKING_STOP_GAIN_LOCK
+    return ConversationHandler.END
