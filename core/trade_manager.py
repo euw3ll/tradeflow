@@ -112,9 +112,50 @@ async def process_new_signal(signal_data: dict, application: Application, source
     db = SessionLocal()
     try:
         if signal_type == SignalType.CANCELAR:
-            # A lógica de cancelamento permanece a mesma
-            logger.info(f"Recebido sinal de cancelamento para {symbol}.")
-            # ... (código de cancelamento que você já tem)
+            # --- INÍCIO DA LÓGICA DE CANCELAMENTO CORRIGIDA ---
+            logger.info(f"Recebido sinal de cancelamento para {symbol}. Buscando ordens pendentes...")
+            
+            pending_orders_to_cancel = db.query(PendingSignal).filter(PendingSignal.symbol == symbol).all()
+
+            if not pending_orders_to_cancel:
+                logger.info(f"Nenhuma ordem limite pendente encontrada para {symbol}. Nenhuma ação necessária.")
+                return
+
+            logger.info(f"Encontradas {len(pending_orders_to_cancel)} ordem(ns) pendente(s) para {symbol} para cancelar.")
+            
+            for pending in pending_orders_to_cancel:
+                user = db.query(User).filter(User.telegram_id == pending.user_telegram_id).first()
+                if not user or not user.api_key_encrypted:
+                    logger.warning(f"Não foi possível encontrar usuário ou chaves de API para a ordem pendente ID:{pending.id}. Pulando.")
+                    continue
+
+                api_key = decrypt_data(user.api_key_encrypted)
+                api_secret = decrypt_data(user.api_secret_encrypted)
+
+                cancel_result = await cancel_order(
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    order_id=pending.order_id,
+                    symbol=pending.symbol
+                )
+
+                if cancel_result.get("success"):
+                    logger.info(f"Ordem {pending.order_id} ({symbol}) cancelada com sucesso para o usuário {user.telegram_id}.")
+                    db.delete(pending)
+                    await application.bot.send_message(
+                        chat_id=user.telegram_id,
+                        text=f"ℹ️ Sua ordem limite pendente para <b>{symbol}</b> foi cancelada pela fonte do sinal.",
+                        parse_mode='HTML'
+                    )
+                else:
+                    error_msg = cancel_result.get("error", "Erro desconhecido")
+                    logger.error(f"Falha ao cancelar ordem {pending.order_id} ({symbol}) para o usuário {user.telegram_id}. Erro: {error_msg}")
+                    await application.bot.send_message(
+                        chat_id=user.telegram_id,
+                        text=f"⚠️ Falha ao tentar cancelar sua ordem limite para <b>{symbol}</b>. Verifique na corretora.\n<b>Motivo:</b> {error_msg}",
+                        parse_mode='HTML'
+                    )
+            
             db.commit()
             return
 
@@ -127,6 +168,11 @@ async def process_new_signal(signal_data: dict, application: Application, source
             logger.info(f"Sinal para {symbol} recebido. Verificando preferências de {len(all_users)} usuário(s)...")
 
             for user in all_users:
+                # Adiciona uma verificação para ver se o bot do usuário está ativo.
+                if not user.is_active:
+                    logger.info(f"Sinal para {symbol} ignorado para o usuário {user.telegram_id} porque o bot está pausado.")
+                    continue
+
                 # 1. Avalia o sinal contra os filtros do usuário
                 aprovado, motivo = _avaliar_sinal(signal_data, user)
                 if not aprovado:

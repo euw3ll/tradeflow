@@ -19,6 +19,8 @@ class User(Base):
     daily_loss_limit = Column(Float, default=0.0, nullable=False)
     coin_whitelist = Column(String, default='todas', nullable=False)
     stop_strategy = Column(String(20), default='BREAK_EVEN', nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False)
+
 
 class InviteCode(Base):
     __tablename__ = 'invite_codes'

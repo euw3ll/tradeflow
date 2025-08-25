@@ -13,7 +13,8 @@ from database.models import User, InviteCode, MonitoredTarget, Trade, SignalForA
 from .keyboards import (
     main_menu_keyboard, confirm_remove_keyboard, admin_menu_keyboard, 
     dashboard_menu_keyboard, settings_menu_keyboard, view_targets_keyboard, 
-    bot_config_keyboard, performance_menu_keyboard, confirm_manual_close_keyboard)
+    bot_config_keyboard, performance_menu_keyboard, confirm_manual_close_keyboard
+    )
 from utils.security import encrypt_data, decrypt_data
 from services.bybit_service import (
     get_open_positions, 
@@ -359,7 +360,7 @@ async def user_dashboard_handler(update: Update, context: ContextTypes.DEFAULT_T
 
         message += "\n\n⚠️ <i>Este bot opera exclusivamente com pares USDT.</i>"
 
-        await query.edit_message_text(message, parse_mode="HTML", reply_markup=dashboard_menu_keyboard())
+        await query.edit_message_text(message, parse_mode="HTML", reply_markup=dashboard_menu_keyboard(user))
 
     except Exception as e:
         logger.error(f"Erro ao montar o painel do usuário: {e}", exc_info=True)
@@ -1230,3 +1231,25 @@ async def prompt_manual_close_handler(update: Update, context: ContextTypes.DEFA
     finally:
         db.close()
 
+async def toggle_bot_status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ativa ou desativa a operação do bot para o usuário, atualizando o painel."""
+    query = update.callback_query
+    user_id = update.effective_user.id
+    
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.telegram_id == user_id).first()
+        if user:
+            # Inverte o status atual
+            user.is_active = not user.is_active
+            db.commit()
+            
+            status_text = "ATIVADO" if user.is_active else "PAUSADO"
+            await query.answer(f"Bot {status_text} com sucesso!")
+            
+            # Apenas atualiza o teclado, mantendo o texto do painel
+            await query.edit_message_reply_markup(
+                reply_markup=dashboard_menu_keyboard(user)
+            )
+    finally:
+        db.close()

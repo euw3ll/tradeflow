@@ -22,7 +22,8 @@ from bot.handlers import (
     ask_loss_limit, receive_loss_limit, ASKING_LOSS_LIMIT, 
     ask_coin_whitelist, receive_coin_whitelist, ASKING_COIN_WHITELIST,
     performance_menu_handler, list_closed_trades_handler,
-    prompt_manual_close_handler, execute_manual_close_handler
+    prompt_manual_close_handler, execute_manual_close_handler,
+    toggle_bot_status_handler
 )
 from database.session import init_db
 from services.telethon_service import start_signal_monitor
@@ -134,6 +135,7 @@ async def main():
     application.add_handler(CallbackQueryHandler(my_positions_handler, pattern='^user_positions$'))
     application.add_handler(CallbackQueryHandler(user_settings_handler, pattern='^user_settings$'))
     application.add_handler(CallbackQueryHandler(user_dashboard_handler, pattern='^user_dashboard$'))
+    application.add_handler(CallbackQueryHandler(toggle_bot_status_handler, pattern='^toggle_bot_status$'))
     application.add_handler(CallbackQueryHandler(back_to_main_menu_handler, pattern='^back_to_main_menu$'))
     application.add_handler(CallbackQueryHandler(prompt_manual_close_handler, pattern='^confirm_close_'))
     application.add_handler(CallbackQueryHandler(execute_manual_close_handler, pattern='^execute_close_'))
