@@ -214,31 +214,57 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                         logger.error(f"TRADE {trade.symbol}: Falha ao mover SL para Break-Even. Erro: {sl_result.get('error', 'desconhecido')}")
             
             elif user.stop_strategy == 'TRAILING_STOP':
-                # ... (toda a lógica de cálculo do trailing stop permanece aqui, como antes)
-                log_prefix = f"[Trailing Stop {trade.symbol}]"
-                if trade.trail_high_water_mark is None: trade.trail_high_water_mark = trade.entry_price
-                new_hwm = trade.trail_high_water_mark
-                if trade.side == 'LONG' and current_price > new_hwm: new_hwm = current_price
-                elif trade.side == 'SHORT' and current_price < new_hwm: new_hwm = current_price
-                if new_hwm != trade.trail_high_water_mark:
-                    logger.info(f"{log_prefix} Novo pico de preço: ${new_hwm:.4f}")
-                    trade.trail_high_water_mark = new_hwm
-                trail_distance = abs(trade.entry_price - trade.stop_loss) if trade.stop_loss is not None else trade.entry_price * 0.02
-                potential_new_sl = trade.trail_high_water_mark - trail_distance if trade.side == 'LONG' else trade.trail_high_water_mark + trail_distance
-                is_improvement = (trade.side == 'LONG' and potential_new_sl > trade.current_stop_loss) or \
-                                 (trade.side == 'SHORT' and potential_new_sl < trade.current_stop_loss)
-                
-                if is_improvement:
-                    is_valid_to_set = (trade.side == 'LONG' and potential_new_sl < current_price) or \
-                                      (trade.side == 'SHORT' and potential_new_sl > current_price)
-                    if is_valid_to_set:
-                        sl_result = await modify_position_stop_loss(api_key, api_secret, trade.symbol, potential_new_sl)
+                # MUDANÇA: A lógica de trailing stop só será ativada APÓS o primeiro TP ser atingido.
+                # Verificamos se a contagem de alvos restantes é menor que a contagem original.
+                first_tp_hit = trade.total_initial_targets is not None and \
+                               trade.initial_targets is not None and \
+                               len(trade.initial_targets) < trade.total_initial_targets
+
+                if first_tp_hit:
+                    log_prefix = f"[Trailing Stop {trade.symbol}]"
+
+                    # Se for a primeira vez que movemos o stop (após o TP1),
+                    # garantimos que ele vá para o break-even primeiro.
+                    if not trade.is_breakeven:
+                        new_stop_loss = trade.entry_price
+                        logger.info(f"{log_prefix} Primeiro alvo atingido. Movendo SL para Break-Even em ${new_stop_loss:.4f}.")
+                        sl_result = await modify_position_stop_loss(api_key, api_secret, trade.symbol, new_stop_loss)
                         if sl_result.get("success"):
-                            trade.current_stop_loss = potential_new_sl
+                            trade.is_breakeven = True
+                            trade.current_stop_loss = new_stop_loss
+                            trade.trail_high_water_mark = new_stop_loss
                             message_was_edited = True
-                            status_title_update = "📈 Trailing Stop Ajustado"
+                            status_title_update = "🛡️ Stop Movido (Break-Even)"
                         else:
-                            logger.error(f"{log_prefix} Falha ao mover Trailing SL. Erro: {sl_result.get('error', 'desconhecido')}")
+                            logger.error(f"{log_prefix} Falha ao mover SL para Break-Even. Erro: {sl_result.get('error', 'desconhecido')}")
+                    else:
+                        # Se já estamos em break-even, a lógica de trailing continua.
+                        if trade.trail_high_water_mark is None: trade.trail_high_water_mark = trade.entry_price
+                        new_hwm = trade.trail_high_water_mark
+                        if trade.side == 'LONG' and current_price > new_hwm: new_hwm = current_price
+                        elif trade.side == 'SHORT' and current_price < new_hwm: new_hwm = current_price
+
+                        if new_hwm != trade.trail_high_water_mark:
+                            logger.info(f"{log_prefix} Novo pico de preço: ${new_hwm:.4f}")
+                            trade.trail_high_water_mark = new_hwm
+
+                        trail_distance = abs(trade.entry_price - trade.stop_loss) if trade.stop_loss is not None else trade.entry_price * 0.02
+                        potential_new_sl = trade.trail_high_water_mark - trail_distance if trade.side == 'LONG' else trade.trail_high_water_mark + trail_distance
+                        
+                        is_improvement = (trade.side == 'LONG' and potential_new_sl > trade.current_stop_loss) or \
+                                         (trade.side == 'SHORT' and potential_new_sl < trade.current_stop_loss)
+                        
+                        if is_improvement:
+                            is_valid_to_set = (trade.side == 'LONG' and potential_new_sl < current_price) or \
+                                              (trade.side == 'SHORT' and potential_new_sl > current_price)
+                            if is_valid_to_set:
+                                sl_result = await modify_position_stop_loss(api_key, api_secret, trade.symbol, potential_new_sl)
+                                if sl_result.get("success"):
+                                    trade.current_stop_loss = potential_new_sl
+                                    message_was_edited = True
+                                    status_title_update = "📈 Trailing Stop Ajustado"
+                                else:
+                                    logger.error(f"{log_prefix} Falha ao mover Trailing SL. Erro: {sl_result.get('error', 'desconhecido')}")
 
             # --- LÓGICA DE EDIÇÃO DE MENSAGEM CENTRALIZADA ---
             if message_was_edited and trade.notification_message_id:
