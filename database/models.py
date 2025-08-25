@@ -39,6 +39,7 @@ class Trade(Base):
     id = Column(Integer, primary_key=True)
     user_telegram_id = Column(BigInteger, nullable=False)
     order_id = Column(String, unique=True, nullable=False)
+    notification_message_id = Column(BigInteger, nullable=True)
     symbol = Column(String, nullable=False)
     side = Column(String, nullable=False)
     qty = Column(Float, nullable=False)

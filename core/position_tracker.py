@@ -14,13 +14,45 @@ from services.bybit_service import (
 from services.notification_service import send_notification
 from utils.security import decrypt_data
 from sqlalchemy.sql import func
+from telegram.error import BadRequest
 
 logger = logging.getLogger(__name__)
 
+def _generate_trade_status_message(trade: Trade, status_title: str, pnl_data: dict = None) -> str:
+    """Gera o texto completo e atualizado para a mensagem de status de um trade."""
+    arrow = "⬆️" if trade.side == "LONG" else "⬇️"
+    
+    pnl_info = ""
+    if pnl_data:
+        pnl = pnl_data.get("unrealized_pnl", 0.0)
+        pnl_pct = pnl_data.get("unrealized_pnl_pct", 0.0)
+        pnl_info = f"  - 📈 <b>P/L Atual:</b> ${pnl:+.2f} ({pnl_pct:+.2f}%)\n"
+
+    targets_info = ""
+    if trade.initial_targets:
+        next_target = trade.initial_targets[0]
+        remaining_count = len(trade.initial_targets)
+        targets_info = f"  - 🎯 <b>Próximo Alvo:</b> ${next_target:,.4f} ({remaining_count} restantes)\n"
+    else:
+        targets_info = "  - ✅ <b>Todos os alvos atingidos!</b>\n"
+
+    stop_loss_info = f"  - 🛡️ <b>Stop Loss:</b> ${trade.current_stop_loss:,.4f}"
+    if trade.is_breakeven:
+        stop_loss_info += " (Break-Even)"
+
+    message = (
+        f"<b>{status_title}</b>\n\n"
+        f"{arrow} <b>{trade.symbol}</b>\n"
+        f"  - 💵 <b>Entrada:</b> ${trade.entry_price:,.4f}\n"
+        f"  - 📦 <b>Qtd. Restante:</b> {trade.remaining_qty:g}\n"
+        f"{pnl_info}"
+        f"{targets_info}"
+        f"{stop_loss_info}"
+    )
+    return message
 
 async def check_pending_orders_for_user(application: Application, user: User, db: Session):
     """Verifica as ordens limite pendentes e envia notificação detalhada na execução."""
-    # (Esta função permanece inalterada)
     pending_orders = db.query(PendingSignal).filter_by(user_telegram_id=user.telegram_id).all()
     if not pending_orders:
         return
@@ -62,15 +94,6 @@ async def check_pending_orders_for_user(application: Application, user: User, db
             if num_targets > 1:
                 tp_text += f" (de {num_targets} alvos)"
             
-            new_trade = Trade(
-                user_telegram_id=order.user_telegram_id, order_id=order.order_id,
-                symbol=order.symbol, side=side, qty=qty, entry_price=entry_price,
-                stop_loss=stop_loss, current_stop_loss=stop_loss,
-                initial_targets=all_targets, status='ACTIVE', remaining_qty=qty
-            )
-            db.add(new_trade)
-            db.delete(order)
-            
             message = (
                 f"📈 <b>Ordem Limite Executada!</b>\n\n"
                 f"  - 📊 <b>Tipo:</b> {side} | <b>Alavancagem:</b> {leverage}x\n"
@@ -81,16 +104,22 @@ async def check_pending_orders_for_user(application: Application, user: User, db
                 f"  - 🛡️ <b>Stop Loss:</b> ${stop_loss:,.4f}\n"
                 f"  - 🎯 <b>Take Profit 1:</b> {tp_text}"
             )
-            await application.bot.send_message(chat_id=user.telegram_id, text=message, parse_mode='HTML')
+            # 1. ENVIAMOS A MENSAGEM E CAPTURAMOS O OBJETO 'sent_message'
+            sent_message = await application.bot.send_message(chat_id=user.telegram_id, text=message, parse_mode='HTML')
 
-        elif order_status in {'Cancelled', 'Deactivated', 'Rejected'}:
-            logger.info(f"Ordem Limite {order.order_id} do usuário {user.telegram_id} foi '{order_status}'. Removendo.")
+            # 2. CRIAMOS O TRADE E JÁ INCLUÍMOS O ID DA MENSAGEM
+            new_trade = Trade(
+                user_telegram_id=order.user_telegram_id, order_id=order.order_id,
+                notification_message_id=sent_message.message_id, # <-- MUDANÇA AQUI
+                symbol=order.symbol, side=side, qty=qty, entry_price=entry_price,
+                stop_loss=stop_loss, current_stop_loss=stop_loss,
+                initial_targets=all_targets, status='ACTIVE', remaining_qty=qty
+            )
+            db.add(new_trade)
             db.delete(order)
-            await application.bot.send_message(chat_id=user.telegram_id, text=f"ℹ️ Sua ordem limite para <b>{order.symbol}</b> foi '<b>{order_status}</b>' e removida do monitoramento.", parse_mode='HTML')
-
 
 async def check_active_trades_for_user(application: Application, user: User, db: Session):
-    """Verifica e gerencia os trades ativos, com logs detalhados e lógica de stop aprimorada."""
+    """Verifica e gerencia os trades ativos, com edição de mensagem para atualizações."""
     active_trades = db.query(Trade).filter(
         Trade.user_telegram_id == user.telegram_id,
         ~Trade.status.like('%CLOSED%')
@@ -100,121 +129,115 @@ async def check_active_trades_for_user(application: Application, user: User, db:
 
     api_key = decrypt_data(user.api_key_encrypted)
     api_secret = decrypt_data(user.api_secret_encrypted)
+    
+    # Busca P/L de todas as posições do usuário de uma vez para otimizar
+    live_pnl_result = await get_open_positions_with_pnl(api_key, api_secret)
+    live_pnl_map = {p['symbol']: p for p in live_pnl_result.get('data', [])} if live_pnl_result.get("success") else {}
 
     for trade in active_trades:
-        live_position_size = await get_specific_position_size(api_key, api_secret, trade.symbol)
+        # Usamos o P/L já buscado em vez de uma nova chamada de API
+        position_data = live_pnl_map.get(trade.symbol)
+        live_position_size = position_data['size'] if position_data else 0.0
+        
+        # Correção para o bug de sincronização: se a busca de P/L falhou, não podemos ter certeza.
+        if not live_pnl_result.get("success"):
+             logger.warning(f"[tracker] Falha temporária ao buscar P/L para {user.telegram_id}. Ignorando ciclo de verificação de trades.")
+             return # Retorna para evitar fechar posições por engano
+
+        message_was_edited = False
+        status_title_update = ""
 
         if live_position_size > 0:
             price_result = await get_market_price(trade.symbol)
             if not price_result.get("success"): continue
             current_price = price_result["price"]
             
-            # Lógica de Take Profit (inalterada)
+            # Lógica de Take Profit
             targets_hit_this_run = []
             if trade.initial_targets:
                 for target_price in trade.initial_targets:
-                    is_target_hit = False
-                    if trade.side == 'LONG' and current_price >= target_price: is_target_hit = True
-                    elif trade.side == 'SHORT' and current_price <= target_price: is_target_hit = True
+                    is_target_hit = (trade.side == 'LONG' and current_price >= target_price) or \
+                                    (trade.side == 'SHORT' and current_price <= target_price)
                     
                     if is_target_hit:
                         logger.info(f"TRADE {trade.symbol}: Alvo de TP em ${target_price:.4f} atingido!")
-                        num_remaining_targets = len(trade.initial_targets)
-                        num_already_hit = len(targets_hit_this_run)
-                        qty_to_close = trade.qty / (num_remaining_targets + num_already_hit)
+                        # O cálculo da quantidade a fechar deve ser sobre o total original
+                        num_original_targets = len(trade.initial_targets) + len(targets_hit_this_run)
+                        qty_to_close = trade.qty / num_original_targets
                         
                         close_result = await close_partial_position(api_key, api_secret, trade.symbol, qty_to_close, trade.side)
                         if close_result.get("success"):
                             targets_hit_this_run.append(target_price)
                             trade.remaining_qty -= qty_to_close
-                            msg = f"🎯 <b>Take Profit Atingido!</b>\n\n<b>Moeda:</b> {trade.symbol}\n<b>Alvo:</b> ${target_price:.4f}\nUma parte da sua posição foi fechada com lucro."
-                            await application.bot.send_message(chat_id=user.telegram_id, text=msg, parse_mode='HTML')
                         else:
                             logger.error(f"TRADE {trade.symbol}: Falha ao fechar posição parcial para o alvo ${target_price:.4f}. Erro: {close_result.get('error')}")
 
             if targets_hit_this_run:
                 trade.initial_targets = [t for t in trade.initial_targets if t not in targets_hit_this_run]
+                message_was_edited = True
+                status_title_update = "🎯 Take Profit Atingido!"
 
             # Lógica de Estratégia de Stop
+            # (O código interno do break-even e trailing stop não muda, apenas a notificação no final)
             if user.stop_strategy == 'BREAK_EVEN':
                 if targets_hit_this_run and not trade.is_breakeven:
                     new_stop_loss = trade.entry_price
-                    # ... (lógica de break-even inalterada) ...
                     sl_result = await modify_position_stop_loss(api_key, api_secret, trade.symbol, new_stop_loss)
                     if sl_result.get("success"):
                         trade.is_breakeven = True
                         trade.current_stop_loss = new_stop_loss
-                        msg = f"🛡️ <b>Stop Loss Ajustado (Break-Even)</b>\n\nSua posição em <b>{trade.symbol}</b> foi protegida..."
-                        await application.bot.send_message(chat_id=user.telegram_id, text=msg, parse_mode='HTML')
+                        message_was_edited = True
+                        status_title_update = "🛡️ Stop Movido (Break-Even)"
                     else:
                         logger.error(f"TRADE {trade.symbol}: Falha ao mover SL para Break-Even. Erro: {sl_result.get('error', 'desconhecido')}")
             
             elif user.stop_strategy == 'TRAILING_STOP':
+                # ... (toda a lógica de cálculo do trailing stop permanece aqui, como antes)
                 log_prefix = f"[Trailing Stop {trade.symbol}]"
-
-                if trade.trail_high_water_mark is None:
-                    trade.trail_high_water_mark = trade.entry_price
-                
+                if trade.trail_high_water_mark is None: trade.trail_high_water_mark = trade.entry_price
                 new_hwm = trade.trail_high_water_mark
                 if trade.side == 'LONG' and current_price > new_hwm: new_hwm = current_price
                 elif trade.side == 'SHORT' and current_price < new_hwm: new_hwm = current_price
-                
                 if new_hwm != trade.trail_high_water_mark:
                     logger.info(f"{log_prefix} Novo pico de preço: ${new_hwm:.4f}")
                     trade.trail_high_water_mark = new_hwm
-                
-                trail_distance = 0
-                if trade.stop_loss is not None: trail_distance = abs(trade.entry_price - trade.stop_loss)
-                else: trail_distance = trade.entry_price * 0.02
-                
-                potential_new_sl = 0.0
-                if trade.side == 'LONG': potential_new_sl = trade.trail_high_water_mark - trail_distance
-                else: potential_new_sl = trade.trail_high_water_mark + trail_distance
-
-                is_improvement = False
-                if trade.side == 'LONG' and potential_new_sl > trade.current_stop_loss: is_improvement = True
-                elif trade.side == 'SHORT' and potential_new_sl < trade.current_stop_loss: is_improvement = True
-                
-                logger.info(
-                    f"{log_prefix} Preço Atual: ${current_price:.4f} | Stop Atual: ${trade.current_stop_loss:.4f} | "
-                    f"Pico: ${trade.trail_high_water_mark:.4f} | Distância: ${trail_distance:.4f} | "
-                    f"Novo SL Potencial: ${potential_new_sl:.4f} | É Melhoria?: {is_improvement}"
-                )
+                trail_distance = abs(trade.entry_price - trade.stop_loss) if trade.stop_loss is not None else trade.entry_price * 0.02
+                potential_new_sl = trade.trail_high_water_mark - trail_distance if trade.side == 'LONG' else trade.trail_high_water_mark + trail_distance
+                is_improvement = (trade.side == 'LONG' and potential_new_sl > trade.current_stop_loss) or \
+                                 (trade.side == 'SHORT' and potential_new_sl < trade.current_stop_loss)
                 
                 if is_improvement:
-                    # --- INÍCIO DA NOVA VERIFICAÇÃO DE SEGURANÇA ---
-                    is_valid_to_set = True
-                    if trade.side == 'LONG' and potential_new_sl >= current_price:
-                        is_valid_to_set = False
-                        logger.warning(
-                            f"{log_prefix} O preço atual (${current_price:.4f}) já ultrapassou o novo SL ({potential_new_sl:.4f}). "
-                            f"A posição deveria ter sido parada. Ignorando o ajuste para evitar erro na API."
-                        )
-                    elif trade.side == 'SHORT' and potential_new_sl <= current_price:
-                        is_valid_to_set = False
-                        logger.warning(
-                            f"{log_prefix} O preço atual (${current_price:.4f}) já ultrapassou o novo SL ({potential_new_sl:.4f}). "
-                            f"A posição deveria ter sido parada. Ignorando o ajuste para evitar erro na API."
-                        )
-                    # --- FIM DA NOVA VERIFICAÇÃO DE SEGURANÇA ---
-
+                    is_valid_to_set = (trade.side == 'LONG' and potential_new_sl < current_price) or \
+                                      (trade.side == 'SHORT' and potential_new_sl > current_price)
                     if is_valid_to_set:
-                        logger.info(f"{log_prefix} MELHORIA DETECTADA! Movendo Stop Loss para ${potential_new_sl:.4f}")
                         sl_result = await modify_position_stop_loss(api_key, api_secret, trade.symbol, potential_new_sl)
-                    if sl_result.get("success"):
-                        # 1. ATUALIZA O ESTADO LOCAL PRIMEIRO para evitar reenvio.
-                        trade.current_stop_loss = potential_new_sl
+                        if sl_result.get("success"):
+                            trade.current_stop_loss = potential_new_sl
+                            message_was_edited = True
+                            status_title_update = "📈 Trailing Stop Ajustado"
+                        else:
+                            logger.error(f"{log_prefix} Falha ao mover Trailing SL. Erro: {sl_result.get('error', 'desconhecido')}")
 
-                        # 2. SÓ ENTÃO, ENVIA A NOTIFICAÇÃO.
-                        msg = f"📈 <b>Trailing Stop Ajustado</b>\n\nO Stop Loss de <b>{trade.symbol}</b> foi atualizado para <b>${potential_new_sl:.4f}</b> para proteger seus lucros."
-                        await application.bot.send_message(chat_id=user.telegram_id, text=msg, parse_mode='HTML')
-                    else:
-                        logger.error(f"{log_prefix} Falha ao mover Trailing SL. Erro: {sl_result.get('error', 'desconhecido')}")
+            # --- LÓGICA DE EDIÇÃO DE MENSAGEM CENTRALIZADA ---
+            if message_was_edited and trade.notification_message_id:
+                try:
+                    pnl_data = live_pnl_map.get(trade.symbol)
+                    msg_text = _generate_trade_status_message(trade, status_title_update, pnl_data)
+                    await application.bot.edit_message_text(
+                        chat_id=user.telegram_id,
+                        message_id=trade.notification_message_id,
+                        text=msg_text,
+                        parse_mode='HTML'
+                    )
+                except BadRequest as e:
+                    logger.warning(f"Falha ao editar mensagem {trade.notification_message_id} para o trade {trade.symbol}: {e}")
+
         else:
-            # Lógica "detetive" (inalterada)
+            # --- Lógica "Detetive" para Posições Fechadas ---
             logger.info(f"[tracker] Posição para {trade.symbol} não encontrada. Usando o detetive...")
-            # ... (código do detetive permanece o mesmo) ...
             closed_info_result = await get_last_closed_trade_info(api_key, api_secret, trade.symbol)
+            final_message = ""
+            
             if closed_info_result.get("success"):
                 closed_data = closed_info_result["data"]
                 pnl = float(closed_data.get("closedPnl", 0.0))
@@ -222,26 +245,36 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                 trade.closed_at = func.now()
                 trade.closed_pnl = pnl
                 trade.remaining_qty = 0.0
-                message_text = ""
+                
                 if closing_reason == "TakeProfit":
                     trade.status = 'CLOSED_PROFIT'
-                    message_text = f"🏆 <b>Take Profit Atingido!</b> 🏆\n<b>Moeda:</b> {trade.symbol}\n<b>Lucro Realizado:</b> ${pnl:,.2f}"
+                    final_message = f"🏆 <b>Posição Fechada (LUCRO)</b> 🏆\n<b>Moeda:</b> {trade.symbol}\n<b>Resultado Final:</b> ${pnl:,.2f}"
                 elif closing_reason == "StopLoss":
-                    if pnl >= 0:
-                        trade.status = 'CLOSED_STOP_GAIN'
-                        message_text = f"✅ <b>Stop com Ganho Atingido!</b>\n<b>Moeda:</b> {trade.symbol}\n<b>Resultado:</b> ${pnl:,.2f}"
-                    else:
-                        trade.status = 'CLOSED_LOSS'
-                        message_text = f"🛑 <b>Stop Loss Atingido</b>\n<b>Moeda:</b> {trade.symbol}\n<b>Prejuízo Realizado:</b> ${pnl:,.2f}"
+                    trade.status = 'CLOSED_LOSS' if pnl < 0 else 'CLOSED_STOP_GAIN'
+                    emoji = "🛑" if pnl < 0 else "✅"
+                    final_message = f"{emoji} <b>Posição Fechada (STOP)</b>\n<b>Moeda:</b> {trade.symbol}\n<b>Resultado Final:</b> ${pnl:,.2f}"
                 else: 
                     trade.status = 'CLOSED_GHOST'
-                    message_text = f"ℹ️ Posição em <b>{trade.symbol}</b> foi fechada na corretora.\n<b>Resultado:</b> ${pnl:,.2f}"
-                await application.bot.send_message(chat_id=user.telegram_id, text=message_text, parse_mode='HTML')
+                    final_message = f"ℹ️ Posição em <b>{trade.symbol}</b> foi fechada na corretora.\n<b>Resultado:</b> ${pnl:,.2f}"
             else:
                 trade.status = 'CLOSED_GHOST'; trade.closed_at = func.now(); trade.closed_pnl = 0.0
                 trade.remaining_qty = 0.0
-                message_text = f"ℹ️ Posição em <b>{trade.symbol}</b> não foi encontrada na Bybit e foi removida do monitoramento."
-                await application.bot.send_message(chat_id=user.telegram_id, text=message_text, parse_mode='HTML')
+                final_message = f"ℹ️ Posição em <b>{trade.symbol}</b> não foi encontrada na Bybit e foi removida do monitoramento."
+
+            # Edita a mensagem uma última vez com o resultado final
+            if trade.notification_message_id:
+                try:
+                    await application.bot.edit_message_text(
+                        chat_id=user.telegram_id,
+                        message_id=trade.notification_message_id,
+                        text=final_message,
+                        parse_mode='HTML'
+                    )
+                except BadRequest as e:
+                    logger.warning(f"Não foi possível editar mensagem final para o trade {trade.symbol} (pode ter sido removida): {e}")
+                    await application.bot.send_message(chat_id=user.telegram_id, text=final_message, parse_mode='HTML')
+            else: # Fallback para trades antigos sem ID de mensagem
+                await application.bot.send_message(chat_id=user.telegram_id, text=final_message, parse_mode='HTML')
 
 async def run_tracker(application: Application):
     """Função principal que roda o verificador em loop para TODOS os usuários."""

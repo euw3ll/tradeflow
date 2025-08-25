@@ -759,11 +759,10 @@ async def toggle_stop_strategy_handler(update: Update, context: ContextTypes.DEF
         db.close()
     
 async def execute_manual_close_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Lida com a EXECUÇÃO do fechamento manual após a confirmação."""
+    """Lida com a EXECUÇÃO do fechamento manual, editando a mensagem original."""
     query = update.callback_query
     await query.answer("Processando fechamento...")
 
-    # O callback_data agora será 'execute_close_123'
     trade_id = int(query.data.split('_')[-1])
     user_id = update.effective_user.id
 
@@ -791,7 +790,7 @@ async def execute_manual_close_handler(update: Update, context: ContextTypes.DEF
 
         if close_result.get("success"):
             pnl = (current_price - trade_to_close.entry_price) * trade_to_close.remaining_qty if trade_to_close.side == 'LONG' else (trade_to_close.entry_price - current_price) * trade_to_close.remaining_qty
-            
+
             trade_to_close.status = 'CLOSED_MANUAL'
             trade_to_close.closed_at = func.now()
             trade_to_close.closed_pnl = pnl
@@ -804,16 +803,33 @@ async def execute_manual_close_handler(update: Update, context: ContextTypes.DEF
                 f"<b>Moeda:</b> {trade_to_close.symbol}\n"
                 f"<b>Resultado:</b> ${pnl:,.2f}"
             )
-            
-            await query.edit_message_text(message_text, parse_mode='HTML')
+
+            # --- LÓGICA DE EDIÇÃO APLICADA AQUI ---
+            if trade_to_close.notification_message_id:
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=user_id,
+                        message_id=trade_to_close.notification_message_id,
+                        text=message_text,
+                        parse_mode='HTML'
+                    )
+                except BadRequest as e:
+                    logger.warning(f"Não foi possível editar msg de fechamento manual para trade {trade_to_close.id}: {e}")
+                    # Fallback: se não conseguir editar, envia uma nova mensagem.
+                    await context.bot.send_message(chat_id=user_id, text=message_text, parse_mode='HTML')
+            else:
+                # Fallback para trades antigos sem ID de mensagem.
+                await query.edit_message_text(message_text, parse_mode='HTML')
+
             await asyncio.sleep(2)
-            await my_positions_handler(update, context)
+            await my_positions_handler(update, context) # Recarrega a lista de posições
         else:
             error_msg = close_result.get('error')
             await context.bot.send_message(
                 chat_id=user_id,
                 text=f"❌ Erro ao fechar a posição para {trade_to_close.symbol}: {error_msg}"
             )
+            await my_positions_handler(update, context) # Recarrega a lista mesmo em caso de erro
     finally:
         db.close()
 

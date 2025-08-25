@@ -73,18 +73,8 @@ async def _execute_trade(signal_data: dict, user: User, application: Application
         take_profit_1 = all_targets[0] if all_targets else "N/A"
         num_targets = len(all_targets)
 
-        new_trade = Trade(
-            user_telegram_id=user.telegram_id, order_id=order_id,
-            symbol=symbol, side=side, qty=qty, entry_price=entry_price,
-            stop_loss=stop_loss, current_stop_loss=stop_loss,
-            initial_targets=all_targets, # Garante que todos os alvos sejam salvos
-            status='ACTIVE',
-            remaining_qty=qty
-        )
-        db.add(new_trade)
-        logger.info(f"Trade {order_id} para o usuário {user.telegram_id} salvo no DB com dados de execução.")
-        
         tp_text = f"${float(take_profit_1):,.4f}" if isinstance(take_profit_1, (int, float)) else take_profit_1
+        
         if num_targets > 1:
             tp_text += f" (de {num_targets} alvos)"
 
@@ -98,10 +88,21 @@ async def _execute_trade(signal_data: dict, user: User, application: Application
             f"  - 🛡️ <b>Stop Loss:</b> ${stop_loss:,.4f}\n"
             f"  - 🎯 <b>Take Profit 1:</b> {tp_text}"
         )
-        await application.bot.send_message(chat_id=user.telegram_id, text=message, parse_mode='HTML')
-    else:
-        error_msg = order_result.get('error')
-        await application.bot.send_message(chat_id=user.telegram_id, text=f"❌ <b>Falha ao Abrir Ordem</b>\n<b>Moeda:</b> {signal_data['coin']}\n<b>Motivo:</b> {error_msg}", parse_mode='HTML')
+        # 1. ENVIAMOS A MENSAGEM E CAPTURAMOS O OBJETO 'sent_message'
+        sent_message = await application.bot.send_message(chat_id=user.telegram_id, text=message, parse_mode='HTML')
+
+        # 2. CRIAMOS O TRADE E JÁ INCLUÍMOS O ID DA MENSAGEM
+        new_trade = Trade(
+            user_telegram_id=user.telegram_id, order_id=order_id,
+            notification_message_id=sent_message.message_id, # <-- MUDANÇA AQUI
+            symbol=symbol, side=side, qty=qty, entry_price=entry_price,
+            stop_loss=stop_loss, current_stop_loss=stop_loss,
+            initial_targets=all_targets,
+            status='ACTIVE',
+            remaining_qty=qty
+        )
+        db.add(new_trade)
+        logger.info(f"Trade {order_id} para o usuário {user.telegram_id} salvo no DB com dados de execução.")
 
 async def process_new_signal(signal_data: dict, application: Application, source_name: str):
     """Processa um novo sinal, verificando a preferência de cada usuário individualmente."""
