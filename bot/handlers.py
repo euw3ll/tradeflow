@@ -35,6 +35,7 @@ from sqlalchemy.sql import func
 (ASKING_ENTRY_PERCENT, ASKING_MAX_LEVERAGE, ASKING_MIN_CONFIDENCE) = range(10, 13)
 (ASKING_PROFIT_TARGET, ASKING_LOSS_LIMIT) = range(13, 15)
 ASKING_STOP_GAIN_TRIGGER, ASKING_STOP_GAIN_LOCK = range(16, 18)
+ASKING_CIRCUIT_THRESHOLD, ASKING_CIRCUIT_PAUSE = range(18, 20)
 ASKING_COIN_WHITELIST = 15
 
 logger = logging.getLogger(__name__)
@@ -1326,4 +1327,74 @@ async def receive_stop_gain_lock(update: Update, context: ContextTypes.DEFAULT_T
         await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit,
             text="❌ Valor inválido. Envie um número (ex: 0.5).")
         return ASKING_STOP_GAIN_LOCK
+    return ConversationHandler.END
+
+async def ask_circuit_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Pergunta o gatilho de perdas do Disjuntor."""
+    query = update.callback_query
+    await query.answer()
+    context.user_data['settings_message_id'] = query.message.message_id
+    await query.edit_message_text(
+        "Envie o número de perdas ativas para ATIVAR o disjuntor.\n\n"
+        "Exemplo: `3`. Se houver 3 ou mais trades perdendo na mesma direção, o bot pausa.\n"
+        "Envie `0` para desativar."
+    )
+    return ASKING_CIRCUIT_THRESHOLD
+
+async def receive_circuit_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Recebe e salva o gatilho do Disjuntor."""
+    user_id = update.effective_user.id
+    message_id_to_edit = context.user_data.get('settings_message_id')
+    await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id)
+    try:
+        value = int(update.message.text)
+        if not (0 <= value <= 20): raise ValueError("Valor fora do range")
+
+        db = SessionLocal()
+        try:
+            user = db.query(User).filter_by(telegram_id=user_id).first()
+            user.circuit_breaker_threshold = value
+            db.commit()
+            feedback = f"✅ Disjuntor ativado para {value} perdas." if value > 0 else "✅ Disjuntor desativado."
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit,
+                text=feedback, reply_markup=settings_menu_keyboard(user))
+        finally:
+            db.close()
+    except (ValueError, TypeError):
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit,
+            text="❌ Valor inválido. Envie um número inteiro (ex: 3).")
+        return ASKING_CIRCUIT_THRESHOLD
+    return ConversationHandler.END
+
+async def ask_circuit_pause(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Pergunta o tempo de pausa do Disjuntor."""
+    query = update.callback_query
+    await query.answer()
+    context.user_data['settings_message_id'] = query.message.message_id
+    await query.edit_message_text("Envie o tempo em MINUTOS que o bot ficará pausado após o disjuntor ser ativado.\n\nExemplo: `60`.")
+    return ASKING_CIRCUIT_PAUSE
+
+async def receive_circuit_pause(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Recebe e salva o tempo de pausa do Disjuntor."""
+    user_id = update.effective_user.id
+    message_id_to_edit = context.user_data.get('settings_message_id')
+    await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id)
+    try:
+        value = int(update.message.text)
+        if not (1 <= value <= 1440): raise ValueError("Valor fora do range")
+
+        db = SessionLocal()
+        try:
+            user = db.query(User).filter_by(telegram_id=user_id).first()
+            user.circuit_breaker_pause_minutes = value
+            db.commit()
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit,
+                text=f"✅ Tempo de pausa do disjuntor atualizado para {value} minutos.",
+                reply_markup=settings_menu_keyboard(user))
+        finally:
+            db.close()
+    except (ValueError, TypeError):
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit,
+            text="❌ Valor inválido. Envie um número inteiro (ex: 60).")
+        return ASKING_CIRCUIT_PAUSE
     return ConversationHandler.END

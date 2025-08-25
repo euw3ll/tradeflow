@@ -25,7 +25,9 @@ from bot.handlers import (
     prompt_manual_close_handler, execute_manual_close_handler,
     toggle_bot_status_handler,
     ask_stop_gain_trigger, receive_stop_gain_trigger, ASKING_STOP_GAIN_TRIGGER,
-    ask_stop_gain_lock, receive_stop_gain_lock, ASKING_STOP_GAIN_LOCK
+    ask_stop_gain_lock, receive_stop_gain_lock, ASKING_STOP_GAIN_LOCK,
+    ask_circuit_threshold, receive_circuit_threshold, ASKING_CIRCUIT_THRESHOLD,
+    ask_circuit_pause, receive_circuit_pause, ASKING_CIRCUIT_PAUSE
 )
 from database.session import init_db
 from services.telethon_service import start_signal_monitor
@@ -123,6 +125,16 @@ async def main():
         states={ ASKING_STOP_GAIN_LOCK: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_stop_gain_lock)] },
         fallbacks=[CommandHandler("cancel", cancel)], per_message=False, per_user=True,
     )
+    circuit_threshold_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(ask_circuit_threshold, pattern='^set_circuit_threshold$')],
+        states={ ASKING_CIRCUIT_THRESHOLD: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_circuit_threshold)] },
+        fallbacks=[CommandHandler("cancel", cancel)], per_message=False, per_user=True,
+    )
+    circuit_pause_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(ask_circuit_pause, pattern='^set_circuit_pause$')],
+        states={ ASKING_CIRCUIT_PAUSE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_circuit_pause)] },
+        fallbacks=[CommandHandler("cancel", cancel)], per_message=False, per_user=True,
+    )
 
     # Adicionando todos os handlers
     application.add_handler(register_conv)
@@ -164,6 +176,10 @@ async def main():
     application.add_handler(CallbackQueryHandler(toggle_approval_mode_handler, pattern='^toggle_approval_mode$'))
 
     application.add_handler(CallbackQueryHandler(handle_signal_approval, pattern=r'^(approve_signal_|reject_signal_)'))
+
+    application.add_handler(stop_gain_lock_conv)
+    application.add_handler(circuit_threshold_conv)
+    application.add_handler(circuit_pause_conv)
 
 
     logger.info("Bot configurado. Iniciando todos os serviços...")

@@ -211,7 +211,7 @@ async def get_market_price(symbol: str) -> dict:
             return {"success": False, "error": str(e)}
     return await asyncio.to_thread(_sync_call)
 
-async def close_partial_position(api_key: str, api_secret: str, symbol: str, qty_to_close: float, side: str) -> dict:
+async def close_partial_position(api_key: str, api_secret: str, symbol: str, qty_to_close: float, side: str, position_idx: int) -> dict:
     """Fecha parte de uma posição com Market/ReduceOnly, usando o novo sistema de regras."""
     async def pre_flight_checks():
         if symbol not in INSTRUMENT_INFO_CACHE:
@@ -234,19 +234,11 @@ async def close_partial_position(api_key: str, api_secret: str, symbol: str, qty
             if qty_adj < instrument_rules["minOrderQty"]:
                 logger.warning(f"Quantidade a fechar para {symbol} ({qty_adj:f}) é menor que o mínimo permitido. Ignorando fechamento parcial.")
                 return {"success": True, "skipped": True, "reason": "qty_less_than_min_order_qty"}
-
-            # MUDANÇA: Adiciona a lógica para o Modo Hedge (positionIdx)
-            # 0 = One-Way, 1 = Posição de Compra (Hedge), 2 = Posição de Venda (Hedge)
-            position_idx = 0 
-            if side == 'LONG':    # Se a posição original que queremos fechar é LONG...
-                position_idx = 1  # ...então estamos afetando o "lado" da COMPRA.
-            elif side == 'SHORT': # Se a posição original que queremos fechar é SHORT...
-                position_idx = 2  # ...então estamos afetando o "lado" da VENDA.
-
+            
             response = session.place_order(
                 category="linear", symbol=symbol, side=close_side,
                 orderType="Market", qty=str(qty_adj), reduceOnly=True,
-                positionIdx=position_idx # <-- Usamos o valor recebido
+                positionIdx=position_idx # <-- O parâmetro que estava faltando na definição
             )
             if response.get('retCode') == 0:
                 return {"success": True, "data": response['result']}
