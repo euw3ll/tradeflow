@@ -220,29 +220,33 @@ async def close_partial_position(api_key: str, api_secret: str, symbol: str, qty
 
     def _sync_call(instrument_rules: Dict[str, Any]):
         try:
-            # 1. VALIDAÇÃO DAS REGRAS
             if not instrument_rules or not instrument_rules.get("success"):
                 return instrument_rules or {"success": False, "error": f"Regras para {symbol} não encontradas."}
 
             session = get_session(api_key, api_secret)
             close_side = "Sell" if side == 'LONG' else "Buy"
 
-            # 2. CÁLCULO DE QUANTIDADE
             qty_raw = Decimal(str(qty_to_close))
             qty_adj = _round_down_to_step(qty_raw, instrument_rules["qtyStep"])
 
             logger.info(f"[bybit_service] close_partial {symbol}: raw={qty_raw}, step={instrument_rules['qtyStep']}, minQty={instrument_rules['minOrderQty']} => adj={qty_adj}")
 
             if qty_adj < instrument_rules["minOrderQty"]:
-                # Se a quantidade a ser fechada for menor que o mínimo, ignoramos a operação
-                # Isso não é um erro, apenas não há o que fazer.
                 logger.warning(f"Quantidade a fechar para {symbol} ({qty_adj:f}) é menor que o mínimo permitido. Ignorando fechamento parcial.")
                 return {"success": True, "skipped": True, "reason": "qty_less_than_min_order_qty"}
 
-            # 3. EXECUÇÃO
+            # MUDANÇA: Adiciona a lógica para o Modo Hedge (positionIdx)
+            # 0 = One-Way, 1 = Posição de Compra (Hedge), 2 = Posição de Venda (Hedge)
+            position_idx = 0 
+            if side == 'LONG':    # Se a posição original que queremos fechar é LONG...
+                position_idx = 1  # ...então estamos afetando o "lado" da COMPRA.
+            elif side == 'SHORT': # Se a posição original que queremos fechar é SHORT...
+                position_idx = 2  # ...então estamos afetando o "lado" da VENDA.
+
             response = session.place_order(
                 category="linear", symbol=symbol, side=close_side,
-                orderType="Market", qty=str(qty_adj), reduceOnly=True
+                orderType="Market", qty=str(qty_adj), reduceOnly=True,
+                positionIdx=position_idx # <-- PARÂMETRO ADICIONADO AQUI
             )
             if response.get('retCode') == 0:
                 return {"success": True, "data": response['result']}
@@ -259,7 +263,6 @@ async def close_partial_position(api_key: str, api_secret: str, symbol: str, qty
     except Exception as e:
         logger.error(f"Exceção em close_partial_position (async): {e}", exc_info=True)
         return {"success": False, "error": str(e)}
-
 
 async def modify_position_stop_loss(api_key: str, api_secret: str, symbol: str, new_stop_loss: float) -> dict:
     """Modifica o Stop Loss de uma posição aberta, garantindo a precisão do preço (tick size)."""
