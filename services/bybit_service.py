@@ -31,7 +31,7 @@ async def get_instrument_info(symbol: str) -> Dict[str, Any]:
     def _sync_call():
         try:
             # Sessão não autenticada com timeout (sem 'retries')
-            session = HTTP(testnet=False, timeout=30) # <-- CORRIGIDO AQUI
+            session = HTTP(testnet=False, timeout=30)
             response = session.get_instruments_info(category="linear", symbol=symbol)
             
             if response.get("retCode") != 0:
@@ -199,7 +199,7 @@ async def get_market_price(symbol: str) -> dict:
     """Busca o preço de mercado atual de forma assíncrona."""
     def _sync_call():
         try:
-            session = HTTP(testnet=False)
+            session = HTTP(testnet=False, timeout=30)
             response = session.get_tickers(category="linear", symbol=symbol)
             if response.get('retCode') == 0 and response['result']['list']:
                 price = float(response['result']['list'][0]['lastPrice'])
