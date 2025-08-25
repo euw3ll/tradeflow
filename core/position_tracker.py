@@ -234,7 +234,16 @@ async def check_active_trades_for_user(application: Application, user: User, db:
 
                         qty_to_close = trade.qty / trade.total_initial_targets
                         
-                        close_result = await close_partial_position(api_key, api_secret, trade.symbol, qty_to_close, trade.side)
+                        position_idx_to_close = position_data.get('position_idx', 0)
+                        
+                        close_result = await close_partial_position(
+                            api_key, 
+                            api_secret, 
+                            trade.symbol, 
+                            qty_to_close, 
+                            trade.side,
+                            position_idx_to_close # <-- Passamos o position_idx correto
+                        )
                         if close_result.get("success"):
                             targets_hit_this_run.append(target_price)
                             trade.remaining_qty -= qty_to_close

@@ -246,7 +246,7 @@ async def close_partial_position(api_key: str, api_secret: str, symbol: str, qty
             response = session.place_order(
                 category="linear", symbol=symbol, side=close_side,
                 orderType="Market", qty=str(qty_adj), reduceOnly=True,
-                positionIdx=position_idx # <-- PARÂMETRO ADICIONADO AQUI
+                positionIdx=position_idx # <-- Usamos o valor recebido
             )
             if response.get('retCode') == 0:
                 return {"success": True, "data": response['result']}
@@ -586,6 +586,7 @@ async def get_open_positions_with_pnl(api_key: str, api_secret: str) -> dict:
                     "mark": mark,
                     "unrealized_pnl": pnl,
                     "unrealized_pnl_pct": pnl_pct,
+                    "position_idx": int(p.get("positionIdx", 0))
                 })
             return {"success": True, "data": out}
         except Exception as e:
