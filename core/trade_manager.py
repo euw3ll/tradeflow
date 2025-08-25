@@ -68,7 +68,6 @@ async def _execute_trade(signal_data: dict, user: User, application: Application
         margin = (qty * entry_price) / leverage if leverage > 0 else 0
         stop_loss = signal_data['stop_loss']
         
-        # --- LÓGICA DE NOTIFICAÇÃO CORRIGIDA ---
         all_targets = signal_data.get('targets') or []
         take_profit_1 = all_targets[0] if all_targets else "N/A"
         num_targets = len(all_targets)
@@ -78,8 +77,15 @@ async def _execute_trade(signal_data: dict, user: User, application: Application
         if num_targets > 1:
             tp_text += f" (de {num_targets} alvos)"
 
+        # Adiciona a linha de Confiança à mensagem, se o dado existir.
+        confidence_text = ""
+        signal_confidence = signal_data.get('confidence')
+        if signal_confidence is not None:
+            confidence_text = f"  - 🟢 <b>Confiança:</b> {signal_confidence:.2f}%\n"
+
         message = (
             f"📈 <b>Ordem a Mercado Aberta!</b>\n\n"
+            f"{confidence_text}"
             f"  - 📊 <b>Tipo:</b> {side} | <b>Alavancagem:</b> {leverage}x\n"
             f"  - 💎 <b>Moeda:</b> {symbol}\n"
             f"  - 🔢 <b>Quantidade:</b> {qty:g}\n"
@@ -88,13 +94,11 @@ async def _execute_trade(signal_data: dict, user: User, application: Application
             f"  - 🛡️ <b>Stop Loss:</b> ${stop_loss:,.4f}\n"
             f"  - 🎯 <b>Take Profit 1:</b> {tp_text}"
         )
-        # 1. ENVIAMOS A MENSAGEM E CAPTURAMOS O OBJETO 'sent_message'
         sent_message = await application.bot.send_message(chat_id=user.telegram_id, text=message, parse_mode='HTML')
 
-        # 2. CRIAMOS O TRADE E JÁ INCLUÍMOS O ID DA MENSAGEM
         new_trade = Trade(
             user_telegram_id=user.telegram_id, order_id=order_id,
-            notification_message_id=sent_message.message_id, # <-- MUDANÇA AQUI
+            notification_message_id=sent_message.message_id,
             symbol=symbol, side=side, qty=qty, entry_price=entry_price,
             stop_loss=stop_loss, current_stop_loss=stop_loss,
             initial_targets=all_targets,
@@ -251,7 +255,6 @@ async def _execute_limit_order_for_user(signal_data: dict, user: User, applicati
     if limit_order_result.get("success"):
         order_id = limit_order_result["data"]["orderId"]
         
-        # --- LÓGICA DE NOTIFICAÇÃO COMPLETA ---
         all_targets = signal_data.get('targets') or []
         take_profit_1 = all_targets[0] if all_targets else "N/A"
         num_targets = len(all_targets)
@@ -259,8 +262,15 @@ async def _execute_limit_order_for_user(signal_data: dict, user: User, applicati
         if num_targets > 1:
             tp_text += f" (de {num_targets} alvos)"
         
+        # Adiciona a linha de Confiança à mensagem, se o dado existir.
+        confidence_text = ""
+        signal_confidence = signal_data.get('confidence')
+        if signal_confidence is not None:
+            confidence_text = f"  - 🟢 <b>Confiança:</b> {signal_confidence:.2f}%\n"
+
         message = (
             f"✅ <b>Ordem Limite Posicionada!</b>\n\n"
+            f"{confidence_text}"
             f"  - 📊 <b>Tipo:</b> {signal_data.get('order_type')} | <b>Alavancagem:</b> {user.max_leverage}x\n"
             f"  - 💎 <b>Moeda:</b> {symbol}\n"
             f"  - 🎯 <b>Preço de Entrada:</b> ${limit_price:,.4f}\n"
@@ -268,7 +278,7 @@ async def _execute_limit_order_for_user(signal_data: dict, user: User, applicati
             f"  - 🎯 <b>Take Profit 1:</b> {tp_text}\n\n"
             f"👀 Monitorando a execução…"
         )
-        
+   
         sent_message = await application.bot.send_message(chat_id=user.telegram_id, text=message, parse_mode='HTML')
         
         db.add(PendingSignal(

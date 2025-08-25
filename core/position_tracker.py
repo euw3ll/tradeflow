@@ -163,29 +163,26 @@ async def check_active_trades_for_user(application: Application, user: User, db:
     api_key = decrypt_data(user.api_key_encrypted)
     api_secret = decrypt_data(user.api_secret_encrypted)
     
-    # Busca P/L de todas as posições do usuário de uma vez para otimizar
     live_pnl_result = await get_open_positions_with_pnl(api_key, api_secret)
     live_pnl_map = {p['symbol']: p for p in live_pnl_result.get('data', [])} if live_pnl_result.get("success") else {}
 
     for trade in active_trades:
-        # Usamos o P/L já buscado em vez de uma nova chamada de API
         position_data = live_pnl_map.get(trade.symbol)
-        live_position_size = position_data['size'] if position_data else 0.0
+        live_position_size = float(position_data['size']) if position_data else 0.0
         
-        # Correção para o bug de sincronização: se a busca de P/L falhou, não podemos ter certeza.
         if not live_pnl_result.get("success"):
              logger.warning(f"[tracker] Falha temporária ao buscar P/L para {user.telegram_id}. Ignorando ciclo de verificação de trades.")
-             return # Retorna para evitar fechar posições por engano
+             return
 
         message_was_edited = False
         status_title_update = ""
+        current_price = 0.0
 
         if live_position_size > 0:
             price_result = await get_market_price(trade.symbol)
             if not price_result.get("success"): continue
             current_price = price_result["price"]
             
-            # Lógica de Take Profit
             targets_hit_this_run = []
             if trade.initial_targets:
                 for target_price in trade.initial_targets:
@@ -194,9 +191,6 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                     
                     if is_target_hit:
                         logger.info(f"TRADE {trade.symbol}: Alvo de TP em ${target_price:.4f} atingido!")
-                        # MUDANÇA: O cálculo da quantidade a fechar agora usa o valor
-                        # imutável 'total_initial_targets' para garantir a fração correta.
-                        # Adicionada também uma verificação para evitar divisão por zero.
                         if not trade.total_initial_targets or trade.total_initial_targets <= 0:
                             logger.warning(f"TRADE {trade.symbol}: O campo 'total_initial_targets' é inválido ({trade.total_initial_targets}). Impossível calcular fechamento parcial.")
                             continue
@@ -215,8 +209,6 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                 message_was_edited = True
                 status_title_update = "🎯 Take Profit Atingido!"
 
-            # Lógica de Estratégia de Stop
-            # (O código interno do break-even e trailing stop não muda, apenas a notificação no final)
             if user.stop_strategy == 'BREAK_EVEN':
                 if targets_hit_this_run and not trade.is_breakeven:
                     new_stop_loss = trade.entry_price
@@ -230,17 +222,12 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                         logger.error(f"TRADE {trade.symbol}: Falha ao mover SL para Break-Even. Erro: {sl_result.get('error', 'desconhecido')}")
             
             elif user.stop_strategy == 'TRAILING_STOP':
-                # MUDANÇA: A lógica de trailing stop só será ativada APÓS o primeiro TP ser atingido.
-                # Verificamos se a contagem de alvos restantes é menor que a contagem original.
                 first_tp_hit = trade.total_initial_targets is not None and \
                                trade.initial_targets is not None and \
                                len(trade.initial_targets) < trade.total_initial_targets
 
                 if first_tp_hit:
                     log_prefix = f"[Trailing Stop {trade.symbol}]"
-
-                    # Se for a primeira vez que movemos o stop (após o TP1),
-                    # garantimos que ele vá para o break-even primeiro.
                     if not trade.is_breakeven:
                         new_stop_loss = trade.entry_price
                         logger.info(f"{log_prefix} Primeiro alvo atingido. Movendo SL para Break-Even em ${new_stop_loss:.4f}.")
@@ -254,7 +241,6 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                         else:
                             logger.error(f"{log_prefix} Falha ao mover SL para Break-Even. Erro: {sl_result.get('error', 'desconhecido')}")
                     else:
-                        # Se já estamos em break-even, a lógica de trailing continua.
                         if trade.trail_high_water_mark is None: trade.trail_high_water_mark = trade.entry_price
                         new_hwm = trade.trail_high_water_mark
                         if trade.side == 'LONG' and current_price > new_hwm: new_hwm = current_price
@@ -282,11 +268,10 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                                 else:
                                     logger.error(f"{log_prefix} Falha ao mover Trailing SL. Erro: {sl_result.get('error', 'desconhecido')}")
 
-            # --- LÓGICA DE EDIÇÃO DE MENSAGEM CENTRALIZADA ---
             if message_was_edited and trade.notification_message_id:
                 try:
                     pnl_data = live_pnl_map.get(trade.symbol)
-                    msg_text = _generate_trade_status_message(trade, status_title_update, pnl_data)
+                    msg_text = _generate_trade_status_message(trade, status_title_update, pnl_data, current_price)
                     await application.bot.edit_message_text(
                         chat_id=user.telegram_id,
                         message_id=trade.notification_message_id,
@@ -295,9 +280,25 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                     )
                 except BadRequest as e:
                     logger.warning(f"Falha ao editar mensagem {trade.notification_message_id} para o trade {trade.symbol}: {e}")
+                    if "Message to edit not found" in str(e) or "message can't be edited" in str(e):
+                        logger.info(f"Mensagem {trade.notification_message_id} parece ter sido apagada. Recriando...")
+                        try:
+                            pnl_data = live_pnl_map.get(trade.symbol)
+                            msg_text = _generate_trade_status_message(trade, "🔄 Status Sincronizado", pnl_data, current_price)
+                            
+                            new_message = await application.bot.send_message(
+                                chat_id=user.telegram_id,
+                                text=msg_text,
+                                parse_mode='HTML'
+                            )
+                            
+                            trade.notification_message_id = new_message.message_id
+                            db.commit()
+                            logger.info(f"Mensagem de trade para {trade.symbol} recriada com novo ID: {new_message.message_id}")
+                        except Exception as send_e:
+                            logger.error(f"Falha CRÍTICA ao tentar recriar a mensagem de status para {trade.symbol}: {send_e}", exc_info=True)
 
         else:
-            # --- Lógica "Detetive" para Posições Fechadas ---
             logger.info(f"[tracker] Posição para {trade.symbol} não encontrada. Usando o detetive...")
             closed_info_result = await get_last_closed_trade_info(api_key, api_secret, trade.symbol)
             final_message = ""
@@ -321,11 +322,12 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                     trade.status = 'CLOSED_GHOST'
                     final_message = f"ℹ️ Posição em <b>{trade.symbol}</b> foi fechada na corretora.\n<b>Resultado:</b> ${pnl:,.2f}"
             else:
-                trade.status = 'CLOSED_GHOST'; trade.closed_at = func.now(); trade.closed_pnl = 0.0
+                trade.status = 'CLOSED_GHOST'
+                trade.closed_at = func.now()
+                trade.closed_pnl = 0.0
                 trade.remaining_qty = 0.0
                 final_message = f"ℹ️ Posição em <b>{trade.symbol}</b> não foi encontrada na Bybit e foi removida do monitoramento."
-
-            # Edita a mensagem uma última vez com o resultado final
+            
             if trade.notification_message_id:
                 try:
                     await application.bot.edit_message_text(
@@ -337,7 +339,7 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                 except BadRequest as e:
                     logger.warning(f"Não foi possível editar mensagem final para o trade {trade.symbol} (pode ter sido removida): {e}")
                     await application.bot.send_message(chat_id=user.telegram_id, text=final_message, parse_mode='HTML')
-            else: # Fallback para trades antigos sem ID de mensagem
+            else:
                 await application.bot.send_message(chat_id=user.telegram_id, text=final_message, parse_mode='HTML')
 
 async def run_tracker(application: Application):
