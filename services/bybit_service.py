@@ -74,6 +74,81 @@ def get_session(api_key: str, api_secret: str) -> HTTP:
         recv_window=10000 
     )
 
+def _resolve_position_index(session, symbol: str, close_side: str) -> Dict[str, Any]:
+    """
+    Descobre o mode (One-Way vs Hedge) e qual positionIdx usar (ou omitir) ao reduzir posição.
+    - One-Way: não enviar positionIdx (ou usar 0).
+    - Hedge: usar 1 (Long/Buy) para reduzir LONG; usar 2 (Short/Sell) para reduzir SHORT.
+
+    close_side: "Buy" ou "Sell" (lado da ORDEM de fechamento, não o 'trade.side').
+    Retorna:
+      {
+        "mode": "one_way" | "hedge" | "unknown",
+        "positionIdx": int | None,  # None => omitir no payload
+        "position_found": bool,     # se há posição aberta detectada
+        "details": {...}            # dados brutos mínimos para log/inspeção
+      }
+    """
+    try:
+        resp = session.get_positions(category="linear", symbol=symbol)
+        if resp.get("retCode") != 0:
+            logger.warning(f"[bybit_service] _resolve_position_index: falha em get_positions para {symbol}: {resp.get('retMsg')}")
+            # fallback seguro: omitir positionIdx
+            return {"mode": "unknown", "positionIdx": None, "position_found": False, "details": {"reason": "api_error"}}
+
+        items = (resp.get("result", {}) or {}).get("list", []) or []
+        # Normalizações úteis
+        positions_nonzero = [p for p in items if float(p.get("size") or 0) > 0]
+        idxs = {int(p.get("positionIdx") or 0) for p in items}
+
+        # Heurística de detecção:
+        # - One-Way geralmente retorna positionIdx 0 (ou único item), e só existe um lado efetivo.
+        # - Hedge usa 1 (Long/Buy) e 2 (Short/Sell). Pode retornar dois itens para o símbolo.
+        mode = "one_way"
+        if 1 in idxs or 2 in idxs:
+            mode = "hedge"
+        elif len(items) > 1:
+            # Vários itens mas sem 1/2 explícitos — trate como hedge por segurança
+            mode = "hedge"
+
+        # Mapeia qual idx usar conforme o lado que será reduzido
+        # close_side = "Sell" se trade era LONG; "Buy" se trade era SHORT.
+        position_idx = None
+        position_found = False
+
+        if mode == "hedge":
+            # Encontre a posição correspondente ao lado que será reduzido
+            # Em Hedge, Buy = LONG (idx 1), Sell = SHORT (idx 2)
+            desired_idx = 1 if close_side == "Sell" else 2
+            for p in items:
+                if int(p.get("positionIdx") or 0) == desired_idx and float(p.get("size") or 0) > 0:
+                    position_found = True
+                    break
+            # Mesmo que size=0, ainda usamos o idx “correto” para o lado.
+            position_idx = desired_idx
+
+        elif mode == "one_way":
+            # Em One-Way, omita o campo (ou use 0). Preferimos omitir para evitar 10001.
+            # Verifica se existe alguma posição aberta > 0
+            position_found = any(positions_nonzero)
+            position_idx = None  # omitir
+
+        details = {
+            "raw_count": len(items),
+            "idxs": sorted(list(idxs)),
+            "close_side": close_side,
+            "positions_nonzero": len(positions_nonzero),
+        }
+
+        logger.info(f"[bybit_service] _resolve_position_index {symbol}: mode={mode}, close_side={close_side}, use_idx={position_idx}, found={position_found}, details={details}")
+        return {"mode": mode, "positionIdx": position_idx, "position_found": position_found, "details": details}
+
+    except Exception as e:
+        logger.error(f"Exceção em _resolve_position_index para {symbol}: {e}", exc_info=True)
+        # fallback seguro: omitir positionIdx
+        return {"mode": "unknown", "positionIdx": None, "position_found": False, "details": {"reason": "exception", "error": str(e)}}
+
+
 async def get_account_info(api_key: str, api_secret: str) -> dict:
     """Busca o saldo da conta, calculando o saldo disponível para Contas Unificadas."""
     def _sync_call():
@@ -179,6 +254,7 @@ async def place_order(api_key: str, api_secret: str, signal_data: dict, user_set
                 if "leverage not modified" in str(e).lower(): logger.warning(f"Alavancagem para {symbol} já está correta. Continuando...")
                 else: return {"success": False, "error": str(e)}
             
+            _safe_log_order_payload("place_order:market_entry", payload)
             response = session.place_order(**{k: v for k, v in payload.items() if v is not None})
             if response.get('retCode') == 0: return {"success": True, "data": response['result']}
             return {"success": False, "error": response.get('retMsg')}
@@ -212,7 +288,11 @@ async def get_market_price(symbol: str) -> dict:
     return await asyncio.to_thread(_sync_call)
 
 async def close_partial_position(api_key: str, api_secret: str, symbol: str, qty_to_close: float, side: str, position_idx: int) -> dict:
-    """Fecha parte de uma posição com Market/ReduceOnly, usando o novo sistema de regras."""
+    """Fecha parte de uma posição com Market/ReduceOnly.
+    - Detecta automaticamente One-Way vs Hedge e aplica/omite positionIdx.
+    - Em erro 10001 (position idx not match), faz 1 retry alternando a estratégia.
+    - Logs estruturados do payload e do retry.
+    """
     async def pre_flight_checks():
         if symbol not in INSTRUMENT_INFO_CACHE:
             await get_instrument_info(symbol)
@@ -228,22 +308,63 @@ async def close_partial_position(api_key: str, api_secret: str, symbol: str, qty
 
             qty_raw = Decimal(str(qty_to_close))
             qty_adj = _round_down_to_step(qty_raw, instrument_rules["qtyStep"])
-
             logger.info(f"[bybit_service] close_partial {symbol}: raw={qty_raw}, step={instrument_rules['qtyStep']}, minQty={instrument_rules['minOrderQty']} => adj={qty_adj}")
 
             if qty_adj < instrument_rules["minOrderQty"]:
                 logger.warning(f"Quantidade a fechar para {symbol} ({qty_adj:f}) é menor que o mínimo permitido. Ignorando fechamento parcial.")
                 return {"success": True, "skipped": True, "reason": "qty_less_than_min_order_qty"}
-            
-            response = session.place_order(
-                category="linear", symbol=symbol, side=close_side,
-                orderType="Market", qty=str(qty_adj), reduceOnly=True,
-                positionIdx=position_idx # <-- O parâmetro que estava faltando na definição
-            )
-            if response.get('retCode') == 0:
-                return {"success": True, "data": response['result']}
-            else:
-                return {"success": False, "error": response.get('retMsg')}
+
+            resolve = _resolve_position_index(session, symbol, close_side)
+            mode = resolve.get("mode", "unknown")
+            auto_idx = resolve.get("positionIdx", None)
+            logger.info(f"[bybit_service] resolver: symbol={symbol}, mode={mode}, auto_idx={auto_idx}, hint_idx={position_idx}, close_side={close_side}, details={resolve.get('details')}")
+
+            payload = {
+                "category": "linear",
+                "symbol": symbol,
+                "side": close_side,
+                "orderType": "Market",
+                "qty": str(qty_adj),
+                "reduceOnly": True,
+            }
+            if auto_idx is not None:
+                payload["positionIdx"] = auto_idx
+
+            def _try_place(p):
+                _safe_log_order_payload("close_partial:first_try", p)
+                return session.place_order(**p)
+
+            try:
+                response = _try_place(payload)
+                if response.get('retCode') == 0:
+                    return {"success": True, "data": response['result']}
+                msg = response.get('retMsg', '')
+                if "position idx not match" in msg.lower():
+                    raise InvalidRequestError(msg)
+                return {"success": False, "error": msg}
+
+            except InvalidRequestError as e:
+                text = str(e).lower()
+                if ("position idx not match" in text) or ("10001" in text):
+                    alt_payload = dict(payload)
+                    if "positionIdx" in alt_payload:
+                        alt_payload.pop("positionIdx", None)
+                        alt_strategy = "remove_positionIdx"
+                    else:
+                        alt_payload["positionIdx"] = 1 if close_side == "Sell" else 2
+                        alt_strategy = f"force_positionIdx_{alt_payload['positionIdx']}"
+
+                    logger.warning(f"[bybit_service] 10001 detectado para {symbol}. Retry com '{alt_strategy}'.")
+                    try:
+                        _safe_log_order_payload("close_partial:retry", alt_payload)
+                        resp2 = session.place_order(**alt_payload)
+                        if resp2.get('retCode') == 0:
+                            logger.info(f"[bybit_service] retry sucesso para {symbol} com estratégia '{alt_strategy}'.")
+                            return {"success": True, "data": resp2['result'], "retry": True, "retry_strategy": alt_strategy}
+                        return {"success": False, "error": resp2.get('retMsg', 'Falha no retry 10001'), "retry": True, "retry_strategy": alt_strategy}
+                    except InvalidRequestError as e2:
+                        return {"success": False, "error": str(e2), "retry": True, "retry_strategy": alt_strategy}
+                return {"success": False, "error": str(e)}
 
         except Exception as e:
             logger.error(f"Exceção ao fechar posição parcial: {e}", exc_info=True)
@@ -255,6 +376,7 @@ async def close_partial_position(api_key: str, api_secret: str, symbol: str, qty
     except Exception as e:
         logger.error(f"Exceção em close_partial_position (async): {e}", exc_info=True)
         return {"success": False, "error": str(e)}
+
 
 async def modify_position_stop_loss(api_key: str, api_secret: str, symbol: str, new_stop_loss: float) -> dict:
     """Modifica o Stop Loss de uma posição aberta, garantindo a precisão do preço (tick size)."""
@@ -277,24 +399,18 @@ async def modify_position_stop_loss(api_key: str, api_secret: str, symbol: str, 
 
         # 3. Executa a chamada à API em uma thread separada
         def _sync_call():
-            try: # <-- NOVO BLOCO TRY
+            try:
                 session = get_session(api_key, api_secret)
-                response = session.set_trading_stop(
-                    category="linear",
-                    symbol=symbol,
-                    stopLoss=str(rounded_sl_price)
-                )
+                payload = {"category": "linear", "symbol": symbol, "stopLoss": str(rounded_sl_price)}
+                _safe_log_order_payload("modify_sl", payload)
+                response = session.set_trading_stop(**payload)
                 if response.get('retCode') == 0:
                     return {"success": True, "data": response['result']}
-                else:
-                    return {"success": False, "error": response.get('retMsg')}
-
-            except InvalidRequestError as e: # <-- CAPTURA DA EXCEÇÃO
-                # Erro comum quando o SL já está no lugar, não é uma falha real.
-                if "not modified" in str(e):
-                    logger.info(f"SL para {symbol} já está em ${rounded_sl_price}. Tratando como sucesso.")
+                return {"success": False, "error": response.get('retMsg')}
+            except InvalidRequestError as e:
+                if "not modified" in str(e).lower():
+                    logger.info(f"SL para {symbol} já está em {rounded_sl_price}. Tratando como sucesso.")
                     return {"success": True, "data": {"note": "not modified"}}
-                # Se for outro tipo de InvalidRequestError, relança o erro.
                 raise e
 
         return await asyncio.to_thread(_sync_call)
@@ -366,12 +482,16 @@ async def place_limit_order(api_key: str, api_secret: str, signal_data: dict, us
             session = get_session(api_key, api_secret)
             side = "Buy" if (signal_data.get('order_type') or '').upper() == 'LONG' else "Sell"
             leverage = Decimal(str(user_settings.max_leverage))
+            tick = instrument_rules["tickSize"]
+
             price = Decimal(str(signal_data.get('limit_price')))
-            price_adj = (price // instrument_rules["tickSize"]) * instrument_rules["tickSize"]
+            price_adj = _round_down_to_tick(price, tick)
+
             margin_in_dollars = Decimal(str(balance)) * (Decimal(str(user_settings.entry_size_percent)) / Decimal("100"))
             notional_value = margin_in_dollars * leverage
 
-            if price_adj <= 0: return {"success": False, "error": f"Preço de entrada inválido após ajuste: {price_adj}"}
+            if price_adj <= 0:
+                return {"success": False, "error": f"Preço de entrada inválido após ajuste: {price_adj}"}
             
             qty_raw = notional_value / price_adj
             qty_adj = _round_down_to_step(qty_raw, instrument_rules["qtyStep"])
@@ -382,12 +502,23 @@ async def place_limit_order(api_key: str, api_secret: str, signal_data: dict, us
             if final_notional_value < instrument_rules["minNotionalValue"]:
                 return {"success": False, "error": f"Valor total da ordem (${final_notional_value:.2f}) é menor que o mínimo permitido de ${instrument_rules['minNotionalValue']:.2f}."}
 
-            # --- LÓGICA CORRIGIDA ---
+            # --- Ajuste de TP/SL ao tick do instrumento ---
+            tp_raw = (signal_data.get('targets') or [None])[0]
+            sl_raw = signal_data.get('stop_loss')
+
+            take_profit_adj = None
+            if tp_raw is not None:
+                take_profit_adj = _round_down_to_tick(Decimal(str(tp_raw)), tick)
+
+            stop_loss_adj = None
+            if sl_raw is not None:
+                stop_loss_adj = _round_down_to_tick(Decimal(str(sl_raw)), tick)
+
             payload = {
                 "category": "linear", "symbol": symbol, "side": side,
                 "orderType": "Limit", "qty": str(qty_adj), "price": str(price_adj),
-                "takeProfit": str((signal_data.get('targets') or [None])[0]),
-                "stopLoss": str(signal_data.get('stop_loss')),
+                "takeProfit": str(take_profit_adj) if take_profit_adj is not None else None,
+                "stopLoss": str(stop_loss_adj) if stop_loss_adj is not None else None,
             }
 
             try:
@@ -398,6 +529,7 @@ async def place_limit_order(api_key: str, api_secret: str, signal_data: dict, us
                 else:
                     return {"success": False, "error": str(e)}
 
+            _safe_log_order_payload("place_limit_order:first_try", payload)
             response = session.place_order(**{k: v for k, v in payload.items() if v is not None})
             if response.get('retCode') == 0:
                 return {"success": True, "data": response['result']}
@@ -413,7 +545,6 @@ async def place_limit_order(api_key: str, api_secret: str, signal_data: dict, us
     except Exception as e:
         logger.error(f"Exceção em place_limit_order (async): {e}", exc_info=True)
         return {"success": False, "error": str(e)}
-
 
 # --- FUNÇÃO PARA VERIFICAR STATUS DE UMA ORDEM ---
 async def get_order_status(api_key: str, api_secret: str, order_id: str, symbol: str) -> dict:
@@ -589,26 +720,33 @@ async def get_open_positions_with_pnl(api_key: str, api_secret: str) -> dict:
 async def get_specific_position_size(api_key: str, api_secret: str, symbol: str) -> float:
     """
     Busca o tamanho (size) de uma posição específica aberta na Bybit.
-    Retorna 0.0 se a posição não existir.
+    Retorna sempre um float (0.0 em caso de inexistência ou erro).
     """
-    def _sync_call():
+    def _sync_call() -> float:
         try:
             session = get_session(api_key, api_secret)
-            # Usamos o filtro de símbolo para buscar apenas a posição de interesse
             response = session.get_positions(category="linear", symbol=symbol)
-            
+
             if response.get('retCode') == 0:
-                position_list = response.get('result', {}).get('list', [])
+                position_list = (response.get('result', {}) or {}).get('list', []) or []
                 if position_list and position_list[0]:
-                    # Retorna o tamanho da primeira (e única) posição na lista
-                    return float(position_list[0].get('size', 0.0))
-            # Se a lista estiver vazia ou houver erro, a posição não existe ou não foi encontrada
+                    # Retorna o tamanho da primeira posição na lista (mantém comportamento atual)
+                    size_val = float(position_list[0].get('size', 0.0) or 0.0)
+                    return size_val
+                # Lista vazia: posição não existe
+                return 0.0
+
+            # retCode != 0: loga e retorna 0.0
+            logger.warning(f"get_specific_position_size: Bybit retornou retCode={response.get('retCode')} para {symbol} - {response.get('retMsg')}")
             return 0.0
+
         except Exception as e:
             logger.error(f"Exceção em get_specific_position_size para {symbol}: {e}", exc_info=True)
-            return None # Em caso de erro, assumimos que não há posição para evitar fechamentos indevidos
+            # Nunca retorne None: padroniza para 0.0
+            return 0.0
 
     return await asyncio.to_thread(_sync_call)
+
     
 async def get_order_history(api_key: str, api_secret: str, order_id: str) -> dict:
     """Busca os detalhes de uma ordem específica no histórico."""
@@ -631,21 +769,41 @@ async def get_order_history(api_key: str, api_secret: str, order_id: str) -> dic
     return await asyncio.to_thread(_sync_call)
 
 async def modify_position_take_profit(api_key: str, api_secret: str, symbol: str, new_take_profit: float) -> dict:
-    """Modifica o Take Profit de uma posição aberta."""
-    def _sync_call():
-        try:
-            session = get_session(api_key, api_secret)
-            response = session.set_trading_stop(
-                category="linear", symbol=symbol, takeProfit=str(new_take_profit)
-            )
-            if response.get('retCode') == 0:
-                return {"success": True, "data": response['result']}
-            else:
+    """Modifica o Take Profit de uma posição aberta, garantindo a precisão do preço (tick size)."""
+    try:
+        # Busca regras/tick do instrumento (com cache)
+        instrument_rules = await get_instrument_info(symbol)
+        if not instrument_rules.get("success"):
+            error_msg = instrument_rules.get("error", f"Regras do instrumento {symbol} não encontradas.")
+            logger.error(f"Falha ao obter regras para {symbol} antes de modificar TP: {error_msg}")
+            return {"success": False, "error": error_msg}
+
+        tick_size = instrument_rules.get("tickSize", Decimal("0"))
+        tp_price_decimal = Decimal(str(new_take_profit))
+        rounded_tp_price = _round_down_to_tick(tp_price_decimal, tick_size)
+
+        logger.info(f"Modificando TP para {symbol}: Original: {tp_price_decimal}, Arredondado ({tick_size}): {rounded_tp_price}")
+
+        def _sync_call():
+            try:
+                session = get_session(api_key, api_secret)
+                payload = {"category": "linear", "symbol": symbol, "takeProfit": str(rounded_tp_price)}
+                _safe_log_order_payload("modify_tp", payload)
+                response = session.set_trading_stop(**payload)
+                if response.get('retCode') == 0:
+                    return {"success": True, "data": response['result']}
                 return {"success": False, "error": response.get('retMsg')}
-        except Exception as e:
-            logger.error(f"Exceção ao modificar Take Profit: {e}", exc_info=True)
-            return {"success": False, "error": str(e)}
-    return await asyncio.to_thread(_sync_call)
+            except InvalidRequestError as e:
+                if "not modified" in str(e).lower():
+                    logger.info(f"TP para {symbol} já está em {rounded_tp_price}. Tratando como sucesso.")
+                    return {"success": True, "data": {"note": "not modified"}}
+                raise e
+
+        return await asyncio.to_thread(_sync_call)
+
+    except Exception as e:
+        logger.error(f"Exceção na lógica de modificar Take Profit para {symbol}: {e}", exc_info=True)
+        return {"success": False, "error": str(e)}
 
 async def get_last_closed_trade_info(api_key: str, api_secret: str, symbol: str) -> dict:
     """
@@ -707,3 +865,25 @@ async def get_last_closed_trade_info(api_key: str, api_secret: str, symbol: str)
             return {"success": False, "error": str(e)}
 
     return await asyncio.to_thread(_sync_call)
+
+def _safe_log_order_payload(context: str, payload: Dict[str, Any]) -> None:
+    """
+    Loga, de forma segura, os campos relevantes de um payload de ordem.
+    Não loga credenciais nem headers. Apenas dados não sensíveis.
+    """
+    try:
+        preview = {
+            "category": payload.get("category"),
+            "symbol": payload.get("symbol"),
+            "side": payload.get("side"),
+            "orderType": payload.get("orderType"),
+            "qty": payload.get("qty"),
+            "price": payload.get("price", "omitted"),
+            "takeProfit": payload.get("takeProfit", "omitted"),
+            "stopLoss": payload.get("stopLoss", "omitted"),
+            "reduceOnly": payload.get("reduceOnly", False),
+            "positionIdx": payload.get("positionIdx", "omitted"),
+        }
+        logger.info(f"[order_payload:{context}] {preview}")
+    except Exception as e:
+        logger.warning(f"[order_payload:{context}] falha ao logar preview: {e}")
