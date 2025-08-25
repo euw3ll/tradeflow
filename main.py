@@ -65,42 +65,50 @@ async def main():
             WAITING_API_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_api_key)],
             WAITING_API_SECRET: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_api_secret)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)], per_message=True, per_user=True, # CORRIGIDO
+        # MUDANÇA: 'per_message' alterado para False para manter o estado da conversa.
+        fallbacks=[CommandHandler("cancel", cancel)], per_message=False, per_user=True,
     )
     remove_api_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(remove_api_prompt, pattern='^remove_api_prompt$')],
         states={ CONFIRM_REMOVE_API: [CallbackQueryHandler(remove_api_action, pattern='^remove_api_confirm|remove_api_cancel$')] },
-        fallbacks=[CommandHandler("cancel", cancel)], per_message=True, per_user=True, # CORRIGIDO
+        # MUDANÇA: 'per_message' alterado para False para manter o estado da conversa.
+        fallbacks=[CommandHandler("cancel", cancel)], per_message=False, per_user=True,
     )
     settings_entry_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(ask_entry_percent, pattern='^set_entry_percent$')],
         states={ ASKING_ENTRY_PERCENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_entry_percent)] },
-        fallbacks=[CommandHandler("cancel", cancel)], per_message=True, per_user=True, # CORRIGIDO
+        # MUDANÇA: 'per_message' alterado para False para manter o estado da conversa.
+        fallbacks=[CommandHandler("cancel", cancel)], per_message=False, per_user=True,
     )
     settings_leverage_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(ask_max_leverage, pattern='^set_max_leverage$')],
         states={ ASKING_MAX_LEVERAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_max_leverage)] },
-        fallbacks=[CommandHandler("cancel", cancel)], per_message=True, per_user=True, # CORRIGIDO
+        # MUDANÇA: 'per_message' alterado para False para manter o estado da conversa.
+        fallbacks=[CommandHandler("cancel", cancel)], per_message=False, per_user=True,
     )
     settings_confidence_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(ask_min_confidence, pattern='^set_min_confidence$')],
         states={ ASKING_MIN_CONFIDENCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_min_confidence)] },
-        fallbacks=[CommandHandler("cancel", cancel)], per_message=True, per_user=True, # CORRIGIDO
+        # MUDANÇA: 'per_message' alterado para False para manter o estado da conversa.
+        fallbacks=[CommandHandler("cancel", cancel)], per_message=False, per_user=True,
     )
     profit_target_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(ask_profit_target, pattern='^set_profit_target$')],
         states={ ASKING_PROFIT_TARGET: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_profit_target)] },
-        fallbacks=[CommandHandler("cancel", cancel)], per_message=True, per_user=True, # CORRIGIDO
+        # MUDANÇA: 'per_message' alterado para False para manter o estado da conversa.
+        fallbacks=[CommandHandler("cancel", cancel)], per_message=False, per_user=True,
     )
     loss_limit_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(ask_loss_limit, pattern='^set_loss_limit$')],
         states={ ASKING_LOSS_LIMIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_loss_limit)] },
-        fallbacks=[CommandHandler("cancel", cancel)], per_message=True, per_user=True, # CORRIGIDO
+        # MUDANÇA: 'per_message' alterado para False para manter o estado da conversa.
+        fallbacks=[CommandHandler("cancel", cancel)], per_message=False, per_user=True,
     )
     whitelist_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(ask_coin_whitelist, pattern='^set_coin_whitelist$')],
         states={ ASKING_COIN_WHITELIST: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_coin_whitelist)] },
-        fallbacks=[CommandHandler("cancel", cancel)], per_message=True, per_user=True, # CORRIGIDO
+        # MUDANÇA: 'per_message' alterado para False para manter o estado da conversa.
+        fallbacks=[CommandHandler("cancel", cancel)], per_message=False, per_user=True,
     )
 
     # Adicionando todos os handlers
