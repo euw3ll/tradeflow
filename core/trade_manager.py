@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+import pytz
 from typing import Tuple
 from telegram.ext import Application
 from sqlalchemy.orm import Session
@@ -17,6 +18,7 @@ from utils.config import ADMIN_ID
 from bot.keyboards import signal_approval_keyboard
 from services.signal_parser import SignalType
 from core.whitelist_service import is_coin_in_whitelist
+from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
@@ -172,6 +174,47 @@ async def process_new_signal(signal_data: dict, application: Application, source
             logger.info(f"Sinal para {symbol} recebido. Verificando preferências de {len(all_users)} usuário(s)...")
 
             for user in all_users:
+                # 1. Verifica se há uma pausa ativa para a direção do sinal
+                signal_side = signal_data.get('order_type')
+                is_paused = False
+                if signal_side == 'LONG' and user.long_trades_paused_until and datetime.now(pytz.utc) < user.long_trades_paused_until:
+                    is_paused = True
+                elif signal_side == 'SHORT' and user.short_trades_paused_until and datetime.now(pytz.utc) < user.short_trades_paused_until:
+                    is_paused = True
+                
+                if is_paused:
+                    logger.info(f"Sinal de {signal_side} para {symbol} ignorado para o usuário {user.telegram_id} devido à pausa do disjuntor.")
+                    continue
+
+                # 2. Se não estiver pausado, verifica se o gatilho de perdas é atingido
+                if user.circuit_breaker_threshold > 0:
+                    losing_trades_count = db.query(Trade).filter(
+                        Trade.user_telegram_id == user.telegram_id,
+                        Trade.side == signal_side,
+                        Trade.status == 'ACTIVE',
+                        Trade.unrealized_pnl_pct < 0
+                    ).count()
+
+                    if losing_trades_count >= user.circuit_breaker_threshold:
+                        logger.warning(f"DISJUNTOR ATIVADO para {signal_side} para o usuário {user.telegram_id}. ({losing_trades_count} perdas ativas)")
+                        
+                        # Ativa a pausa
+                        pause_until = datetime.now(pytz.utc) + timedelta(minutes=user.circuit_breaker_pause_minutes)
+                        if signal_side == 'LONG':
+                            user.long_trades_paused_until = pause_until
+                        else: # SHORT
+                            user.short_trades_paused_until = pause_until
+                        
+                        # Notifica o usuário
+                        await application.bot.send_message(
+                            chat_id=user.telegram_id,
+                            text=f"🚨 <b>Disjuntor de Performance Ativado!</b> 🚨\n\n"
+                                 f"Detectamos {losing_trades_count} operações de <b>{signal_side}</b> em prejuízo.\n"
+                                 f"Para sua segurança, novas operações de <b>{signal_side}</b> estão pausadas por {user.circuit_breaker_pause_minutes} minutos.",
+                            parse_mode='HTML'
+                        )
+                        continue # Rejeita o sinal atual
+
                 # Adiciona uma verificação para ver se o bot do usuário está ativo.
                 if not user.is_active:
                     logger.info(f"Sinal para {symbol} ignorado para o usuário {user.telegram_id} porque o bot está pausado.")

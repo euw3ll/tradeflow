@@ -178,6 +178,10 @@ async def check_active_trades_for_user(application: Application, user: User, db:
         status_title_update = ""
         current_price = 0.0
 
+        # Otimização para Disjuntor: Cache do P/L no DB
+        if position_data:
+            trade.unrealized_pnl_pct = position_data.get("unrealized_pnl_pct", 0.0) * 100
+
         if live_position_size > 0:
             price_result = await get_market_price(trade.symbol)
             if not price_result.get("success"): continue

@@ -22,6 +22,10 @@ class User(Base):
     is_active = Column(Boolean, default=True, nullable=False)
     stop_gain_trigger_pct = Column(Float, default=0.0, nullable=False)
     stop_gain_lock_pct = Column(Float, default=0.0, nullable=False)
+    circuit_breaker_threshold = Column(Integer, default=0, nullable=False)
+    circuit_breaker_pause_minutes = Column(Integer, default=60, nullable=False)
+    long_trades_paused_until = Column(DateTime(timezone=True), nullable=True)
+    short_trades_paused_until = Column(DateTime(timezone=True), nullable=True)
 
 class InviteCode(Base):
     __tablename__ = 'invite_codes'
@@ -59,6 +63,7 @@ class Trade(Base):
     is_breakeven = Column(Boolean, default=False, nullable=False)
     trail_high_water_mark = Column(Float, nullable=True)
     is_stop_gain_active = Column(Boolean, default=False, nullable=False)
+    unrealized_pnl_pct = Column(Float, nullable=True)
 
 class PendingSignal(Base):
     __tablename__ = 'pending_signals'
