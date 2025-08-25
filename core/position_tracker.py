@@ -119,13 +119,28 @@ async def check_pending_orders_for_user(application: Application, user: User, db
                 f"  - 🛡️ <b>Stop Loss:</b> ${stop_loss:,.4f}\n"
                 f"  - 🎯 <b>Take Profit 1:</b> {tp_text}"
             )
-            # 1. ENVIAMOS A MENSAGEM E CAPTURAMOS O OBJETO 'sent_message'
-            sent_message = await application.bot.send_message(chat_id=user.telegram_id, text=message, parse_mode='HTML')
 
-            # 2. CRIAMOS O TRADE E JÁ INCLUÍMOS O ID DA MENSAGEM
+            message_id_to_update = order.notification_message_id
+            sent_message = None
+            
+            if message_id_to_update:
+                try:
+                    sent_message = await application.bot.edit_message_text(
+                        chat_id=user.telegram_id,
+                        message_id=message_id_to_update,
+                        text=message,
+                        parse_mode='HTML'
+                    )
+                except BadRequest as e:
+                    logger.warning(f"Não foi possível editar a mensagem {message_id_to_update}. Enviando uma nova. Erro: {e}")
+                    sent_message = await application.bot.send_message(chat_id=user.telegram_id, text=message, parse_mode='HTML')
+            else:
+                # Fallback para ordens antigas que não tinham o ID da mensagem salvo.
+                sent_message = await application.bot.send_message(chat_id=user.telegram_id, text=message, parse_mode='HTML')
+
             new_trade = Trade(
                 user_telegram_id=order.user_telegram_id, order_id=order.order_id,
-                notification_message_id=sent_message.message_id, # <-- MUDANÇA AQUI
+                notification_message_id=sent_message.message_id, # Passa o ID correto para o trade
                 symbol=order.symbol, side=side, qty=qty, entry_price=entry_price,
                 stop_loss=stop_loss, current_stop_loss=stop_loss,
                 initial_targets=all_targets,
@@ -134,6 +149,7 @@ async def check_pending_orders_for_user(application: Application, user: User, db
             )
             db.add(new_trade)
             db.delete(order)
+
 
 async def check_active_trades_for_user(application: Application, user: User, db: Session):
     """Verifica e gerencia os trades ativos, com edição de mensagem para atualizações."""

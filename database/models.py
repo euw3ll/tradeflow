@@ -62,15 +62,10 @@ class PendingSignal(Base):
     __tablename__ = 'pending_signals'
     id = Column(Integer, primary_key=True)
     user_telegram_id = Column(BigInteger, nullable=False, index=True)
-    
-    # --- MUDANÇA APLICADA AQUI ---
-    # Removemos o unique=True do symbol
     symbol = Column(String, nullable=False, index=True) 
-    
     order_id = Column(String, unique=True, nullable=False)
     signal_data = Column(JSON, nullable=False)
-
-    # Adicionamos uma restrição de unicidade composta
+    notification_message_id = Column(BigInteger, nullable=True)
     __table_args__ = (UniqueConstraint('user_telegram_id', 'symbol', name='_user_symbol_uc'),)
 
 class SignalForApproval(Base):

@@ -250,7 +250,6 @@ async def _execute_limit_order_for_user(signal_data: dict, user: User, applicati
 
     if limit_order_result.get("success"):
         order_id = limit_order_result["data"]["orderId"]
-        db.add(PendingSignal(user_telegram_id=user.telegram_id, symbol=symbol, order_id=order_id, signal_data=signal_data))
         
         # --- LÓGICA DE NOTIFICAÇÃO COMPLETA ---
         all_targets = signal_data.get('targets') or []
@@ -269,7 +268,16 @@ async def _execute_limit_order_for_user(signal_data: dict, user: User, applicati
             f"  - 🎯 <b>Take Profit 1:</b> {tp_text}\n\n"
             f"👀 Monitorando a execução…"
         )
-        await application.bot.send_message(chat_id=user.telegram_id, text=message, parse_mode='HTML')
+        
+        sent_message = await application.bot.send_message(chat_id=user.telegram_id, text=message, parse_mode='HTML')
+        
+        db.add(PendingSignal(
+            user_telegram_id=user.telegram_id, 
+            symbol=symbol, 
+            order_id=order_id, 
+            signal_data=signal_data,
+            notification_message_id=sent_message.message_id
+        ))
     else:
         error = limit_order_result.get('error') or "Erro desconhecido"
         await application.bot.send_message(chat_id=user.telegram_id, text=f"❌ Falha ao posicionar sua ordem limite para <b>{symbol}</b>.\n<b>Motivo:</b> {error}", parse_mode='HTML')
