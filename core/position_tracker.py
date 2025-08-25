@@ -234,7 +234,11 @@ async def check_active_trades_for_user(application: Application, user: User, db:
 
                         qty_to_close = trade.qty / trade.total_initial_targets
                         
-                        position_idx_to_close = position_data.get('position_idx', 0)
+                        position_idx_to_close = 0 # Padrão para One-Way
+                        if trade.side == 'LONG':
+                            position_idx_to_close = 1
+                        elif trade.side == 'SHORT':
+                            position_idx_to_close = 2
                         
                         close_result = await close_partial_position(
                             api_key, 
@@ -242,7 +246,7 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                             trade.symbol, 
                             qty_to_close, 
                             trade.side,
-                            position_idx_to_close # <-- Passamos o position_idx correto
+                            position_idx_to_close # <-- Passamos o position_idx correto e confiável
                         )
                         if close_result.get("success"):
                             targets_hit_this_run.append(target_price)
