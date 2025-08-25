@@ -178,9 +178,14 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                     
                     if is_target_hit:
                         logger.info(f"TRADE {trade.symbol}: Alvo de TP em ${target_price:.4f} atingido!")
-                        # O cálculo da quantidade a fechar deve ser sobre o total original
-                        num_original_targets = len(trade.initial_targets) + len(targets_hit_this_run)
-                        qty_to_close = trade.qty / num_original_targets
+                        # MUDANÇA: O cálculo da quantidade a fechar agora usa o valor
+                        # imutável 'total_initial_targets' para garantir a fração correta.
+                        # Adicionada também uma verificação para evitar divisão por zero.
+                        if not trade.total_initial_targets or trade.total_initial_targets <= 0:
+                            logger.warning(f"TRADE {trade.symbol}: O campo 'total_initial_targets' é inválido ({trade.total_initial_targets}). Impossível calcular fechamento parcial.")
+                            continue
+
+                        qty_to_close = trade.qty / trade.total_initial_targets
                         
                         close_result = await close_partial_position(api_key, api_secret, trade.symbol, qty_to_close, trade.side)
                         if close_result.get("success"):
