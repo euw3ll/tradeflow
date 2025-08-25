@@ -70,7 +70,8 @@ def get_session(api_key: str, api_secret: str) -> HTTP:
         testnet=False,
         api_key=api_key,
         api_secret=api_secret,
-        timeout=30 # <-- VALOR DO TIMEOUT AUMENTADO
+        timeout=30,
+        recv_window=10000 
     )
 
 async def get_account_info(api_key: str, api_secret: str) -> dict:
