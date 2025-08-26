@@ -13,7 +13,8 @@ from database.models import User, InviteCode, MonitoredTarget, Trade, SignalForA
 from .keyboards import (
     main_menu_keyboard, confirm_remove_keyboard, admin_menu_keyboard, 
     dashboard_menu_keyboard, settings_menu_keyboard, view_targets_keyboard, 
-    bot_config_keyboard, performance_menu_keyboard, confirm_manual_close_keyboard
+    bot_config_keyboard, performance_menu_keyboard, confirm_manual_close_keyboard,
+    signal_filters_keyboard, ma_timeframe_keyboard
     )
 from utils.security import encrypt_data, decrypt_data
 from services.bybit_service import (
@@ -37,6 +38,10 @@ from sqlalchemy.sql import func
 ASKING_STOP_GAIN_TRIGGER, ASKING_STOP_GAIN_LOCK = range(16, 18)
 ASKING_CIRCUIT_THRESHOLD, ASKING_CIRCUIT_PAUSE = range(18, 20)
 ASKING_COIN_WHITELIST = 15
+(
+    ASKING_MA_PERIOD, ASKING_MA_TIMEFRAME,
+    ASKING_RSI_OVERSOLD, ASKING_RSI_OVERBOUGHT
+) = range(20, 24)
 
 logger = logging.getLogger(__name__)
 
@@ -1540,4 +1545,200 @@ async def receive_circuit_pause(update: Update, context: ContextTypes.DEFAULT_TY
         await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit,
             text="❌ Valor inválido. Envie um número inteiro (ex: 60).")
         return ASKING_CIRCUIT_PAUSE
+    return ConversationHandler.END
+
+async def signal_filters_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Exibe o menu de configuração de filtros de sinais."""
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter_by(telegram_id=user_id).first()
+        if user:
+            await query.edit_message_text(
+                "<b>🔬 Filtros de Análise Técnica</b>\n\n"
+                "Ative e configure filtros para melhorar a qualidade dos sinais executados.",
+                parse_mode='HTML',
+                reply_markup=signal_filters_keyboard(user)
+            )
+    finally:
+        db.close()
+
+async def toggle_ma_filter_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ativa ou desativa o filtro de Média Móvel."""
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter_by(telegram_id=user_id).first()
+        if user:
+            user.is_ma_filter_enabled = not user.is_ma_filter_enabled
+            db.commit()
+            await query.edit_message_reply_markup(reply_markup=signal_filters_keyboard(user))
+    finally:
+        db.close()
+
+async def toggle_rsi_filter_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ativa ou desativa o filtro de RSI."""
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter_by(telegram_id=user_id).first()
+        if user:
+            user.is_rsi_filter_enabled = not user.is_rsi_filter_enabled
+            db.commit()
+            await query.edit_message_reply_markup(reply_markup=signal_filters_keyboard(user))
+    finally:
+        db.close()
+
+# --- Handlers para configurar os valores (exemplo para Período da MA) ---
+
+async def ask_ma_period(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Pergunta o novo período da Média Móvel."""
+    query = update.callback_query
+    await query.answer()
+    context.user_data['settings_message_id'] = query.message.message_id
+    await query.edit_message_text("Envie o período para a Média Móvel (ex: 50).")
+    return ASKING_MA_PERIOD
+
+async def receive_ma_period(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Recebe e salva o novo período da MA."""
+    user_id = update.effective_user.id
+    message_id_to_edit = context.user_data.get('settings_message_id')
+    await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id)
+    try:
+        value = int(update.message.text)
+        if not (5 <= value <= 200): raise ValueError("Valor fora do range")
+
+        db = SessionLocal()
+        try:
+            user = db.query(User).filter_by(telegram_id=user_id).first()
+            user.ma_period = value
+            db.commit()
+            await context.bot.edit_message_text(
+                chat_id=update.effective_chat.id, message_id=message_id_to_edit,
+                text=f"✅ Período da MA atualizado para {value}.",
+                reply_markup=signal_filters_keyboard(user)
+            )
+        finally:
+            db.close()
+    except (ValueError, TypeError):
+        await context.bot.edit_message_text(
+            chat_id=update.effective_chat.id, message_id=message_id_to_edit,
+            text="❌ Valor inválido. Envie um número inteiro entre 5 e 200."
+        )
+        return ASKING_MA_PERIOD
+    return ConversationHandler.END
+
+# --- Handlers para o Timeframe da Média Móvel ---
+async def ask_ma_timeframe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Exibe as opções de timeframe para o usuário escolher."""
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter_by(telegram_id=user_id).first()
+        if user:
+            await query.edit_message_text(
+                "Selecione o tempo gráfico para o cálculo da Média Móvel:",
+                reply_markup=ma_timeframe_keyboard(user)
+            )
+    finally:
+        db.close()
+
+async def set_ma_timeframe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Define o timeframe escolhido pelo usuário."""
+    query = update.callback_query
+    await query.answer()
+    timeframe = query.data.split('_')[-1]
+    user_id = update.effective_user.id
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter_by(telegram_id=user_id).first()
+        if user:
+            user.ma_timeframe = timeframe
+            user.rsi_timeframe = timeframe # Sincroniza o timeframe do RSI por simplicidade
+            db.commit()
+            await query.edit_message_text(
+                f"✅ Timeframe atualizado para {timeframe} minutos.",
+                reply_markup=signal_filters_keyboard(user)
+            )
+    finally:
+        db.close()
+
+
+# --- Handlers para o Limite de Sobrevenda do RSI ---
+async def ask_rsi_oversold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    context.user_data['settings_message_id'] = query.message.message_id
+    await query.edit_message_text("Envie o limite de **Sobrevenda** para o RSI (ex: 30).\nSinais de SHORT serão rejeitados se o RSI estiver abaixo deste valor.")
+    return ASKING_RSI_OVERSOLD
+
+async def receive_rsi_oversold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.effective_user.id
+    message_id_to_edit = context.user_data.get('settings_message_id')
+    await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id)
+    try:
+        value = int(update.message.text)
+        if not (10 <= value <= 40): raise ValueError("Valor fora do range")
+        db = SessionLocal()
+        try:
+            user = db.query(User).filter_by(telegram_id=user_id).first()
+            user.rsi_oversold_threshold = value
+            db.commit()
+            await context.bot.edit_message_text(
+                chat_id=update.effective_chat.id, message_id=message_id_to_edit,
+                text=f"✅ Limite de Sobrevenda do RSI atualizado para {value}.",
+                reply_markup=signal_filters_keyboard(user)
+            )
+        finally:
+            db.close()
+    except (ValueError, TypeError):
+        await context.bot.edit_message_text(
+            chat_id=update.effective_chat.id, message_id=message_id_to_edit,
+            text="❌ Valor inválido. Envie um número inteiro entre 10 e 40."
+        )
+        return ASKING_RSI_OVERSOLD
+    return ConversationHandler.END
+
+# --- Handlers para o Limite de Sobrecompra do RSI ---
+async def ask_rsi_overbought(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    context.user_data['settings_message_id'] = query.message.message_id
+    await query.edit_message_text("Envie o limite de **Sobrecompra** para o RSI (ex: 70).\nSinais de LONG serão rejeitados se o RSI estiver acima deste valor.")
+    return ASKING_RSI_OVERBOUGHT
+
+async def receive_rsi_overbought(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.effective_user.id
+    message_id_to_edit = context.user_data.get('settings_message_id')
+    await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id)
+    try:
+        value = int(update.message.text)
+        if not (60 <= value <= 90): raise ValueError("Valor fora do range")
+        db = SessionLocal()
+        try:
+            user = db.query(User).filter_by(telegram_id=user_id).first()
+            user.rsi_overbought_threshold = value
+            db.commit()
+            await context.bot.edit_message_text(
+                chat_id=update.effective_chat.id, message_id=message_id_to_edit,
+                text=f"✅ Limite de Sobrecompra do RSI atualizado para {value}.",
+                reply_markup=signal_filters_keyboard(user)
+            )
+        finally:
+            db.close()
+    except (ValueError, TypeError):
+        await context.bot.edit_message_text(
+            chat_id=update.effective_chat.id, message_id=message_id_to_edit,
+            text="❌ Valor inválido. Envie um número inteiro entre 60 e 90."
+        )
+        return ASKING_RSI_OVERBOUGHT
     return ConversationHandler.END

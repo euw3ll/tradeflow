@@ -15,6 +15,8 @@ from bot.handlers import (
     ask_max_leverage, receive_max_leverage, ASKING_MAX_LEVERAGE,
     ask_min_confidence, receive_min_confidence, ASKING_MIN_CONFIDENCE,
     toggle_stop_strategy_handler,
+    signal_filters_menu_handler, toggle_ma_filter_handler, toggle_rsi_filter_handler,
+    ask_ma_period, receive_ma_period, ASKING_MA_PERIOD,
     admin_menu, list_channels_handler, select_channel_to_monitor, select_topic_to_monitor,
     admin_view_targets_handler, back_to_admin_menu_handler,
     bot_config_handler, toggle_approval_mode_handler, handle_signal_approval, 
@@ -27,7 +29,10 @@ from bot.handlers import (
     ask_stop_gain_trigger, receive_stop_gain_trigger, ASKING_STOP_GAIN_TRIGGER,
     ask_stop_gain_lock, receive_stop_gain_lock, ASKING_STOP_GAIN_LOCK,
     ask_circuit_threshold, receive_circuit_threshold, ASKING_CIRCUIT_THRESHOLD,
-    ask_circuit_pause, receive_circuit_pause, ASKING_CIRCUIT_PAUSE
+    ask_circuit_pause, receive_circuit_pause, ASKING_CIRCUIT_PAUSE,
+    ask_ma_timeframe, set_ma_timeframe,
+    ask_rsi_oversold, receive_rsi_oversold, ASKING_RSI_OVERSOLD,
+    ask_rsi_overbought, receive_rsi_overbought, ASKING_RSI_OVERBOUGHT
 )
 from database.session import init_db
 from services.telethon_service import start_signal_monitor
@@ -140,6 +145,21 @@ async def main():
         states={ ASKING_CIRCUIT_PAUSE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_circuit_pause)] },
         fallbacks=[CommandHandler("cancel", cancel)], per_message=False, per_user=True,
     )
+    ma_period_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(ask_ma_period, pattern='^set_ma_period$')],
+        states={ ASKING_MA_PERIOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_ma_period)] },
+        fallbacks=[CommandHandler("cancel", cancel)], per_message=False, per_user=True,
+    )
+    rsi_oversold_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(ask_rsi_oversold, pattern='^set_rsi_oversold$')],
+        states={ ASKING_RSI_OVERSOLD: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_rsi_oversold)] },
+        fallbacks=[CommandHandler("cancel", cancel)], per_message=False, per_user=True,
+    )
+    rsi_overbought_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(ask_rsi_overbought, pattern='^set_rsi_overbought$')],
+        states={ ASKING_RSI_OVERBOUGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_rsi_overbought)] },
+        fallbacks=[CommandHandler("cancel", cancel)], per_message=False, per_user=True,
+    )
 
     # Adicionando todos os handlers
     application.add_handler(register_conv)
@@ -185,6 +205,16 @@ async def main():
     application.add_handler(stop_gain_lock_conv)
     application.add_handler(circuit_threshold_conv)
     application.add_handler(circuit_pause_conv)
+
+    application.add_handler(CallbackQueryHandler(signal_filters_menu_handler, pattern='^signal_filters_menu$'))
+    application.add_handler(CallbackQueryHandler(toggle_ma_filter_handler, pattern='^toggle_ma_filter$'))
+    application.add_handler(CallbackQueryHandler(toggle_rsi_filter_handler, pattern='^toggle_rsi_filter$'))
+    application.add_handler(ma_period_conv)
+
+    application.add_handler(CallbackQueryHandler(ask_ma_timeframe, pattern='^ask_ma_timeframe$'))
+    application.add_handler(CallbackQueryHandler(set_ma_timeframe, pattern='^set_ma_timeframe_'))
+    application.add_handler(rsi_oversold_conv)
+    application.add_handler(rsi_overbought_conv)
 
 
     logger.info("Bot configurado. Iniciando todos os serviços...")

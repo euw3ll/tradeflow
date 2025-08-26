@@ -102,6 +102,7 @@ def settings_menu_keyboard(user_settings):
         [InlineKeyboardButton("✅ Whitelist de Moedas", callback_data='set_coin_whitelist')],
         [InlineKeyboardButton(circuit_text, callback_data='set_circuit_threshold')],
         [InlineKeyboardButton(f"Pausa Disjuntor: {circuit_pause} min", callback_data='set_circuit_pause')],
+        [InlineKeyboardButton("Filtros de Sinais 🔬", callback_data='signal_filters_menu')],
         [InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data='back_to_main_menu')]
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -174,4 +175,52 @@ def confirm_manual_close_keyboard(trade_id: int):
             InlineKeyboardButton("❌ Cancelar", callback_data='user_positions') # Volta para a lista de posições
         ],
     ]
+    return InlineKeyboardMarkup(keyboard)
+
+def signal_filters_keyboard(user_settings):
+    """
+    Retorna o teclado para o menu de configuração dos filtros de análise técnica.
+    """
+    # Botão para o filtro de Média Móvel (MA)
+    ma_status_icon = "✅" if user_settings.is_ma_filter_enabled else "❌"
+    ma_text = f"{ma_status_icon} Filtro de Média Móvel"
+
+    # Botão para o filtro de RSI
+    rsi_status_icon = "✅" if user_settings.is_rsi_filter_enabled else "❌"
+    rsi_text = f"{rsi_status_icon} Filtro de RSI"
+    
+    keyboard = [
+        [InlineKeyboardButton("Voltar para Configurações ⬅️", callback_data='user_settings')],
+        [
+            InlineKeyboardButton(ma_text, callback_data='toggle_ma_filter'),
+            InlineKeyboardButton(f"Período MA: {user_settings.ma_period}", callback_data='set_ma_period')
+        ],
+        [
+            InlineKeyboardButton(rsi_text, callback_data='toggle_rsi_filter'),
+            InlineKeyboardButton(f"Sobrecompra: {user_settings.rsi_overbought_threshold}", callback_data='set_rsi_overbought')
+        ],
+        [
+            InlineKeyboardButton(f"Timeframe: {user_settings.ma_timeframe} min", callback_data='ask_ma_timeframe'),
+            InlineKeyboardButton(f"Sobrevenda: {user_settings.rsi_oversold_threshold}", callback_data='set_rsi_oversold')
+        ],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def ma_timeframe_keyboard(user_settings):
+    """
+    Retorna o teclado com as opções de timeframe para a Média Móvel.
+    """
+    # Marca o timeframe atual com um emoji
+    timeframes = {'15': '15 min', '60': '1 hora', '240': '4 horas', 'D': 'Diário'}
+    keyboard_buttons = []
+    
+    for tf_value, tf_text in timeframes.items():
+        prefix = "✅ " if user_settings.ma_timeframe == tf_value else ""
+        keyboard_buttons.append(
+            InlineKeyboardButton(f"{prefix}{tf_text}", callback_data=f"set_ma_timeframe_{tf_value}")
+        )
+    
+    # Organiza os botões em duas colunas
+    keyboard = [keyboard_buttons[i:i + 2] for i in range(0, len(keyboard_buttons), 2)]
+    keyboard.append([InlineKeyboardButton("⬅️ Voltar para Filtros", callback_data='signal_filters_menu')])
     return InlineKeyboardMarkup(keyboard)

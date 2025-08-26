@@ -27,6 +27,14 @@ class User(Base):
     long_trades_paused_until = Column(DateTime(timezone=True), nullable=True)
     short_trades_paused_until = Column(DateTime(timezone=True), nullable=True)
     is_sleep_mode_enabled = Column(Boolean, default=False, nullable=False)
+    # Filtros de Análise Técnica
+    is_ma_filter_enabled = Column(Boolean, default=False, nullable=False)
+    ma_period = Column(Integer, default=50, nullable=False)
+    ma_timeframe = Column(String(10), default='60', nullable=False) # '60' para 1 hora
+    is_rsi_filter_enabled = Column(Boolean, default=False, nullable=False)
+    rsi_timeframe = Column(String(10), default='60', nullable=False)
+    rsi_oversold_threshold = Column(Integer, default=30, nullable=False)
+    rsi_overbought_threshold = Column(Integer, default=70, nullable=False)
 
 class InviteCode(Base):
     __tablename__ = 'invite_codes'

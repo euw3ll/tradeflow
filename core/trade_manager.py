@@ -2,6 +2,8 @@ import os
 import asyncio
 import logging
 import pytz
+import pandas as pd
+import pandas_ta as ta
 from typing import Tuple
 from telegram.ext import Application
 from sqlalchemy.orm import Session
@@ -10,7 +12,8 @@ from database.models import User, Trade, PendingSignal, SignalForApproval
 from services.bybit_service import (
     place_order, get_account_info,
     place_limit_order, cancel_order,
-    get_order_history
+    get_order_history,
+    get_historical_klines
 )
 from services.notification_service import send_notification
 from utils.security import decrypt_data
@@ -23,13 +26,79 @@ from datetime import datetime, timedelta
 logger = logging.getLogger(__name__)
 
 
-def _avaliar_sinal(signal_data: dict, user_settings: User) -> Tuple[bool, str]:
+async def _avaliar_sinal(signal_data: dict, user_settings: User) -> Tuple[bool, str]:
+    """
+    Avalia um sinal com base na confiança mínima e nos filtros de análise técnica (MA e RSI), se ativos.
+    """
+    # Filtro 1: Confiança Mínima (lógica existente)
     min_confidence = user_settings.min_confidence
     signal_confidence = signal_data.get('confidence', 0.0)
     if signal_confidence is not None and signal_confidence < min_confidence:
         motivo = f"Confiança ({signal_confidence:.2f}%) é menor que o seu mínimo ({min_confidence:.2f}%)"
         return False, motivo
-    return True, "Sinal aprovado pelos seus critérios."
+
+    # --- INÍCIO DA NOVA LÓGICA DE FILTROS TÉCNICOS ---
+    
+    # Se nenhum filtro técnico estiver ativo, aprova o sinal aqui
+    if not user_settings.is_ma_filter_enabled and not user_settings.is_rsi_filter_enabled:
+        return True, "Sinal aprovado pelos seus critérios."
+
+    symbol = signal_data.get("coin")
+    side = signal_data.get("order_type")
+    
+    # Unifica a busca de dados se os timeframes forem os mesmos para MA e RSI
+    required_timeframes = set()
+    if user_settings.is_ma_filter_enabled:
+        required_timeframes.add(user_settings.ma_timeframe)
+    if user_settings.is_rsi_filter_enabled:
+        required_timeframes.add(user_settings.rsi_timeframe)
+
+    hist_data_map = {}
+    for tf in required_timeframes:
+        klines_result = await get_historical_klines(symbol=symbol, interval=tf, limit=200)
+        if not klines_result.get("success"):
+            logger.warning(f"Não foi possível obter dados históricos para {symbol} no timeframe {tf}. Filtros para este timeframe serão ignorados.")
+            hist_data_map[tf] = None
+            continue
+        
+        # Converte os dados para um DataFrame do Pandas
+        df = pd.DataFrame(klines_result['data'], columns=['startTime', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
+        df['close'] = pd.to_numeric(df['close']) # Garante que os preços são numéricos
+        hist_data_map[tf] = df
+
+    # Filtro 2: Média Móvel (MA)
+    if user_settings.is_ma_filter_enabled:
+        df_ma = hist_data_map.get(user_settings.ma_timeframe)
+        if df_ma is not None:
+            ma_period = user_settings.ma_period
+            df_ma.ta.sma(length=ma_period, append=True) # Calcula e adiciona a coluna da MA
+            
+            latest_close = df_ma['close'].iloc[0]
+            latest_ma = df_ma[f'SMA_{ma_period}'].iloc[0]
+
+            if side == 'LONG' and latest_close < latest_ma:
+                return False, f"Rejeitado por Média Móvel (preço {latest_close:.4f} < MA {latest_ma:.4f})"
+            if side == 'SHORT' and latest_close > latest_ma:
+                return False, f"Rejeitado por Média Móvel (preço {latest_close:.4f} > MA {latest_ma:.4f})"
+
+    # Filtro 3: Índice de Força Relativa (RSI)
+    if user_settings.is_rsi_filter_enabled:
+        df_rsi = hist_data_map.get(user_settings.rsi_timeframe)
+        if df_rsi is not None:
+            oversold = user_settings.rsi_oversold_threshold
+            overbought = user_settings.rsi_overbought_threshold
+            df_rsi.ta.rsi(append=True) # Calcula e adiciona a coluna do RSI
+            
+            latest_rsi = df_rsi['RSI_14'].iloc[0]
+
+            if side == 'LONG' and latest_rsi > overbought:
+                return False, f"Rejeitado por RSI (RSI {latest_rsi:.2f} > Sobrecompra {overbought})"
+            if side == 'SHORT' and latest_rsi < oversold:
+                return False, f"Rejeitado por RSI (RSI {latest_rsi:.2f} < Sobrevenda {oversold})"
+    
+    # --- FIM DA NOVA LÓGICA ---
+
+    return True, "Sinal aprovado pelos seus critérios e filtros técnicos."
 
 async def _execute_trade(signal_data: dict, user: User, application: Application, db: Session, source_name: str):
     """Executa uma ordem a MERCADO, busca os detalhes da execução e envia uma notificação detalhada."""
@@ -237,7 +306,7 @@ async def process_new_signal(signal_data: dict, application: Application, source
                     continue
 
                 # 1. Avalia o sinal contra os filtros do usuário
-                aprovado, motivo = _avaliar_sinal(signal_data, user)
+                aprovado, motivo = await _avaliar_sinal(signal_data, user)
                 if not aprovado:
                     logger.info(f"Sinal para {symbol} ignorado para o usuário {user.telegram_id}: {motivo}")
                     continue

@@ -1128,6 +1128,47 @@ async def get_last_closed_trade_info(api_key: str, api_secret: str, symbol: str)
 
     return await asyncio.to_thread(_sync_call)
 
+async def get_historical_klines(symbol: str, interval: str, limit: int = 200) -> dict:
+    """
+    Busca os dados históricos de k-lines (candles) para um símbolo.
+    
+    Args:
+        symbol: O par de moedas (ex: 'BTCUSDT').
+        interval: O tempo gráfico do candle ('60' para 1h, '240' para 4h, 'D' para diário).
+        limit: O número de candles a serem buscados (máx 1000, padrão 200).
+
+    Returns:
+        Um dicionário com a lista de k-lines ou um erro.
+        O formato dos dados é uma lista de listas:
+        [startTime, openPrice, highPrice, lowPrice, closePrice, volume, turnover]
+    """
+    def _sync_call():
+        try:
+            # Para dados públicos de mercado, não é necessário autenticar com chaves de API
+            session = HTTP(testnet=False, timeout=15)
+            response = session.get_kline(
+                category="linear",
+                symbol=symbol,
+                interval=interval,
+                limit=limit
+            )
+            
+            if response.get('retCode') == 0 and response.get('result', {}).get('list'):
+                kline_data = response['result']['list']
+                # Os dados vêm com o candle mais recente no final, vamos inverter
+                # para que o mais recente fique na primeira posição.
+                kline_data.reverse()
+                return {"success": True, "data": kline_data}
+            else:
+                error_msg = response.get('retMsg', f"Não foi possível obter os k-lines para {symbol}.")
+                logger.warning(f"[bybit_service] Falha ao buscar k-lines para {symbol} (intervalo {interval}): {error_msg}")
+                return {"success": False, "error": error_msg}
+        except Exception as e:
+            logger.error(f"Exceção em get_historical_klines para {symbol}: {e}", exc_info=True)
+            return {"success": False, "error": str(e)}
+
+    return await asyncio.to_thread(_sync_call)
+
 def _safe_log_order_payload(context: str, payload: Dict[str, Any]) -> None:
     """
     Loga, de forma segura, os campos relevantes de um payload de ordem.
