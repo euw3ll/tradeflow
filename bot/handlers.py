@@ -300,8 +300,19 @@ def _aggregate_trades_by_symbol_side(active_trades, live_pnl_data):
 
 async def my_positions_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
-    await query.edit_message_text("Buscando suas posições gerenciadas...")
+    # protege contra callbacks antigos (igual ao user_dashboard_handler)
+    try:
+        await query.answer()
+    except BadRequest as e:
+        logger.warning(f"Não foi possível responder ao callback_query (pode ser antigo): {e}")
+        return
+
+    # feedback imediato
+    try:
+        await query.edit_message_text("Buscando suas posições gerenciadas...")
+    except BadRequest as e:
+        logger.warning(f"Falha ao editar mensagem para 'Buscando suas posições...': {e}")
+        return
 
     user_id = update.effective_user.id
     db = SessionLocal()
@@ -314,6 +325,7 @@ async def my_positions_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         api_key = decrypt_data(user.api_key_encrypted)
         api_secret = decrypt_data(user.api_secret_encrypted)
 
+        # Trades ativos que o bot está gerenciando
         active_trades = db.query(Trade).filter(
             Trade.user_telegram_id == user_id,
             ~Trade.status.like('%CLOSED%')
@@ -329,13 +341,16 @@ async def my_positions_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             )
             return
 
+        # Posições ao vivo (para pegar mark/last)
+        # ⚠️ CORREÇÃO: chave pelo SÍMBOLO (string), não por tupla (symbol, side),
+        # pois o aggregator usa live_pnl_data.get(t.symbol)
         live_pnl_data = {}
         live_positions_result = await get_open_positions_with_pnl(api_key, api_secret)
         if live_positions_result.get("success"):
             for pos in live_positions_result.get("data", []):
-                live_pnl_data[(pos["symbol"], pos["side"])] = pos
+                live_pnl_data[pos["symbol"]] = pos
 
-        # --- AGRUPAR trades locais com dados vivos da Bybit ---
+        # --- AGRUPAMENTO POR (symbol, side) com dados live por símbolo ---
         groups = _aggregate_trades_by_symbol_side(active_trades, live_pnl_data)
         if not groups:
             await query.edit_message_text(
@@ -356,8 +371,14 @@ async def my_positions_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             pnl = g["pnl"]
             pnl_pct = g["pnl_frac"] * 100.0
 
-            pnl_info = f"  P/L: <b>{pnl:+.2f} USDT ({pnl_pct:+.2f}%)</b>\n" if entry and mark else "  Status: Em aberto\n"
-            targets_info = f"  🎯 Próximo Alvo: ${g['next_target']:,.4f}\n" if g["next_target"] else ""
+            pnl_info = (
+                f"  P/L: <b>{pnl:+.2f} USDT ({pnl_pct:+.2f}%)</b>\n"
+                if entry and mark else "  Status: Em aberto\n"
+            )
+            targets_info = (
+                f"  🎯 Próximo Alvo: ${g['next_target']:,.4f}\n"
+                if g["next_target"] is not None else ""
+            )
 
             lines.append(
                 f"- {arrow} <b>{g['symbol']}</b> ({g['side']})\n"
@@ -365,6 +386,7 @@ async def my_positions_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 f"  Entrada: ${entry:,.4f}\n"
                 f"{pnl_info}{targets_info}"
             )
+
             keyboard.append([
                 InlineKeyboardButton(
                     f"Fechar {g['symbol']} ({g['side']}) ❌",

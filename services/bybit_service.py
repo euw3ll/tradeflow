@@ -14,27 +14,21 @@ logger = logging.getLogger(__name__)
 INSTRUMENT_INFO_CACHE: Dict[str, Any] = {}
 
 def _round_down_to_step(value: Decimal, step: Decimal) -> Decimal:
-    # arredonda para baixo no múltiplo do step
+    """Arredonda para BAIXO no múltiplo de 'step' (quantidade)."""
     if step <= 0:
         return value
     return (value // step) * step
 
 def _round_down_to_tick(price: Decimal, tick: Decimal) -> Decimal:
+    """Arredonda para BAIXO no múltiplo de 'tick' (preço)."""
     if tick <= 0:
         return price
     return (price // tick) * tick
 
 def _round_up_to_tick(price: Decimal, tick: Decimal) -> Decimal:
+    """Arredonda para CIMA no múltiplo de 'tick' (preço), sem alterar se já estiver alinhado."""
     if tick <= 0:
         return price
-    # arredonda para o múltiplo de tick acima
-    return ( (price / tick).to_integral_value(rounding=ROUND_CEILING) ) * tick
-
-def _round_up_to_tick(price: Decimal, tick: Decimal) -> Decimal:
-    """Arredonda para CIMA no múltiplo de tick."""
-    if tick <= 0:
-        return price
-    # se já está alinhado ao tick, retorna como está
     q, r = divmod(price, tick)
     if r == 0:
         return price
