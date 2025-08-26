@@ -19,29 +19,37 @@ from telegram.error import BadRequest
 logger = logging.getLogger(__name__)
 
 def _generate_trade_status_message(trade: Trade, status_title: str, pnl_data: dict = None, current_price: float = None) -> str:
-    """Gera o texto completo e atualizado para a mensagem de status de um trade no formato Dashboard."""
+    """Gera o texto completo e atualizado para a mensagem de status de um trade no formato Dashboard.
+    Exibe % a partir de fração (unrealized_pnl_frac). Mantém compatibilidade caso ainda venha 'unrealized_pnl_pct' (legado).
+    """
     side_emoji = "⬆️" if trade.side == "LONG" else "⬇️"
-    
+
     # --- Cabeçalho ---
     message = f"{side_emoji} <b>{status_title}: {trade.side}</b>\n\n"
     message += f"💎 <b>MOEDA:</b> {trade.symbol}\n\n"
 
     # --- Seção de P/L e Margem ---
     if pnl_data:
-        pnl = pnl_data.get("unrealized_pnl", 0.0)
-        pnl_pct = pnl_data.get("unrealized_pnl_pct", 0.0)
-        margin = (trade.entry_price * trade.qty) / 10 # Assumindo alavancagem de 10x para margem
+        pnl = float(pnl_data.get("unrealized_pnl", 0.0))
+        # Usa a fração nova; se não existir, usa a chave antiga (que pode estar em fração também após nossa padronização)
+        pnl_frac = float(pnl_data.get("unrealized_pnl_frac", pnl_data.get("unrealized_pnl_pct", 0.0)) or 0.0)
+        pnl_pct = pnl_frac * 100.0
+
+        # Observação: margem aqui é uma estimativa simples. Se quiser precisão, passe a alavancagem real.
+        leverage_assumida = 10
+        margin = (trade.entry_price * trade.qty) / leverage_assumida if leverage_assumida > 0 else 0
+
         message += f"📈 <b>P/L Atual:</b> ${pnl:+.2f} ({pnl_pct:+.2f}%)\n"
         message += f"💰 <b>Margem:</b> ${margin:,.2f}\n"
-    
+
     message += " - - - - - - - - - - - - - - - - \n"
-    
+
     # --- Seção da Posição ---
     message += f"➡️ <b>Entrada:</b> ${trade.entry_price:,.4f}\n"
-    if current_price:
+    if current_price is not None:
         message += f"📊 <b>Preço Atual:</b> ${current_price:,.4f}\n"
     message += f"📦 <b>Qtd. Restante:</b> {trade.remaining_qty:g}\n"
-    
+
     message += " - - - - - - - - - - - - - - - - \n"
 
     # --- Seção de Risco ---
@@ -50,18 +58,18 @@ def _generate_trade_status_message(trade: Trade, status_title: str, pnl_data: di
         next_target_num = targets_hit + 1
         next_target_price = trade.initial_targets[0]
         message += f"🎯 <b>Próximo Alvo (TP{next_target_num}):</b> ${next_target_price:,.4f}\n"
-    
-    sl_note = ""
-    if trade.is_breakeven:
-        sl_note = " (Break-Even)"
-    
-    message += f"🛡️ <b>Stop Loss:</b> ${trade.current_stop_loss:,.4f}{sl_note}\n"
-    
+
+    sl_note = " (Break-Even)" if trade.is_breakeven else ""
+    if trade.current_stop_loss is not None:
+        message += f"🛡️ <b>Stop Loss:</b> ${trade.current_stop_loss:,.4f}{sl_note}\n"
+    else:
+        message += "🛡️ <b>Stop Loss:</b> —\n"
+
     message += " - - - - - - - - - - - - - - - - \n"
 
     # --- Seção de Progresso ---
     if trade.total_initial_targets:
-        targets_hit = trade.total_initial_targets - len(trade.initial_targets)
+        targets_hit = trade.total_initial_targets - len(trade.initial_targets or [])
         message += f"📊 <b>Alvos Atingidos:</b> {targets_hit} de {trade.total_initial_targets}\n"
 
     return message
@@ -182,7 +190,7 @@ async def check_active_trades_for_user(application: Application, user: User, db:
 
         # Cache de P/L no DB (corrige duplicidade de % já tratada previamente)
         if position_data:
-            trade.unrealized_pnl_pct = position_data.get("unrealized_pnl_pct", 0.0)
+            trade.unrealized_pnl_pct = position_data.get("unrealized_pnl_frac", 0.0)
 
         if live_position_size > 0:
             price_result = await get_market_price(trade.symbol)
@@ -193,7 +201,7 @@ async def check_active_trades_for_user(application: Application, user: User, db:
             # --- STOP-GAIN DINÂMICO (inalterado nesta etapa) ---
             pnl_data = live_pnl_map.get(trade.symbol)
             if pnl_data and user.stop_gain_trigger_pct > 0 and not trade.is_stop_gain_active and not trade.is_breakeven:
-                pnl_pct = pnl_data.get("unrealized_pnl_pct", 0.0) * 100  # mantém conversão para exibição
+                pnl_pct = pnl_data.get("unrealized_pnl_frac", 0.0) * 100  # mantém conversão para exibição
 
                 if pnl_pct >= user.stop_gain_trigger_pct:
                     log_prefix = f"[Stop-Gain {trade.symbol}]"

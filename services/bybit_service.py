@@ -909,8 +909,8 @@ async def get_closed_pnl_breakdown(api_key: str, api_secret: str, start_time: da
 # --- POSIÇÕES ABERTAS COM PNL ATUAL ---
 async def get_open_positions_with_pnl(api_key: str, api_secret: str) -> dict:
     """
-    Lista posições abertas com avgPrice, markPrice e P/L atual (valor e %), deduplicando por (symbol, side, positionIdx).
-    Mantém apenas uma entrada por chave; se houver duplicatas, fica a de maior size.
+    Lista posições abertas com avgPrice, markPrice e P/L atual (valor e fração),
+    deduplicando por (symbol, side, positionIdx). Se houver duplicatas, mantém a de maior size.
     """
     def _sync_call():
         try:
@@ -919,21 +919,22 @@ async def get_open_positions_with_pnl(api_key: str, api_secret: str) -> dict:
             if resp.get("retCode") != 0:
                 return {"success": False, "error": resp.get("retMsg", "erro")}
 
-            seen = {}  # key -> item
-            for p in (resp.get("result", {}).get("list", []) or []):
-                size = float(p.get("size", 0) or 0)
+            seen = {}  # key: (symbol, side, positionIdx) -> item
+            positions = (resp.get("result", {}).get("list", []) or [])
+            for pos in positions:
+                size = float(pos.get("size", 0) or 0)
                 if size <= 0:
                     continue
 
-                symbol = p.get("symbol")
-                pos_side_api = p.get("side")  # "Buy" ou "Sell"
-                side = "LONG" if (pos_side_api == "Buy") else "SHORT"
-                entry = float(p.get("avgPrice", 0) or 0)
-                mark = float((p.get("markPrice") or 0) or 0)
-                pos_idx = int(p.get("positionIdx", 0))
+                symbol = pos.get("symbol")
+                pos_side_api = (pos.get("side") or "").strip()  # "Buy" | "Sell"
+                side = "LONG" if pos_side_api == "Buy" else "SHORT"
+                entry = float(pos.get("avgPrice", 0) or 0)
+                mark = float((pos.get("markPrice") or 0) or 0)
+                pos_idx = int(pos.get("positionIdx", 0))
                 key = (symbol, side, pos_idx)
 
-                # se mark vier 0, tenta buscar via tickers
+                # Fallback de preço se mark vier 0
                 if not mark and symbol:
                     try:
                         t = session.get_tickers(category="linear", symbol=symbol)
@@ -941,13 +942,13 @@ async def get_open_positions_with_pnl(api_key: str, api_secret: str) -> dict:
                     except Exception:
                         pass
 
-                if not entry or not mark:
-                    pnl = 0.0
-                    pnl_pct = 0.0
-                else:
+                if entry > 0 and mark > 0:
                     diff = (mark - entry) if side == "LONG" else (entry - mark)
                     pnl = diff * size
-                    pnl_pct = (diff / entry) * 100.0 if entry else 0.0
+                    pnl_frac = (diff / entry) if entry else 0.0  # fração (ex.: 0.015 = 1.5%)
+                else:
+                    pnl = 0.0
+                    pnl_frac = 0.0
 
                 item = {
                     "symbol": symbol,
@@ -956,17 +957,23 @@ async def get_open_positions_with_pnl(api_key: str, api_secret: str) -> dict:
                     "entry": entry,
                     "mark": mark,
                     "unrealized_pnl": pnl,
-                    "unrealized_pnl_pct": pnl_pct,
-                    "position_idx": pos_idx
+                    "unrealized_pnl_frac": pnl_frac,  # padronizado em FRAÇÃO
+                    "position_idx": pos_idx,
                 }
 
                 if key in seen:
                     # mantém a maior posição e loga para auditoria
-                    if size > seen[key]["size"]:
-                        logger.info("[positions:dedupe:replace] key=%s old_size=%.8f new_size=%.8f", key, seen[key]["size"], size)
+                    if size > float(seen[key]["size"]):
+                        logger.info(
+                            "[positions:dedupe:replace] key=%s old_size=%.8f new_size=%.8f",
+                            key, float(seen[key]["size"]), size
+                        )
                         seen[key] = item
                     else:
-                        logger.info("[positions:dedupe:skip] key=%s keep_size=%.8f skip_size=%.8f", key, seen[key]["size"], size)
+                        logger.info(
+                            "[positions:dedupe:skip] key=%s keep_size=%.8f skip_size=%.8f",
+                            key, float(seen[key]["size"]), size
+                        )
                 else:
                     seen[key] = item
 
@@ -975,6 +982,7 @@ async def get_open_positions_with_pnl(api_key: str, api_secret: str) -> dict:
         except Exception as e:
             logger.error(f"Exceção em get_open_positions_with_pnl: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
+
     return await asyncio.to_thread(_sync_call)
 
 async def get_specific_position_size(api_key: str, api_secret: str, symbol: str) -> float:
