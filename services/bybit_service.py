@@ -29,6 +29,12 @@ def _round_up_to_tick(price: Decimal, tick: Decimal) -> Decimal:
     # arredonda para o múltiplo de tick acima
     return ( (price / tick).to_integral_value(rounding=ROUND_CEILING) ) * tick
 
+def _round_up_to_tick(price: Decimal, tick: Decimal) -> Decimal:
+    if tick <= 0:
+        return price
+    q = price // tick
+    r = price - (q * tick)
+    return price if r == 0 else (q + 1) * tick
 
 async def get_instrument_info(symbol: str) -> Dict[str, Any]:
     """
@@ -468,15 +474,15 @@ async def modify_position_stop_loss(api_key: str, api_secret: str, symbol: str, 
     - Retry em 10001, aumentando a folga (+1 tick por tentativa) e refazendo o cálculo com backoff+jitter.
     """
     SAFETY_TICKS_BASE = int(os.getenv("TF_SAFETY_TICKS", "2"))
-    RETRY_MAX = int(os.getenv("TF_RETRY_MAX", "3"))
-    RETRY_BASE_MS = int(os.getenv("TF_RETRY_BASE_MS", "120"))
+    RETRY_MAX = int(os.getenv("TF_RETRY_MAX", "3"))            # 3
+    RETRY_BASE_MS = int(os.getenv("TF_RETRY_BASE_MS", "200"))  # 200ms -> 200, 400, 800
 
     try:
-        # 1) Regras do instrumento (tick)
+        # 1) Regras do instrumento (tickSize)
         instrument_rules = await get_instrument_info(symbol)
         if not instrument_rules.get("success"):
             error_msg = instrument_rules.get("error", f"Regras do instrumento {symbol} não encontradas.")
-            logger.error(f"[modify_sl] Falha regras {symbol}: {error_msg}")
+            logger.error(f"[modify_sl] rules_error symbol={symbol} error={error_msg}")
             return {"success": False, "error": error_msg}
 
         tick_size: Decimal = instrument_rules.get("tickSize", Decimal("0")) or Decimal("0")
@@ -488,7 +494,7 @@ async def modify_position_stop_loss(api_key: str, api_secret: str, symbol: str, 
         def _sync_call():
             session = get_session(api_key, api_secret)
 
-            def resolve_side_and_last():
+            def _resolve_side_and_last():
                 # lado real da posição
                 pos_resp = session.get_positions(category="linear", symbol=symbol)
                 if pos_resp.get("retCode") != 0:
@@ -504,101 +510,91 @@ async def modify_position_stop_loss(api_key: str, api_secret: str, symbol: str, 
                 if t.get("retCode") != 0 or not (t.get("result", {}).get("list") or []):
                     return None, None, t.get("retMsg", "falha get_tickers")
                 last = Decimal(str(t["result"]["list"][0]["lastPrice"]))
-
                 return pos_side_api, last, None
 
-            def calc_adjusted_sl(pos_side_api: str, last: Decimal, safety_ticks: int) -> Decimal | None:
+            def _calc_adjusted_sl(pos_side_api: str, last: Decimal, safety_ticks: int) -> Decimal:
                 is_long = (pos_side_api == "Buy")
-                is_short = (pos_side_api == "Sell")
-
-                # arredonda ao tick conforme direção
+                # 1) arredonda o "desired" corretamente ao tick
                 if is_long:
                     rounded_desired = _round_down_to_tick(desired, tick_size)
                 else:
                     rounded_desired = _round_up_to_tick(desired, tick_size)
 
-                # aplica margem de segurança dinâmica
+                # 2) aplica *folga mínima* contra o last
                 if is_long:
+                    # SL deve ficar ESTRITAMENTE abaixo do last
                     raw_limit = last - (tick_size * safety_ticks)
                     limit_floor = _round_down_to_tick(raw_limit, tick_size)
-                    if limit_floor >= last:
-                        limit_floor = limit_floor - tick_size
                     adjusted = min(rounded_desired, limit_floor)
-                    if not (adjusted < last):
-                        return None  # inválido vs preço base
                 else:
+                    # SHORT: SL deve ficar ESTRITAMENTE acima do last
                     raw_limit = last + (tick_size * safety_ticks)
                     limit_ceil = _round_up_to_tick(raw_limit, tick_size)
-                    if limit_ceil <= last:
-                        limit_ceil = limit_ceil + tick_size
                     adjusted = max(rounded_desired, limit_ceil)
-                    if not (adjusted > last):
-                        return None  # inválido vs preço base
 
                 return adjusted
 
-            last_error = None
-
-            for attempt in range(1, RETRY_MAX + 1):
-                pos_side_api, last, err = resolve_side_and_last()
+            # Tentativas com backoff exponencial + jitter
+            for attempt in range(RETRY_MAX):
+                pos_side_api, last, err = _resolve_side_and_last()
                 if err:
-                    last_error = err
-                    logger.error("[modify_sl:resolve_fail] symbol=%s attempt=%s reason=%s", symbol, attempt, err)
-                    # Se falha em resolver lado/preço, não adianta tentar 10001; mas ainda tentamos recuperar nas próximas
-                    # caso fosse um 5xx temporário.
-                else:
-                    safety_ticks = SAFETY_TICKS_BASE + (attempt - 1)  # aumenta 1 a cada tentativa
-                    adjusted = calc_adjusted_sl(pos_side_api, last, safety_ticks)
-                    logger.info(
-                        "[modify_sl:calc] symbol=%s attempt=%s side=%s desired=%s tick=%s last=%s safety_ticks=%s adjusted=%s",
-                        symbol, attempt, pos_side_api, str(desired), str(tick_size), str(last), safety_ticks, str(adjusted)
-                    )
+                    logger.error(f"[modify_sl] resolve_error symbol={symbol} error={err}")
+                    return {"success": False, "error": err}
 
-                    if adjusted is None:
-                        last_error = "SL calculado inválido vs preço atual (anti-race)."
-                    else:
-                        payload = {"category": "linear", "symbol": symbol, "stopLoss": str(adjusted)}
-                        logger.info("[order_payload:modify_sl] %s", {
-                            "category": "linear", "symbol": symbol,
-                            "price": "omitted", "takeProfit": "omitted",
-                            "stopLoss": str(adjusted), "reduceOnly": False, "positionIdx": "omitted"
-                        })
+                safety_ticks = SAFETY_TICKS_BASE + attempt  # aumenta a folga a cada retry
+                adjusted = _calc_adjusted_sl(pos_side_api, last, safety_ticks)
 
-                        try:
-                            response = session.set_trading_stop(**payload)
-                            if response.get('retCode') == 0:
-                                return {"success": True, "data": response['result']}
-                            else:
-                                last_error = response.get('retMsg')
-                                logger.error("[modify_sl:api_fail] symbol=%s attempt=%s retMsg=%s", symbol, attempt, last_error)
-                        except InvalidRequestError as e:
-                            emsg = str(e)
-                            emsg_low = emsg.lower()
-                            # not modified → sucesso (no-op)
-                            if "not modified" in emsg_low:
-                                logger.info("[modify_sl:noop] %s", emsg)
-                                return {"success": True, "data": {"note": "not modified"}}
+                payload = {
+                    "category": "linear",
+                    "symbol": symbol,
+                    "stopLoss": str(adjusted)
+                }
 
-                            # 10001 → possível race vs base_price → retry
-                            if "10001" in emsg or "should lower than base_price" in emsg_low or "should higher than base_price" in emsg_low:
-                                last_error = emsg
-                                logger.warning("[modify_sl:retry_10001] symbol=%s attempt=%s reason=%s", symbol, attempt, emsg)
-                            # 10002 / timestamp / recv_window → pequeno backoff e retry
-                            elif "10002" in emsg or "timestamp" in emsg_low or "recv_window" in emsg_low:
-                                last_error = emsg
-                                logger.warning("[modify_sl:retry_10002] symbol=%s attempt=%s reason=%s", symbol, attempt, emsg)
-                            else:
-                                # erro não recuperável → aborta
-                                logger.error("[modify_sl:abort] symbol=%s attempt=%s reason=%s", symbol, attempt, emsg)
-                                return {"success": False, "error": emsg}
+                logger.info(
+                    "[order_payload:modify_sl] symbol=%s side=%s desired=%s tick=%s last=%s adjusted=%s safety_ticks=%s attempt=%s",
+                    symbol, pos_side_api, str(desired), str(tick_size), str(last), str(adjusted), safety_ticks, attempt + 1
+                )
 
-                # Backoff com jitter antes da próxima tentativa
-                if attempt < RETRY_MAX:
-                    sleep_ms = (RETRY_BASE_MS * (2 ** (attempt - 1))) + int(random.uniform(0, 150))
-                    time.sleep(sleep_ms / 1000.0)
+                try:
+                    response = session.set_trading_stop(**payload)
+                    if response.get('retCode') == 0:
+                        return {"success": True, "data": response['result']}
+                    # Se vier um erro não-exceção, retorna direto
+                    return {"success": False, "error": response.get('retMsg', 'Erro desconhecido')}
 
-            # esgotou tentativas
-            return {"success": False, "error": last_error or "Falha desconhecida ao ajustar SL."}
+                except InvalidRequestError as e:
+                    msg = str(e)
+                    # Caso clássico: "not modified" -> trata como sucesso
+                    if "not modified" in msg.lower():
+                        logger.info(f"[modify_sl] not_modified symbol={symbol} adjusted={adjusted}")
+                        return {"success": True, "data": {"note": "not modified"}}
+
+                    # Erro 10001 (base price mudou) -> retry com backoff
+                    if "10001" in msg:
+                        backoff = (RETRY_BASE_MS / 1000.0) * (2 ** attempt)
+                        jitter = random.uniform(0, (RETRY_BASE_MS / 1000.0) * 0.4)
+                        sleep_time = backoff + jitter
+                        logger.warning(
+                            "[modify_sl:retry] symbol=%s reason=10001 side=%s last=%s desired=%s adjusted=%s safety_ticks=%s will_retry_in=%.3fs attempt=%s/%s",
+                            symbol, pos_side_api, str(last), str(desired), str(adjusted), safety_ticks, sleep_time, attempt + 1, RETRY_MAX
+                        )
+                        time.sleep(sleep_time)
+                        continue  # tenta novamente
+
+                    # Outro erro -> retorna
+                    logger.error(f"[modify_sl] error symbol={symbol} error={msg}")
+                    return {"success": False, "error": msg}
+
+                except Exception as e:
+                    logger.error(f"[modify_sl] exception symbol={symbol} error={e}", exc_info=True)
+                    return {"success": False, "error": str(e)}
+
+            # esgotou os retries
+            logger.error(
+                "[modify_sl:exhausted] symbol=%s reason=exhausted_retries desired=%s last=%s tick=%s safety_ticks_base=%s",
+                symbol, str(desired), "n/a", str(tick_size), SAFETY_TICKS_BASE
+            )
+            return {"success": False, "error": "Falha ao ajustar SL após múltiplas tentativas (10001)."}
 
         return await asyncio.to_thread(_sync_call)
 
