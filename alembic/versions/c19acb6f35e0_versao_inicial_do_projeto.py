@@ -1,8 +1,8 @@
-"""Criação da estrutura inicial do banco de dados
+"""versao_inicial_do_projeto
 
-Revision ID: 77721795cc18
+Revision ID: c19acb6f35e0
 Revises: 
-Create Date: 2025-08-24 00:25:45.337111
+Create Date: 2025-08-26 17:47:42.959909
 
 """
 from typing import Sequence, Union
@@ -12,7 +12,7 @@ import sqlalchemy as sa
 
 
 # revision identifiers, used by Alembic.
-revision: str = '77721795cc18'
+revision: str = 'c19acb6f35e0'
 down_revision: Union[str, Sequence[str], None] = None
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
@@ -43,6 +43,7 @@ def upgrade() -> None:
     sa.Column('symbol', sa.String(), nullable=False),
     sa.Column('order_id', sa.String(), nullable=False),
     sa.Column('signal_data', sa.JSON(), nullable=False),
+    sa.Column('notification_message_id', sa.BigInteger(), nullable=True),
     sa.PrimaryKeyConstraint('id'),
     sa.UniqueConstraint('order_id'),
     sa.UniqueConstraint('user_telegram_id', 'symbol', name='_user_symbol_uc')
@@ -64,6 +65,7 @@ def upgrade() -> None:
     sa.Column('id', sa.Integer(), nullable=False),
     sa.Column('user_telegram_id', sa.BigInteger(), nullable=False),
     sa.Column('order_id', sa.String(), nullable=False),
+    sa.Column('notification_message_id', sa.BigInteger(), nullable=True),
     sa.Column('symbol', sa.String(), nullable=False),
     sa.Column('side', sa.String(), nullable=False),
     sa.Column('qty', sa.Float(), nullable=False),
@@ -71,11 +73,16 @@ def upgrade() -> None:
     sa.Column('stop_loss', sa.Float(), nullable=True),
     sa.Column('current_stop_loss', sa.Float(), nullable=True),
     sa.Column('initial_targets', sa.JSON(), nullable=True),
+    sa.Column('total_initial_targets', sa.Integer(), nullable=True),
     sa.Column('status', sa.String(), nullable=True),
     sa.Column('remaining_qty', sa.Float(), nullable=True),
     sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('(CURRENT_TIMESTAMP)'), nullable=True),
     sa.Column('closed_at', sa.DateTime(timezone=True), nullable=True),
     sa.Column('closed_pnl', sa.Float(), nullable=True),
+    sa.Column('is_breakeven', sa.Boolean(), nullable=False),
+    sa.Column('trail_high_water_mark', sa.Float(), nullable=True),
+    sa.Column('is_stop_gain_active', sa.Boolean(), nullable=False),
+    sa.Column('unrealized_pnl_pct', sa.Float(), nullable=True),
     sa.PrimaryKeyConstraint('id'),
     sa.UniqueConstraint('order_id')
     )
@@ -92,6 +99,15 @@ def upgrade() -> None:
     sa.Column('daily_profit_target', sa.Float(), nullable=False),
     sa.Column('daily_loss_limit', sa.Float(), nullable=False),
     sa.Column('coin_whitelist', sa.String(), nullable=False),
+    sa.Column('stop_strategy', sa.String(length=20), nullable=False),
+    sa.Column('is_active', sa.Boolean(), nullable=False),
+    sa.Column('stop_gain_trigger_pct', sa.Float(), nullable=False),
+    sa.Column('stop_gain_lock_pct', sa.Float(), nullable=False),
+    sa.Column('circuit_breaker_threshold', sa.Integer(), nullable=False),
+    sa.Column('circuit_breaker_pause_minutes', sa.Integer(), nullable=False),
+    sa.Column('long_trades_paused_until', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('short_trades_paused_until', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('is_sleep_mode_enabled', sa.Boolean(), nullable=False),
     sa.PrimaryKeyConstraint('id')
     )
     op.create_index(op.f('ix_users_telegram_id'), 'users', ['telegram_id'], unique=True)

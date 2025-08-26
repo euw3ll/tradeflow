@@ -27,6 +27,7 @@ from utils.config import ADMIN_ID
 from database.crud import get_user_by_id
 from core.trade_manager import _execute_trade, _execute_limit_order_for_user
 from core.performance_service import generate_performance_report
+from services.currency_service import get_usd_to_brl_rate
 from sqlalchemy.sql import func
 
 # Estados para as conversas
@@ -420,32 +421,38 @@ async def user_dashboard_handler(update: Update, context: ContextTypes.DEFAULT_T
         api_key = decrypt_data(user.api_key_encrypted)
         api_secret = decrypt_data(user.api_secret_encrypted)
 
-        account_info = await get_account_info(api_key, api_secret)
+        # Busca o saldo e a cotação em paralelo para mais eficiência
+        account_info_task = get_account_info(api_key, api_secret)
+        brl_rate_task = get_usd_to_brl_rate()
+        account_info, brl_rate = await asyncio.gather(account_info_task, brl_rate_task)
 
         message = "<b>Meu Painel Financeiro</b> 📊\n\n"
         
         if account_info.get("success"):
             balance_data = account_info.get("data", {})
             total_equity = balance_data.get("total_equity", 0.0)
-            
-            message += f"💰 <b>Patrimônio Total:</b> ${total_equity:,.2f} USDT\n\n"
+
+            brl_text = ""
+            if brl_rate:
+                total_brl = total_equity * brl_rate
+                brl_text = f" (aprox. R$ {total_brl:,.2f})"
+
+            message += f"💰 <b>Patrimônio Total:</b> ${total_equity:,.2f} USDT{brl_text}\n"
+            message += "<i>(Valor total da conta, incluindo P/L de posições abertas e o valor de todas as moedas)</i>\n\n"
             message += "<b>Saldos em Carteira:</b>\n"
 
             coin_list = balance_data.get("coin_list", [])
             wallet_lines = []
-            usdt_found = False
-
+            
             if coin_list:
                 for c in coin_list:
                     coin = (c.get("coin") or "").upper()
                     wallet_balance_str = c.get("walletBalance")
                     wallet_balance = float(wallet_balance_str) if wallet_balance_str else 0.0
 
-                    # Exibe apenas moedas com saldo significativo
                     if wallet_balance > 0.00001:
                         if coin == "USDT":
-                            wallet_lines.append(f"  - <b>{coin}: {wallet_balance:,.2f}</b>")
-                            usdt_found = True
+                            wallet_lines.insert(0, f"  - <b>{coin}: {wallet_balance:,.2f}</b>") # Garante que USDT apareça primeiro
                         else:
                             wallet_lines.append(f"  - {coin}: {wallet_balance:g}")
             
@@ -453,7 +460,6 @@ async def user_dashboard_handler(update: Update, context: ContextTypes.DEFAULT_T
                 message += "\n".join(wallet_lines)
             else:
                 message += "Nenhum saldo encontrado.\n"
-            
         else:
             message += f"❌ Erro ao buscar saldo: {account_info.get('error')}\n"
 
@@ -1336,7 +1342,7 @@ async def prompt_manual_close_handler(update: Update, context: ContextTypes.DEFA
         db.close()
 
 async def toggle_bot_status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Liga/Desliga o bot. OFF: não abre novas posições e cancela ordens pendentes, mas CONTINUA gerenciando as abertas."""
+    """Liga/Desliga o bot ou ativa o modo dormir, em um ciclo de 3 estados."""
     query = update.callback_query
     user_id = update.effective_user.id
 
@@ -1347,34 +1353,47 @@ async def toggle_bot_status_handler(update: Update, context: ContextTypes.DEFAUL
             await query.answer("Usuário não encontrado.", show_alert=True)
             return
 
-        # inverte status
-        user.is_active = not user.is_active
-        db.commit()
-
+        # Lógica do ciclo de 3 estados
+        alert_message = ""
         if not user.is_active:
-            # Cancela ordens limite pendentes
+            # ESTADO ATUAL: Pausado -> PRÓXIMO: Ativo 24h
+            user.is_active = True
+            user.is_sleep_mode_enabled = False
+            alert_message = "Bot ATIVADO."
+            
+        elif user.is_active and not user.is_sleep_mode_enabled:
+            # ESTADO ATUAL: Ativo 24h -> PRÓXIMO: Ativo com Modo Dormir
+            user.is_sleep_mode_enabled = True
+            alert_message = "Modo Dormir ATIVADO. O bot pausará entre 00:00 e 07:00."
+
+        else: # user.is_active and user.is_sleep_mode_enabled
+            # ESTADO ATUAL: Ativo com Modo Dormir -> PRÓXIMO: Pausado
+            user.is_active = False
+            user.is_sleep_mode_enabled = False # Reseta o modo dormir ao pausar
+            alert_message = "Bot PAUSADO."
+
+            # Mantém a lógica de cancelar ordens pendentes ao pausar
             api_key = decrypt_data(user.api_key_encrypted)
             api_secret = decrypt_data(user.api_secret_encrypted)
-
             pendentes = db.query(PendingSignal).filter_by(user_telegram_id=user_id).all()
             canceladas = 0
             for p in pendentes:
                 try:
                     resp = await cancel_order(api_key, api_secret, p.order_id, p.symbol)
                     if not resp.get("success"):
-                        logger.warning(f"[OFF] Falha ao cancelar ordem {p.order_id} ({p.symbol}): {resp.get('error')}")
+                        logger.warning(f"[PAUSE] Falha ao cancelar ordem {p.order_id} ({p.symbol}): {resp.get('error')}")
                     db.delete(p)
                     canceladas += 1
                 except Exception as e:
-                    logger.error(f"[OFF] Exceção ao cancelar {p.order_id} ({p.symbol}): {e}", exc_info=True)
-            db.commit()
+                    logger.error(f"[PAUSE] Exceção ao cancelar {p.order_id} ({p.symbol}): {e}", exc_info=True)
+            
+            if canceladas > 0:
+                alert_message += f" {canceladas} ordem(ns) pendente(s) foi(ram) cancelada(s)."
+        
+        db.commit()
+        await query.answer(alert_message, show_alert=True)
 
-            # Avisa o usuário
-            await query.answer(f"Bot PAUSADO. {canceladas} ordem(ns) pendente(s) cancelada(s).", show_alert=True)
-        else:
-            await query.answer("Bot ATIVADO.")
-
-        # Apenas atualiza o teclado do painel (mantém a mensagem atual)
+        # Atualiza o teclado do painel para refletir o novo estado
         await query.edit_message_reply_markup(reply_markup=dashboard_menu_keyboard(user))
 
     finally:

@@ -26,6 +26,7 @@ class User(Base):
     circuit_breaker_pause_minutes = Column(Integer, default=60, nullable=False)
     long_trades_paused_until = Column(DateTime(timezone=True), nullable=True)
     short_trades_paused_until = Column(DateTime(timezone=True), nullable=True)
+    is_sleep_mode_enabled = Column(Boolean, default=False, nullable=False)
 
 class InviteCode(Base):
     __tablename__ = 'invite_codes'

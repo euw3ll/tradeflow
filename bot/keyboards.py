@@ -27,14 +27,18 @@ def main_menu_keyboard(telegram_id: int):
 def dashboard_menu_keyboard(user):
     """Retorna o teclado para o painel do usuário, com a opção de remover a API e ligar/desligar o bot."""
     
-    # Lógica do botão dinâmico para Ligar/Desligar o bot
-    if user.is_active:
-        toggle_button_text = "Bot: Ativo ✅"
-    else:
+    # Lógica do botão único de 3 estados
+    if not user.is_active:
+        # Estado 1: Pausado
         toggle_button_text = "Bot: Pausado ⏸️"
+    elif user.is_active and not user.is_sleep_mode_enabled:
+        # Estado 2: Ativo 24h
+        toggle_button_text = "Bot: Ativo ☀️"
+    else: # user.is_active and user.is_sleep_mode_enabled
+        # Estado 3: Ativo com Modo Dormir
+        toggle_button_text = "Bot: Ativo com Modo Dormir 😴"
     
     keyboard = [
-        # NOVO BOTÃO ADICIONADO:
         [InlineKeyboardButton(toggle_button_text, callback_data='toggle_bot_status')],
         [InlineKeyboardButton("🗑️ Remover API", callback_data='remove_api_prompt')],
         [InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data='back_to_main_menu')]

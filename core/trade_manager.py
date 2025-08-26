@@ -181,6 +181,15 @@ async def process_new_signal(signal_data: dict, application: Application, source
             logger.info(f"Sinal para {symbol} recebido. Verificando preferências de {len(all_users)} usuário(s)...")
 
             for user in all_users:
+                if user.is_sleep_mode_enabled:
+                    br_timezone = pytz.timezone("America/Sao_Paulo")
+                    now_br = datetime.now(br_timezone).time()
+                    
+                    # O bot fica offline das 00:00 (incluso) até 07:00 (excluso)
+                    if 0 <= now_br.hour < 7:
+                        logger.info(f"Sinal para {symbol} ignorado para o usuário {user.telegram_id} devido ao Modo Dormir ativo.")
+                        continue # Pula para o próximo usuário
+
                 # 1. Verifica se há uma pausa ativa para a direção do sinal
                 signal_side = signal_data.get('order_type')
                 is_paused = False
