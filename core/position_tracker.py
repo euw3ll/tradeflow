@@ -19,60 +19,87 @@ from telegram.error import BadRequest
 logger = logging.getLogger(__name__)
 
 def _generate_trade_status_message(trade: Trade, status_title: str, pnl_data: dict = None, current_price: float = None) -> str:
-    """Gera o texto completo e atualizado para a mensagem de status de um trade no formato Dashboard.
-    Exibe % a partir de fração (unrealized_pnl_frac). Mantém compatibilidade caso ainda venha 'unrealized_pnl_pct' (legado).
-    """
-    side_emoji = "⬆️" if trade.side == "LONG" else "⬇️"
+    """Dashboard compacto e rico para a mensagem de status do trade (HTML)."""
+    arrow = "⬆️" if trade.side == "LONG" else "⬇️"
 
-    # --- Cabeçalho ---
-    message = f"{side_emoji} <b>{status_title}: {trade.side}</b>\n\n"
-    message += f"💎 <b>MOEDA:</b> {trade.symbol}\n\n"
+    # --- Dados base ---
+    entry = float(trade.entry_price or 0.0)
+    curr  = float(current_price or 0.0)
+    qty   = float(trade.qty or 0.0)
+    rem   = float(trade.remaining_qty if trade.remaining_qty is not None else qty)
 
-    # --- Seção de P/L e Margem ---
-    if pnl_data:
-        pnl = float(pnl_data.get("unrealized_pnl", 0.0))
-        # Usa a fração nova; se não existir, usa a chave antiga (que pode estar em fração também após nossa padronização)
-        pnl_frac = float(pnl_data.get("unrealized_pnl_frac", pnl_data.get("unrealized_pnl_pct", 0.0)) or 0.0)
-        pnl_pct = pnl_frac * 100.0
+    # --- P/L ao vivo (fração → sempre formatar x100 na exibição) ---
+    unreal_val = float((pnl_data or {}).get("unrealized_pnl", 0.0))
+    unreal_frac = float((pnl_data or {}).get("unrealized_pnl_frac", 0.0))  # ex.: 0.015 = 1.5%
+    unreal_pct = unreal_frac * 100.0
 
-        # Observação: margem aqui é uma estimativa simples. Se quiser precisão, passe a alavancagem real.
-        leverage_assumida = 10
-        margin = (trade.entry_price * trade.qty) / leverage_assumida if leverage_assumida > 0 else 0
+    # --- TP progress / próximo alvo ---
+    total_tps = int(trade.total_initial_targets or 0)
+    remaining_targets = list(trade.initial_targets or [])
+    hit_tps = max(0, total_tps - len(remaining_targets))
+    next_tp = remaining_targets[0] if remaining_targets else None
 
-        message += f"📈 <b>P/L Atual:</b> ${pnl:+.2f} ({pnl_pct:+.2f}%)\n"
-        message += f"💰 <b>Margem:</b> ${margin:,.2f}\n"
+    # Barrinha de progresso de TPs (ex.: ■■□□ para 2/4)
+    filled = "■" * min(hit_tps, total_tps)
+    empty  = "□" * max(0, total_tps - hit_tps)
+    tp_bar = f"{filled}{empty}" if total_tps > 0 else "—"
 
-    message += " - - - - - - - - - - - - - - - - \n"
+    # --- Stop Loss (rótulos úteis) ---
+    sl = trade.current_stop_loss
+    sl_badge = []
+    if trade.is_breakeven:
+        sl_badge.append("BE")
+    if trade.is_stop_gain_active:
+        sl_badge.append("LOCK")
+    if trade.trail_high_water_mark is not None:
+        sl_badge.append("TS")
+    sl_tag = f" [{' / '.join(sl_badge)}]" if sl_badge else ""
 
-    # --- Seção da Posição ---
-    message += f"➡️ <b>Entrada:</b> ${trade.entry_price:,.4f}\n"
-    if current_price is not None:
-        message += f"📊 <b>Preço Atual:</b> ${current_price:,.4f}\n"
-    message += f"📦 <b>Qtd. Restante:</b> {trade.remaining_qty:g}\n"
+    # --- Datas/metadata ---
+    created_str = ""
+    try:
+        if trade.created_at:
+            created_str = trade.created_at.strftime("%d/%m %H:%M")
+    except Exception:
+        pass
 
-    message += " - - - - - - - - - - - - - - - - \n"
+    # --- Montagem da mensagem ---
+    lines = []
+    lines.append(f"{arrow} <b>{trade.symbol} — {trade.side}</b>")
+    if status_title:
+        lines.append(f"🟦 <b>{status_title}</b>")
+    lines.append("")
 
-    # --- Seção de Risco ---
-    if trade.initial_targets and trade.total_initial_targets:
-        targets_hit = trade.total_initial_targets - len(trade.initial_targets)
-        next_target_num = targets_hit + 1
-        next_target_price = trade.initial_targets[0]
-        message += f"🎯 <b>Próximo Alvo (TP{next_target_num}):</b> ${next_target_price:,.4f}\n"
+    # Preços e tamanhos
+    lines.append(f"➡️ <b>Entrada:</b> ${entry:,.4f}")
+    if curr:
+        lines.append(f"📊 <b>Atual:</b> ${curr:,.4f}")
+    lines.append(f"📦 <b>Qtd. Total:</b> {qty:g} | <b>Restante:</b> {rem:g}")
+    notional = entry * qty
+    lines.append(f"💵 <b>Notional (aprox.):</b> ${notional:,.2f}")
+    lines.append("")
 
-    sl_note = " (Break-Even)" if trade.is_breakeven else ""
-    if trade.current_stop_loss is not None:
-        message += f"🛡️ <b>Stop Loss:</b> ${trade.current_stop_loss:,.4f}{sl_note}\n"
+    # P/L
+    lines.append(f"📈 <b>P/L Atual:</b> {unreal_val:+.2f} USDT ({unreal_pct:+.2f}%)")
+
+    # Stop
+    if sl:
+        lines.append(f"🛡️ <b>Stop Loss:</b> ${float(sl):,.4f}{sl_tag}")
     else:
-        message += "🛡️ <b>Stop Loss:</b> —\n"
+        lines.append("🛡️ <b>Stop Loss:</b> —")
+    lines.append("")
 
-    message += " - - - - - - - - - - - - - - - - \n"
+    # TPs
+    if total_tps > 0:
+        lines.append(f"🎯 <b>TPs:</b> {hit_tps}/{total_tps}  {tp_bar}")
+        if next_tp is not None:
+            lines.append(f"   ↳ <i>Próximo:</i> ${float(next_tp):,.4f}")
+        lines.append("")
 
-    # --- Seção de Progresso ---
-    if trade.total_initial_targets:
-        targets_hit = trade.total_initial_targets - len(trade.initial_targets or [])
-        message += f"📊 <b>Alvos Atingidos:</b> {targets_hit} de {trade.total_initial_targets}\n"
+    if created_str:
+        lines.append(f"⏱ <i>Aberto em:</i> {created_str}")
 
-    return message
+    return "\n".join(lines)
 
 async def check_pending_orders_for_user(application: Application, user: User, db: Session):
     """Verifica as ordens limite pendentes e envia notificação detalhada na execução."""
@@ -188,7 +215,7 @@ async def check_active_trades_for_user(application: Application, user: User, db:
         status_title_update = ""
         current_price = 0.0
 
-        # Cache de P/L no DB (corrige duplicidade de % já tratada previamente)
+        # Cache de P/L no DB (padronizado: fração)
         if position_data:
             trade.unrealized_pnl_pct = position_data.get("unrealized_pnl_frac", 0.0)
 
@@ -198,11 +225,10 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                 continue
             current_price = price_result["price"]
             
-            # --- STOP-GAIN DINÂMICO (inalterado nesta etapa) ---
+            # --- STOP-GAIN DINÂMICO ---
             pnl_data = live_pnl_map.get(trade.symbol)
             if pnl_data and user.stop_gain_trigger_pct > 0 and not trade.is_stop_gain_active and not trade.is_breakeven:
-                pnl_pct = pnl_data.get("unrealized_pnl_frac", 0.0) * 100  # mantém conversão para exibição
-
+                pnl_pct = pnl_data.get("unrealized_pnl_frac", 0.0) * 100.0  # exibição/threshold em %
                 if pnl_pct >= user.stop_gain_trigger_pct:
                     log_prefix = f"[Stop-Gain {trade.symbol}]"
                     logger.info(f"{log_prefix} Gatilho de {user.stop_gain_trigger_pct}% atingido com P/L de {pnl_pct:.2f}%.")
@@ -228,29 +254,23 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                         else:
                             logger.error(f"{log_prefix} Falha ao mover SL (lock). Erro: {sl_result.get('error', 'desconhecido')}")
 
-            # --- LÓGICA DE TAKE PROFIT: AGORA SOMENTE APÓS EXECUÇÃO REAL ---
+            # --- TAKE PROFIT: só confirma após redução bem-sucedida ---
             targets_executados_este_ciclo = []
             if trade.initial_targets:
                 for target_price in list(trade.initial_targets):
                     is_target_hit = (trade.side == 'LONG' and current_price >= target_price) or \
                                     (trade.side == 'SHORT' and current_price <= target_price)
-                    
                     if not is_target_hit:
                         continue
 
-                    # Calcula a fração a fechar (fixa por design)
                     if not trade.total_initial_targets or trade.total_initial_targets <= 0:
                         logger.warning(f"TRADE {trade.symbol}: 'total_initial_targets' inválido ({trade.total_initial_targets}). Impossível calcular fechamento parcial.")
                         continue
 
                     qty_to_close = trade.qty / trade.total_initial_targets
 
-                    # Determinar índice de posição em modo hedge; em one-way será ignorado pela service
-                    position_idx_to_close = 0
-                    if trade.side == 'LONG':
-                        position_idx_to_close = 1
-                    elif trade.side == 'SHORT':
-                        position_idx_to_close = 2
+                    # positionIdx (hedge); em one-way Bybit ignora
+                    position_idx_to_close = 1 if trade.side == 'LONG' else 2
 
                     logger.info(
                         "[tp:crossed] symbol=%s side=%s target=%.4f last=%.4f msg='preço cruzou TP; tentando executar redução'",
@@ -267,14 +287,12 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                     )
 
                     if close_result.get("success"):
-                        # Somente aqui consideramos TP 'EXECUTADO'
                         targets_executados_este_ciclo.append(target_price)
                         try:
                             trade.remaining_qty = (trade.remaining_qty or trade.qty) - qty_to_close
                             if trade.remaining_qty < 0:
                                 trade.remaining_qty = 0.0
                         except Exception:
-                            # fallback para coerência mínima
                             trade.remaining_qty = max(0.0, (trade.remaining_qty or 0.0) - qty_to_close)
 
                         message_was_edited = True
@@ -284,24 +302,18 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                             trade.symbol, trade.side, float(target_price), float(qty_to_close), float(trade.remaining_qty or 0.0)
                         )
                     else:
-                        # NÃO remaja targets nem mexe em remaining_qty; apenas loga erro
                         err = close_result.get("error", "desconhecido")
-                        logger.error(
-                            "[tp:failed] symbol=%s side=%s target=%.4f reason=%s",
-                            trade.symbol, trade.side, float(target_price), err
-                        )
+                        logger.error("[tp:failed] symbol=%s side=%s target=%.4f reason=%s",
+                                     trade.symbol, trade.side, float(target_price), err)
 
-            # Remoção de targets somente após execuções confirmadas
             if targets_executados_este_ciclo:
                 trade.initial_targets = [t for t in trade.initial_targets if t not in targets_executados_este_ciclo]
                 message_was_edited = True
-                # Se já havia um título (ex.: Stop-Gain), mantemos o mais “forte”
                 if not status_title_update:
                     status_title_update = "🎯 Take Profit EXECUTADO!"
 
-            # --- BREAK_EVEN por TP (1º TP -> entrada; subsequentes -> preço do TP) ---
+            # --- BREAK_EVEN (1º TP → entrada; seguintes → preço do TP) ---
             if user.stop_strategy == 'BREAK_EVEN' and targets_executados_este_ciclo:
-                # Escolhe o TP de referência deste ciclo (o mais "distante" a favor)
                 tp_ref = max(targets_executados_este_ciclo) if trade.side == 'LONG' else min(targets_executados_este_ciclo)
 
                 if not trade.is_breakeven:
@@ -311,11 +323,10 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                     desired_sl = float(tp_ref)
                     reason = f"Break-Even Avançado (TP {tp_ref:.4f})"
 
-                # Regras de melhoria e validade vs preço atual
                 is_improvement = (trade.side == 'LONG' and desired_sl > (trade.current_stop_loss or float('-inf'))) or \
-                                (trade.side == 'SHORT' and desired_sl < (trade.current_stop_loss or float('inf')))
+                                 (trade.side == 'SHORT' and desired_sl < (trade.current_stop_loss or float('inf')))
                 is_valid_to_set = (trade.side == 'LONG' and desired_sl < current_price) or \
-                                (trade.side == 'SHORT' and desired_sl > current_price)
+                                  (trade.side == 'SHORT' and desired_sl > current_price)
 
                 if is_improvement and is_valid_to_set:
                     sl_result = await modify_position_stop_loss(api_key, api_secret, trade.symbol, desired_sl)
@@ -324,20 +335,14 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                         trade.current_stop_loss = desired_sl
                         message_was_edited = True
                         status_title_update = f"🛡️ {reason}"
-                        logger.info(
-                            "[be:set] symbol=%s side=%s desired_sl=%.4f last=%.4f",
-                            trade.symbol, trade.side, desired_sl, float(current_price)
-                        )
+                        logger.info("[be:set] symbol=%s side=%s desired_sl=%.4f last=%.4f",
+                                    trade.symbol, trade.side, desired_sl, float(current_price))
                     else:
-                        logger.error(
-                            "[be:failed] symbol=%s desired_sl=%.4f reason=%s",
-                            trade.symbol, desired_sl, sl_result.get('error', 'desconhecido')
-                        )
+                        logger.error("[be:failed] symbol=%s desired_sl=%.4f reason=%s",
+                                     trade.symbol, desired_sl, sl_result.get('error', 'desconhecido'))
                 else:
-                    logger.info(
-                        "[be:skip] symbol=%s improvement=%s valid=%s desired=%.4f last=%.4f current_stop=%.4f",
-                        trade.symbol, is_improvement, is_valid_to_set, desired_sl, float(current_price), float(trade.current_stop_loss or 0.0)
-                    )
+                    logger.info("[be:skip] symbol=%s improvement=%s valid=%s desired=%.4f last=%.4f current_stop=%.4f",
+                                trade.symbol, is_improvement, is_valid_to_set, desired_sl, float(current_price), float(trade.current_stop_loss or 0.0))
             
             elif user.stop_strategy == 'TRAILING_STOP':
                 first_tp_hit = trade.total_initial_targets is not None and \
@@ -390,37 +395,14 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                                 else:
                                     logger.error(f"{log_prefix} Falha ao mover Trailing SL. Erro: {sl_result.get('error', 'desconhecido')}")
 
-            # --- Atualização da mensagem do Telegram ---
-            if message_was_edited and trade.notification_message_id:
-                try:
-                    pnl_data = live_pnl_map.get(trade.symbol)
-                    msg_text = _generate_trade_status_message(trade, status_title_update, pnl_data, current_price)
-                    await application.bot.edit_message_text(
-                        chat_id=user.telegram_id,
-                        message_id=trade.notification_message_id,
-                        text=msg_text,
-                        parse_mode='HTML'
-                    )
-                except BadRequest as e:
-                    logger.warning(f"Falha ao editar mensagem {trade.notification_message_id} para o trade {trade.symbol}: {e}")
-                    if "Message to edit not found" in str(e) or "message can't be edited" in str(e):
-                        logger.info(f"Mensagem {trade.notification_message_id} parece ter sido apagada. Recriando...")
-                        try:
-                            pnl_data = live_pnl_map.get(trade.symbol)
-                            msg_text = _generate_trade_status_message(trade, "🔄 Status Sincronizado", pnl_data, current_price)
-                            new_message = await application.bot.send_message(
-                                chat_id=user.telegram_id,
-                                text=msg_text,
-                                parse_mode='HTML'
-                            )
-                            trade.notification_message_id = new_message.message_id
-                            db.commit()
-                            logger.info(f"Mensagem de trade para {trade.symbol} recriada com novo ID: {new_message.message_id}")
-                        except Exception as send_e:
-                            logger.error(f"Falha CRÍTICA ao tentar recriar a mensagem de status para {trade.symbol}: {send_e}", exc_info=True)
+            # --- Mensagem viva (status em aberto) ---
+            if message_was_edited:
+                pnl_data = live_pnl_map.get(trade.symbol)
+                msg_text = _generate_trade_status_message(trade, status_title_update, pnl_data, current_price)
+                await _send_or_edit_trade_message(application, user, trade, db, msg_text)
 
         else:
-            # (inalterado) Detetive de fechamento
+            # --- Detetive de fechamento ---
             logger.info(f"[tracker] Posição para {trade.symbol} não encontrada. Usando o detetive...")
             closed_info_result = await get_last_closed_trade_info(api_key, api_secret, trade.symbol)
             final_message = ""
@@ -449,20 +431,9 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                 trade.closed_pnl = 0.0
                 trade.remaining_qty = 0.0
                 final_message = f"ℹ️ Posição em <b>{trade.symbol}</b> não foi encontrada na Bybit e foi removida do monitoramento."
-            
-            if trade.notification_message_id:
-                try:
-                    await application.bot.edit_message_text(
-                        chat_id=user.telegram_id,
-                        message_id=trade.notification_message_id,
-                        text=final_message,
-                        parse_mode='HTML'
-                    )
-                except BadRequest as e:
-                    logger.warning(f"Não foi possível editar mensagem final para o trade {trade.symbol} (pode ter sido removida): {e}")
-                    await application.bot.send_message(chat_id=user.telegram_id, text=final_message, parse_mode='HTML')
-            else:
-                await application.bot.send_message(chat_id=user.telegram_id, text=final_message, parse_mode='HTML')
+
+            # Mensagem final pelo helper (recupera se a antiga foi apagada)
+            await _send_or_edit_trade_message(application, user, trade, db, final_message)
 
 async def run_tracker(application: Application):
     """Função principal que roda o verificador em loop para TODOS os usuários."""
@@ -549,3 +520,50 @@ async def run_tracker(application: Application):
             db.close()
 
         await asyncio.sleep(60)
+
+from telegram.error import BadRequest
+
+async def _send_or_edit_trade_message(
+    application: Application,
+    user: User,
+    trade: Trade,
+    db: Session,
+    text: str
+) -> None:
+    """
+    Atualiza a 'mensagem viva' do trade de forma resiliente:
+    - Se existe message_id → tenta editar.
+    - Se a edição falhar (mensagem apagada/não editável) → envia nova
+      e atualiza trade.notification_message_id no banco.
+    """
+    # 1) Tenta editar se já temos uma mensagem anterior
+    if getattr(trade, "notification_message_id", None):
+        try:
+            await application.bot.edit_message_text(
+                chat_id=user.telegram_id,
+                message_id=trade.notification_message_id,
+                text=text,
+                parse_mode="HTML",
+            )
+            return  # sucesso, nada mais a fazer
+        except BadRequest:
+            # Qualquer falha típica de edição (apagada, muito antiga, etc.) → recriar
+            pass
+        except Exception:
+            # Falha inesperada → também tenta recriar como fallback
+            pass
+
+    # 2) Não havia mensagem ou edição falhou → envia nova
+    new_msg = await application.bot.send_message(
+        chat_id=user.telegram_id,
+        text=text,
+        parse_mode="HTML",
+    )
+    trade.notification_message_id = new_msg.message_id
+
+    # 3) Persiste o novo ID no banco
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
