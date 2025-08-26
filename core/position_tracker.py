@@ -435,11 +435,27 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                 await _send_or_edit_trade_message(application, user, trade, db, msg_text)
 
         else:
-            # --- Detetive de fechamento (posição não está mais aberta na corretora) ---
-            logger.info(f"[tracker] Posição para {trade.symbol} não encontrada. Usando o detetive...")
-            closed_info_result = await get_last_closed_trade_info(api_key, api_secret, trade.symbol)
+            # --- DETETIVE DE FECHAMENTO COM RETENTATIVAS ---
+            logger.info(f"[tracker] Posição para {trade.symbol} não encontrada. Ativando detetive paciente...")
+            
+            closed_info_result = {"success": False}  # Começa como falha
             final_message = ""
 
+            # Tenta buscar os detalhes do fechamento por até 3 vezes, com pausas
+            for attempt in range(3):
+                logger.info(f"[detetive] Tentativa {attempt + 1}/3 para obter detalhes de fechamento de {trade.symbol}...")
+                result = await get_last_closed_trade_info(api_key, api_secret, trade.symbol)
+                
+                if result.get("success"):
+                    closed_info_result = result
+                    logger.info(f"[detetive] Sucesso na tentativa {attempt + 1}. Detalhes obtidos.")
+                    break  # Se obteve sucesso, sai do loop
+                
+                if attempt < 2: # Se não for a última tentativa
+                    logger.info("[detetive] Falha na tentativa. Aguardando 20 segundos antes de tentar novamente...")
+                    await asyncio.sleep(20)
+            
+            # Prossegue com a lógica original, usando o resultado final das tentativas
             if closed_info_result.get("success"):
                 closed_data = closed_info_result["data"]
                 pnl = float(closed_data.get("closedPnl", 0.0))
@@ -455,17 +471,22 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                     trade.status = 'CLOSED_LOSS' if pnl < 0 else 'CLOSED_STOP_GAIN'
                     emoji = "🛑" if pnl < 0 else "✅"
                     final_message = f"{emoji} <b>Posição Fechada (STOP)</b>\n<b>Moeda:</b> {trade.symbol}\n<b>Resultado Final:</b> ${pnl:,.2f}"
-                else:
-                    trade.status = 'CLOSED_GHOST'
-                    final_message = f"ℹ️ Posição em <b>{trade.symbol}</b> foi fechada na corretora.\n<b>Resultado:</b> ${pnl:,.2f}"
+                else: # Manual, Liquidação, etc.
+                    trade.status = 'CLOSED_GHOST' # Mantém GHOST mas com PNL
+                    resultado_str = "LUCRO" if pnl >= 0 else "PREJUÍZO"
+                    emoji = "✅" if pnl >= 0 else "🔻"
+                    final_message = f"{emoji} <b>Posição Fechada ({resultado_str})</b>\n<b>Moeda:</b> {trade.symbol}\n<b>Resultado:</b> ${pnl:,.2f}"
             else:
+                # Se mesmo após as tentativas falhar, mantém o comportamento original
+                logger.error(f"[detetive] Falha ao obter detalhes de fechamento para {trade.symbol} após 3 tentativas.")
                 trade.status = 'CLOSED_GHOST'
                 trade.closed_at = func.now()
                 trade.closed_pnl = 0.0
                 trade.remaining_qty = 0.0
-                final_message = f"ℹ️ Posição em <b>{trade.symbol}</b> não foi encontrada na Bybit e foi removida do monitoramento."
+                final_message = f"ℹ️ Posição em <b>{trade.symbol}</b> foi fechada na corretora. Detalhes de P/L não puderam ser obtidos via API."
 
             await _send_or_edit_trade_message(application, user, trade, db, final_message)
+
 
 async def run_tracker(application: Application):
     """Função principal que roda o verificador em loop para TODOS os usuários."""
