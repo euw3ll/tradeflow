@@ -33,6 +33,9 @@ from database.session import init_db
 from services.telethon_service import start_signal_monitor
 from core.position_tracker import run_tracker
 
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="telegram.ext.conversationhandler")
+
 # --- Configuração do Logging ---
 logging.basicConfig(
     format="%(asctime)s - [%(levelname)s] - %(name)s - %(message)s",

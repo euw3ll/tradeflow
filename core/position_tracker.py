@@ -446,72 +446,108 @@ async def run_tracker(application: Application):
             for user in all_api_users_for_sync:
                 sync_api_key = decrypt_data(user.api_key_encrypted)
                 sync_api_secret = decrypt_data(user.api_secret_encrypted)
-                
+
                 bybit_positions_result = await get_open_positions_with_pnl(sync_api_key, sync_api_secret)
                 if not bybit_positions_result.get("success"):
                     logger.error(f"Sincronização: Falha ao buscar posições da Bybit para o usuário {user.telegram_id}. Pulando.")
                     continue
-                
-                bybit_positions = {pos['symbol']: pos for pos in bybit_positions_result.get('data', [])}
-                
-                # --- INÍCIO DA LÓGICA CORRIGIDA ---
-                # 1. Busca trades ativos no banco de dados
-                db_active_trades = db.query(Trade).filter(Trade.user_telegram_id == user.telegram_id, ~Trade.status.like('%CLOSED%')).all()
-                db_active_symbols = {trade.symbol for trade in db_active_trades}
 
-                # 2. Busca ordens PENDENTES no banco de dados
-                db_pending_signals = db.query(PendingSignal).filter(PendingSignal.user_telegram_id == user.telegram_id).all()
-                db_pending_symbols = {signal.symbol for signal in db_pending_signals}
+                bybit_list = bybit_positions_result.get("data", []) or []
+                bybit_keys = {(p["symbol"], p["side"]) for p in bybit_list}
+                bybit_map = {(p["symbol"], p["side"]): p for p in bybit_list}
 
-                # 3. Une os dois conjuntos para ter uma visão completa dos símbolos conhecidos pelo bot
-                all_known_symbols = db_active_symbols.union(db_pending_symbols)
-                
-                # 4. Compara e identifica posições órfãs (apenas as que não estão em nenhuma das listas)
-                symbols_to_add = set(bybit_positions.keys()) - all_known_symbols
-                # --- FIM DA LÓGICA CORRIGIDA ---
-                
-                if symbols_to_add:
-                    logger.warning(f"Sincronização: {len(symbols_to_add)} posições órfãs encontradas para o usuário {user.telegram_id}. Adotando-as.")
-                    for symbol in symbols_to_add:
-                        pos_data = bybit_positions[symbol]
-                        
-                        new_trade = Trade(
-                            user_telegram_id=user.telegram_id,
-                            order_id=f"sync_{symbol}_{int(time.time())}",
-                            symbol=symbol,
-                            side=pos_data['side'],
-                            qty=pos_data['size'],
-                            remaining_qty=pos_data['size'],
-                            entry_price=pos_data['entry'],
-                            status='ACTIVE_SYNCED',
-                            stop_loss=None,
-                            initial_targets=[],
-                            current_stop_loss=pos_data.get('stop_loss', 0.0)
-                        )
-                        db.add(new_trade)
-                        
-                        message = (
-                            f"⚠️ <b>Posição Sincronizada</b> ⚠️\n\n"
-                            f"Uma posição em <b>{symbol}</b> foi encontrada aberta na Bybit sem um registro local e foi adicionada ao monitoramento.\n\n"
-                            f"<b>Atenção:</b> O bot não conhece os alvos ou o stop loss originais do sinal. O gerenciamento será feito com base na sua estratégia de stop loss configurada."
-                        )
-                        await application.bot.send_message(chat_id=user.telegram_id, text=message, parse_mode='HTML')
-            
+                db_active_trades = db.query(Trade).filter(
+                    Trade.user_telegram_id == user.telegram_id,
+                    ~Trade.status.like('%CLOSED%')
+                ).all()
+                db_active_keys = {(t.symbol, t.side) for t in db_active_trades}
+
+                db_pending_signals = db.query(PendingSignal).filter(
+                    PendingSignal.user_telegram_id == user.telegram_id
+                ).all()
+                db_pending_symbols = {s.symbol for s in db_pending_signals}
+
+                # Adotar órfãs (Bybit → DB)
+                keys_to_adopt = bybit_keys - db_active_keys - {(sym, "LONG") for sym in db_pending_symbols} - {(sym, "SHORT") for sym in db_pending_symbols}
+                for key in keys_to_adopt:
+                    symbol, side = key
+                    pos = bybit_map[key]
+                    entry = float(pos.get("entry", 0) or 0)
+                    size = float(pos.get("size", 0) or 0)
+                    curr_sl = pos.get("stop_loss") or None
+
+                    new_trade = Trade(
+                        user_telegram_id=user.telegram_id,
+                        order_id=f"sync_{symbol}_{int(time.time())}",
+                        symbol=symbol,
+                        side=side,
+                        qty=size,
+                        remaining_qty=size,
+                        entry_price=entry,
+                        status='ACTIVE_SYNCED',
+                        stop_loss=curr_sl,
+                        current_stop_loss=curr_sl,
+                        initial_targets=[],
+                        total_initial_targets=0
+                    )
+
+                    cand = db.query(PendingSignal).filter_by(
+                        user_telegram_id=user.telegram_id, symbol=symbol
+                    ).order_by(PendingSignal.id.desc()).first()
+                    if cand and cand.signal_data:
+                        try:
+                            tps = cand.signal_data.get('targets') or []
+                            new_trade.initial_targets = tps
+                            new_trade.total_initial_targets = len(tps)
+                            if not curr_sl and cand.signal_data.get('stop_loss'):
+                                new_trade.stop_loss = cand.signal_data['stop_loss']
+                                new_trade.current_stop_loss = new_trade.stop_loss
+                            db.delete(cand)
+                            logger.info("[sync:recover-signal] %s: recuperados %d TP(s) e SL.", symbol, len(tps))
+                        except Exception:
+                            logger.exception("[sync:recover-signal] falhou ao mapear sinal para %s", symbol)
+
+                    db.add(new_trade)
+
+                    msg = (
+                        f"⚠️ <b>Posição Sincronizada</b>\n"
+                        f"Moeda: <b>{symbol}</b> | Lado: <b>{side}</b>\n"
+                        f"A posição foi encontrada aberta na Bybit e adotada pelo bot.\n"
+                        f"{'Alvos/SL recuperados.' if new_trade.total_initial_targets else 'Sem alvos conhecidos.'}"
+                    )
+                    await application.bot.send_message(chat_id=user.telegram_id, text=msg, parse_mode='HTML')
+
+                # Fechar fantasmas (DB → Bybit)
+                keys_to_close = db_active_keys - bybit_keys
+                for t in db_active_trades:
+                    if (t.symbol, t.side) in keys_to_close:
+                        t.status = 'CLOSED_GHOST'
+                        t.closed_at = func.now()
+                        t.closed_pnl = 0.0
+                        t.remaining_qty = 0.0
+                        try:
+                            if t.notification_message_id:
+                                await application.bot.edit_message_text(
+                                    chat_id=user.telegram_id,
+                                    message_id=t.notification_message_id,
+                                    text=f"ℹ️ Posição em <b>{t.symbol}</b> não foi encontrada na Bybit e foi removida.",
+                                    parse_mode='HTML'
+                                )
+                        except Exception:
+                            pass
+
             db.commit()
 
-            # Lógica principal de verificação (inalterada)
+            # --- Lógica de verificação normal ---
             all_users = db.query(User).filter(User.api_key_encrypted.isnot(None)).all()
-            if not all_users:
-                logger.info("Rastreador: Nenhum usuário com API para verificar.")
-            else:
+            if all_users:
                 logger.info(f"Rastreador: Verificando assets para {len(all_users)} usuário(s).")
-                # CORREÇÃO: Laço 'for' indentado para pertencer ao bloco 'else'.
                 for user in all_users:
                     await check_pending_orders_for_user(application, user, db)
                     await check_active_trades_for_user(application, user, db)
-
                 db.commit()
-
+            else:
+                logger.info("Rastreador: Nenhum usuário com API para verificar.")
 
         except Exception as e:
             logger.critical(f"Erro crítico no loop do rastreador: {e}", exc_info=True)

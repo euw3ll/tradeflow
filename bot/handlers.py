@@ -298,7 +298,6 @@ def _aggregate_trades_by_symbol_side(active_trades, live_pnl_data):
     out.sort(key=lambda x: (x["symbol"], x["side"]))
     return out
 
-# --- PAINÉIS DO USUÁRIO ---
 async def my_positions_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -309,15 +308,12 @@ async def my_positions_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         user = db.query(User).filter_by(telegram_id=user_id).first()
         if not user or not user.api_key_encrypted:
-            await query.edit_message_text(
-                "Você ainda não configurou suas chaves de API."
-            )
+            await query.edit_message_text("Você ainda não configurou suas chaves de API.")
             return
 
         api_key = decrypt_data(user.api_key_encrypted)
         api_secret = decrypt_data(user.api_secret_encrypted)
 
-        # Trades ativos que o bot está gerenciando
         active_trades = db.query(Trade).filter(
             Trade.user_telegram_id == user_id,
             ~Trade.status.like('%CLOSED%')
@@ -325,7 +321,7 @@ async def my_positions_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
         if not active_trades:
             await query.edit_message_text(
-                "<b>📊 Suas Posições Ativas</b>\n\nNenhuma posição sendo gerenciada no momento.",
+                "<b>📊 Suas Posições Ativas</b>\n\nNenhuma posição sendo gerenciada.",
                 parse_mode='HTML',
                 reply_markup=InlineKeyboardMarkup(
                     [[InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data='back_to_main_menu')]]
@@ -333,18 +329,17 @@ async def my_positions_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             )
             return
 
-        # Posições ao vivo (para pegar mark/last)
         live_pnl_data = {}
         live_positions_result = await get_open_positions_with_pnl(api_key, api_secret)
         if live_positions_result.get("success"):
             for pos in live_positions_result.get("data", []):
-                live_pnl_data[pos["symbol"]] = pos
+                live_pnl_data[(pos["symbol"], pos["side"])] = pos
 
-        # --- AGRUPAMENTO POR (symbol, side) ---
+        # --- AGRUPAR trades locais com dados vivos da Bybit ---
         groups = _aggregate_trades_by_symbol_side(active_trades, live_pnl_data)
         if not groups:
             await query.edit_message_text(
-                "Você não possui posições gerenciadas pelo bot no momento.",
+                "Nenhuma posição encontrada na Bybit.",
                 parse_mode='HTML',
                 reply_markup=InlineKeyboardMarkup(
                     [[InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data='back_to_main_menu')]]
@@ -354,46 +349,31 @@ async def my_positions_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
         lines = ["<b>📊 Suas Posições Ativas (Gerenciadas pelo Bot)</b>", ""]
         keyboard = []
-
         for g in groups:
             arrow = "⬆️" if g["side"] == "LONG" else "⬇️"
-            entry_price = g["entry_price"] or 0.0
-            mark_price = g["mark"] or 0.0
+            entry = g["entry_price"] or 0.0
+            mark = g["mark"] or 0.0
             pnl = g["pnl"]
-            pnl_pct = g["pnl_frac"] * 100.0  # fração -> %
+            pnl_pct = g["pnl_frac"] * 100.0
 
-            if mark_price > 0 and entry_price > 0:
-                pnl_info = (
-                    f"  Preço Atual: ${mark_price:,.4f}\n"
-                    f"  P/L: <b>{pnl:+.2f} USDT ({pnl_pct:+.2f}%)</b>\n"
-                )
-            else:
-                pnl_info = "  Status: Em aberto\n"
-
-            targets_info = f"  🎯 Próximo Alvo: ${g['next_target']:,.4f}\n" if g["next_target"] is not None else ""
+            pnl_info = f"  P/L: <b>{pnl:+.2f} USDT ({pnl_pct:+.2f}%)</b>\n" if entry and mark else "  Status: Em aberto\n"
+            targets_info = f"  🎯 Próximo Alvo: ${g['next_target']:,.4f}\n" if g["next_target"] else ""
 
             lines.append(
                 f"- {arrow} <b>{g['symbol']}</b> ({g['side']})\n"
-                f"  Quantidade Total: {g['qty']:g}\n"
-                f"  Entrada Média: ${entry_price:,.4f}\n"
-                f"{pnl_info}"
-                f"{targets_info}"
+                f"  Quantidade: {g['qty']:g}\n"
+                f"  Entrada: ${entry:,.4f}\n"
+                f"{pnl_info}{targets_info}"
             )
-
-            # Botões de fechar por trade (mesma linha, para não poluir)
-            row_buttons = [
-                InlineKeyboardButton(f"Fechar {g['symbol']} #{tid} ❌", callback_data=f"confirm_close_{tid}")
-                for tid in g["trade_ids"]
-            ]
-            keyboard.append(row_buttons)
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"Fechar {g['symbol']} ({g['side']}) ❌",
+                    callback_data=f"confirm_close_group|{g['symbol']}|{g['side']}"
+                )
+            ])
 
         keyboard.append([InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data='back_to_main_menu')])
-
-        await query.edit_message_text(
-            "\n".join(lines),
-            parse_mode='HTML',
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
+        await query.edit_message_text("\n".join(lines), parse_mode='HTML', reply_markup=InlineKeyboardMarkup(keyboard))
 
     finally:
         db.close()
