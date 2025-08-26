@@ -217,6 +217,87 @@ async def remove_api_action(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     )
     return ConversationHandler.END
 
+def _aggregate_trades_by_symbol_side(active_trades, live_pnl_data):
+    """
+    Agrupa trades por (symbol, side). 
+    - Soma size (preferindo remaining_qty quando houver).
+    - Faz média ponderada do entry_price.
+    - Usa mark do live_pnl_data[symbol] quando disponível.
+    - Calcula P/L e P/L% (fração) do grupo.
+    - Escolhe um 'próximo alvo' simples: o alvo "mais próximo" do sentido (menor p/ LONG, maior p/ SHORT) entre os primeiros alvos de cada trade.
+    - Mantém a lista de trade_ids para montar botões de fechar.
+    """
+    groups = {}  # key: (symbol, side) -> dict
+    for t in active_trades:
+        key = (t.symbol, t.side)
+        g = groups.get(key)
+        if not g:
+            g = {
+                "symbol": t.symbol,
+                "side": t.side,
+                "total_qty": 0.0,
+                "weighted_cost": 0.0,
+                "mark": None,
+                "next_targets": [],
+                "trade_ids": [],
+            }
+            groups[key] = g
+
+        qty = float((t.remaining_qty if t.remaining_qty is not None else t.qty) or 0.0)
+        entry = float(t.entry_price or 0.0)
+        if qty > 0 and entry > 0:
+            g["total_qty"] += qty
+            g["weighted_cost"] += qty * entry
+
+        lp_data = live_pnl_data.get(t.symbol, {})
+        lp_mark = float(lp_data.get("mark") or 0.0)
+        if lp_mark:  # pega qualquer mark válido, vale sobrescrever (mesmo símbolo tem um só mark)
+            g["mark"] = lp_mark
+
+        if t.initial_targets:
+            # Considera apenas o "próximo alvo" daquele trade (primeiro da lista)
+            g["next_targets"].append(float(t.initial_targets[0]))
+
+        g["trade_ids"].append(t.id)
+
+    # Finaliza agregados
+    out = []
+    for (symbol, side), g in groups.items():
+        size = g["total_qty"]
+        entry_avg = (g["weighted_cost"] / size) if size > 0 else 0.0
+        mark = g["mark"] or 0.0
+
+        pnl = 0.0
+        pnl_frac = 0.0
+        if size > 0 and entry_avg > 0 and mark > 0:
+            diff = (mark - entry_avg) if side == "LONG" else (entry_avg - mark)
+            pnl = diff * size
+            pnl_frac = (diff / entry_avg) if entry_avg else 0.0  # fração
+
+        # Próximo alvo "do sentido":
+        next_target = None
+        if g["next_targets"]:
+            if side == "LONG":
+                next_target = min(g["next_targets"])
+            else:
+                next_target = max(g["next_targets"])
+
+        out.append({
+            "symbol": symbol,
+            "side": side,
+            "qty": size,
+            "entry_price": entry_avg,
+            "mark": mark,
+            "pnl": pnl,
+            "pnl_frac": pnl_frac,
+            "next_target": next_target,
+            "trade_ids": g["trade_ids"],
+        })
+
+    # Ordena por símbolo para estabilidade visual
+    out.sort(key=lambda x: (x["symbol"], x["side"]))
+    return out
+
 # --- PAINÉIS DO USUÁRIO ---
 async def my_positions_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -228,13 +309,15 @@ async def my_positions_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         user = db.query(User).filter_by(telegram_id=user_id).first()
         if not user or not user.api_key_encrypted:
-            await query.edit_message_text("Você ainda não configurou suas chaves de API.")
+            await query.edit_message_text(
+                "Você ainda não configurou suas chaves de API."
+            )
             return
 
         api_key = decrypt_data(user.api_key_encrypted)
         api_secret = decrypt_data(user.api_secret_encrypted)
 
-        # Busca as posições ativas que o bot está gerenciando no nosso DB
+        # Trades ativos que o bot está gerenciando
         active_trades = db.query(Trade).filter(
             Trade.user_telegram_id == user_id,
             ~Trade.status.like('%CLOSED%')
@@ -244,61 +327,74 @@ async def my_positions_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             await query.edit_message_text(
                 "<b>📊 Suas Posições Ativas</b>\n\nNenhuma posição sendo gerenciada no momento.",
                 parse_mode='HTML',
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data='back_to_main_menu')]])
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data='back_to_main_menu')]]
+                )
             )
             return
 
-        # Busca os dados ao vivo (P/L) da Bybit para essas posições
+        # Posições ao vivo (para pegar mark/last)
         live_pnl_data = {}
         live_positions_result = await get_open_positions_with_pnl(api_key, api_secret)
         if live_positions_result.get("success"):
             for pos in live_positions_result.get("data", []):
                 live_pnl_data[pos["symbol"]] = pos
 
+        # --- AGRUPAMENTO POR (symbol, side) ---
+        groups = _aggregate_trades_by_symbol_side(active_trades, live_pnl_data)
+        if not groups:
+            await query.edit_message_text(
+                "Você não possui posições gerenciadas pelo bot no momento.",
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data='back_to_main_menu')]]
+                )
+            )
+            return
+
         lines = ["<b>📊 Suas Posições Ativas (Gerenciadas pelo Bot)</b>", ""]
         keyboard = []
 
-        for trade in active_trades:
-            arrow = "⬆️" if trade.side == "LONG" else "⬇️"
-            pnl_info = ""
-            
-            # Adiciona os dados de P/L ao vivo, se disponíveis
-            if trade.symbol in live_pnl_data:
-                live_data = live_pnl_data[trade.symbol]
-                pnl = live_data["unrealized_pnl"]
-                pnl_pct = live_data["unrealized_pnl_pct"]
-                mark_price = live_data["mark"]
+        for g in groups:
+            arrow = "⬆️" if g["side"] == "LONG" else "⬇️"
+            entry_price = g["entry_price"] or 0.0
+            mark_price = g["mark"] or 0.0
+            pnl = g["pnl"]
+            pnl_pct = g["pnl_frac"] * 100.0  # fração -> %
+
+            if mark_price > 0 and entry_price > 0:
                 pnl_info = (
                     f"  Preço Atual: ${mark_price:,.4f}\n"
                     f"  P/L: <b>{pnl:+.2f} USDT ({pnl_pct:+.2f}%)</b>\n"
                 )
             else:
-                pnl_info = f"  Status: {trade.status}\n"
+                pnl_info = "  Status: Em aberto\n"
 
-            # --- NOVA LÓGICA PARA EXIBIR ALVOS ---
-            targets_info = ""
-            if trade.initial_targets:
-                next_target = trade.initial_targets[0]
-                remaining_count = len(trade.initial_targets)
-                targets_info = f"  🎯 Próximo Alvo: ${next_target:,.4f} ({remaining_count} restantes)\n"
+            targets_info = f"  🎯 Próximo Alvo: ${g['next_target']:,.4f}\n" if g["next_target"] is not None else ""
 
             lines.append(
-                f"- {arrow} <b>{trade.symbol}</b> ({trade.qty:g} unid.)\n"
-                f"  Entrada: ${trade.entry_price:.4f}\n"
+                f"- {arrow} <b>{g['symbol']}</b> ({g['side']})\n"
+                f"  Quantidade Total: {g['qty']:g}\n"
+                f"  Entrada Média: ${entry_price:,.4f}\n"
                 f"{pnl_info}"
                 f"{targets_info}"
             )
 
-            keyboard.append([
-                InlineKeyboardButton(f"Fechar {trade.symbol} ❌", callback_data=f"confirm_close_{trade.id}")
-            ])
+            # Botões de fechar por trade (mesma linha, para não poluir)
+            row_buttons = [
+                InlineKeyboardButton(f"Fechar {g['symbol']} #{tid} ❌", callback_data=f"confirm_close_{tid}")
+                for tid in g["trade_ids"]
+            ]
+            keyboard.append(row_buttons)
 
         keyboard.append([InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data='back_to_main_menu')])
+
         await query.edit_message_text(
             "\n".join(lines),
             parse_mode='HTML',
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
+
     finally:
         db.close()
 
