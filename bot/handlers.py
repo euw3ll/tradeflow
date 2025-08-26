@@ -3,7 +3,7 @@ import asyncio
 import pytz
 from database.models import PendingSignal
 from services.signal_parser import SignalType
-from services.bybit_service import place_limit_order, get_account_info
+from services.bybit_service import place_limit_order, get_account_info, cancel_order 
 from datetime import datetime, time, timedelta 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes, ConversationHandler
@@ -28,7 +28,6 @@ from database.crud import get_user_by_id
 from core.trade_manager import _execute_trade, _execute_limit_order_for_user
 from core.performance_service import generate_performance_report
 from sqlalchemy.sql import func
-
 
 # Estados para as conversas
 (WAITING_CODE, WAITING_API_KEY, WAITING_API_SECRET, CONFIRM_REMOVE_API) = range(4)
@@ -1332,25 +1331,47 @@ async def prompt_manual_close_handler(update: Update, context: ContextTypes.DEFA
         db.close()
 
 async def toggle_bot_status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ativa ou desativa a operação do bot para o usuário, atualizando o painel."""
+    """Liga/Desliga o bot. OFF: não abre novas posições e cancela ordens pendentes, mas CONTINUA gerenciando as abertas."""
     query = update.callback_query
     user_id = update.effective_user.id
-    
+
     db = SessionLocal()
     try:
         user = db.query(User).filter(User.telegram_id == user_id).first()
-        if user:
-            # Inverte o status atual
-            user.is_active = not user.is_active
+        if not user:
+            await query.answer("Usuário não encontrado.", show_alert=True)
+            return
+
+        # inverte status
+        user.is_active = not user.is_active
+        db.commit()
+
+        if not user.is_active:
+            # Cancela ordens limite pendentes
+            api_key = decrypt_data(user.api_key_encrypted)
+            api_secret = decrypt_data(user.api_secret_encrypted)
+
+            pendentes = db.query(PendingSignal).filter_by(user_telegram_id=user_id).all()
+            canceladas = 0
+            for p in pendentes:
+                try:
+                    resp = await cancel_order(api_key, api_secret, p.order_id, p.symbol)
+                    if not resp.get("success"):
+                        logger.warning(f"[OFF] Falha ao cancelar ordem {p.order_id} ({p.symbol}): {resp.get('error')}")
+                    db.delete(p)
+                    canceladas += 1
+                except Exception as e:
+                    logger.error(f"[OFF] Exceção ao cancelar {p.order_id} ({p.symbol}): {e}", exc_info=True)
             db.commit()
-            
-            status_text = "ATIVADO" if user.is_active else "PAUSADO"
-            await query.answer(f"Bot {status_text} com sucesso!")
-            
-            # Apenas atualiza o teclado, mantendo o texto do painel
-            await query.edit_message_reply_markup(
-                reply_markup=dashboard_menu_keyboard(user)
-            )
+
+            # Avisa o usuário
+            await query.answer(f"Bot PAUSADO. {canceladas} ordem(ns) pendente(s) cancelada(s).", show_alert=True)
+        else:
+            await query.answer("Bot ATIVADO.")
+
+        # Apenas atualiza o teclado do painel (mantém a mensagem atual)
+        await query.edit_message_reply_markup(reply_markup=dashboard_menu_keyboard(user))
+
     finally:
         db.close()
 

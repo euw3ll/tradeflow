@@ -33,6 +33,13 @@ def _avaliar_sinal(signal_data: dict, user_settings: User) -> Tuple[bool, str]:
 
 async def _execute_trade(signal_data: dict, user: User, application: Application, db: Session, source_name: str):
     """Executa uma ordem a MERCADO, busca os detalhes da execução e envia uma notificação detalhada."""
+    if not user.is_active:
+        await application.bot.send_message(
+            chat_id=user.telegram_id,
+            text="⏸️ Bot está PAUSADO: não abrirei novas posições. (As posições abertas seguem sendo gerenciadas.)"
+        )
+        return
+    
     api_key = decrypt_data(user.api_key_encrypted)
     api_secret = decrypt_data(user.api_secret_encrypted)
     
@@ -271,6 +278,13 @@ async def process_new_signal(signal_data: dict, application: Application, source
 
 async def _execute_limit_order_for_user(signal_data: dict, user: User, application: Application, db: Session):
     """Função auxiliar para posicionar uma ordem limite para um único usuário."""
+    if not user.is_active:
+        await application.bot.send_message(
+            chat_id=user.telegram_id,
+            text="⏸️ Bot está PAUSADO: não abrirei novas posições. (As posições abertas seguem sendo gerenciadas.)"
+        )
+        return
+
     symbol = signal_data.get("coin")
     existing_pending = db.query(PendingSignal).filter_by(user_telegram_id=user.telegram_id, symbol=symbol).first()
     if existing_pending:
