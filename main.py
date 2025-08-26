@@ -35,6 +35,8 @@ from core.position_tracker import run_tracker
 
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="telegram.ext.conversationhandler")
+logging.getLogger("telegram").setLevel(logging.ERROR)
+logging.getLogger("telegram.ext").setLevel(logging.ERROR)
 
 # --- Configuração do Logging ---
 logging.basicConfig(

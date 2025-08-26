@@ -1142,7 +1142,12 @@ async def receive_loss_limit(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def performance_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Exibe o painel de desempenho e lida com a seleção de período, usando o fuso horário de SP."""
     query = update.callback_query
-    await query.answer()
+    try:
+        await query.answer()
+    except BadRequest as e:
+        # callback antigo/expirado: não faz nada e evita stacktrace
+        logger.warning(f"[perf] callback expirado/antigo: {e}")
+        return
 
     user_id = query.from_user.id
     

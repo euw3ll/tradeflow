@@ -103,19 +103,23 @@ def _generate_trade_status_message(trade: Trade, status_title: str, pnl_data: di
     return "\n".join(lines)
 
 async def check_pending_orders_for_user(application: Application, user: User, db: Session):
-    """Verifica as ordens limite pendentes e envia notificação na execução."""
+    """Verifica as ordens limite pendentes e envia notificação na execução.
+    OFF: cancela todas as pendentes e encerra. ON: acompanha e promove para Trade quando 'Filled'.
+    """
 
     pending_orders = db.query(PendingSignal).filter_by(user_telegram_id=user.telegram_id).all()
     if not pending_orders:
         return
 
+    # 🔑 DECRIPTA UMA ÚNICA VEZ (antes do branch ON/OFF)
+    api_key = decrypt_data(user.api_key_encrypted)
+    api_secret = decrypt_data(user.api_secret_encrypted)
+
     # Se o bot estiver OFF, cancela todas as pendentes e sai
     if not user.is_active:
-        api_key = decrypt_data(user.api_key_encrypted)
-        api_secret = decrypt_data(user.api_secret_encrypted)
         for order in pending_orders:
             try:
-                _ = await cancel_order(api_key, api_secret, order.order_id, order.symbol)
+                await cancel_order(api_key, api_secret, order.order_id, order.symbol)
             except Exception as e:
                 logger.error(f"[tracker:OFF] Exceção ao cancelar {order.order_id} ({order.symbol}): {e}", exc_info=True)
             db.delete(order)
@@ -123,13 +127,14 @@ async def check_pending_orders_for_user(application: Application, user: User, db
         logger.info(f"[tracker:OFF] PendingSignals do usuário {user.telegram_id} cancelados/limpos.")
         return
 
+    # Bot ON: segue o fluxo normal
     for order in pending_orders:
         status_result = await get_order_status(api_key, api_secret, order.order_id, order.symbol)
         if not status_result.get("success"):
             logger.error(f"Falha ao obter status da ordem {order.order_id}: {status_result.get('error')}")
             continue
 
-        order_data = status_result["data"] or {}
+        order_data = status_result.get("data") or {}
         order_status = (order_data.get("orderStatus") or "").strip()
 
         if order_status == 'Filled':
