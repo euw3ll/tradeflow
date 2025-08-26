@@ -152,7 +152,9 @@ async def check_pending_orders_for_user(application: Application, user: User, db
 
 
 async def check_active_trades_for_user(application: Application, user: User, db: Session):
-    """Verifica e gerencia os trades ativos, com edição de mensagem para atualizações."""
+    """Verifica e gerencia os trades ativos, com edição de mensagem para atualizações.
+    Etapa 1: TP só é considerado 'executado' após sucesso na redução (retCode == 0).
+    """
     active_trades = db.query(Trade).filter(
         Trade.user_telegram_id == user.telegram_id,
         ~Trade.status.like('%CLOSED%')
@@ -178,9 +180,8 @@ async def check_active_trades_for_user(application: Application, user: User, db:
         status_title_update = ""
         current_price = 0.0
 
-        # Cache do P/L no DB
+        # Cache de P/L no DB (corrige duplicidade de % já tratada previamente)
         if position_data:
-            # FIX: já vem em porcentagem; não multiplicar por 100
             trade.unrealized_pnl_pct = position_data.get("unrealized_pnl_pct", 0.0)
 
         if live_position_size > 0:
@@ -189,11 +190,10 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                 continue
             current_price = price_result["price"]
             
-            # --- STOP-GAIN DINÂMICO ---
+            # --- STOP-GAIN DINÂMICO (inalterado nesta etapa) ---
             pnl_data = live_pnl_map.get(trade.symbol)
             if pnl_data and user.stop_gain_trigger_pct > 0 and not trade.is_stop_gain_active and not trade.is_breakeven:
-                # FIX: não multiplicar por 100 (valor já é %)
-                pnl_pct = pnl_data.get("unrealized_pnl_pct", 0.0)
+                pnl_pct = pnl_data.get("unrealized_pnl_pct", 0.0) * 100  # mantém conversão para exibição
 
                 if pnl_pct >= user.stop_gain_trigger_pct:
                     log_prefix = f"[Stop-Gain {trade.symbol}]"
@@ -201,11 +201,11 @@ async def check_active_trades_for_user(application: Application, user: User, db:
 
                     if trade.side == 'LONG':
                         new_stop_loss = trade.entry_price * (1 + (user.stop_gain_lock_pct / 100))
-                    else:  # SHORT
+                    else:
                         new_stop_loss = trade.entry_price * (1 - (user.stop_gain_lock_pct / 100))
 
-                    is_improvement = (trade.side == 'LONG' and (trade.current_stop_loss is None or new_stop_loss > trade.current_stop_loss)) or \
-                                     (trade.side == 'SHORT' and (trade.current_stop_loss is None or new_stop_loss < trade.current_stop_loss))
+                    is_improvement = (trade.side == 'LONG' and new_stop_loss > (trade.current_stop_loss or float('-inf'))) or \
+                                     (trade.side == 'SHORT' and new_stop_loss < (trade.current_stop_loss or float('inf')))
                     is_valid_to_set = (trade.side == 'LONG' and new_stop_loss < current_price) or \
                                       (trade.side == 'SHORT' and new_stop_loss > current_price)
 
@@ -216,71 +216,120 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                             trade.current_stop_loss = new_stop_loss
                             message_was_edited = True
                             status_title_update = f"💰 Stop-Gain Ativado (+{user.stop_gain_lock_pct:.2f}%)"
-                            logger.info(f"{log_prefix} Stop loss movido para ${new_stop_loss:.4f} para garantir +{user.stop_gain_lock_pct:.2f}% de lucro.")
+                            logger.info(f"{log_prefix} Stop loss movido para ${new_stop_loss:.4f} (lock).")
                         else:
-                            logger.error(f"{log_prefix} Falha ao mover SL para o nível de Stop-Gain. Erro: {sl_result.get('error', 'desconhecido')}")
-                    elif not is_valid_to_set:
-                        logger.warning(f"{log_prefix} Nível de stop-gain inválido vs preço atual "
-                                       f"(side={trade.side}, sl={new_stop_loss:.4f}, last={current_price:.4f}). Ignorando este ciclo.")
+                            logger.error(f"{log_prefix} Falha ao mover SL (lock). Erro: {sl_result.get('error', 'desconhecido')}")
 
-            # --- TAKE PROFIT ---
-            targets_hit_this_run = []
+            # --- LÓGICA DE TAKE PROFIT: AGORA SOMENTE APÓS EXECUÇÃO REAL ---
+            targets_executados_este_ciclo = []
             if trade.initial_targets:
-                for target_price in trade.initial_targets:
+                for target_price in list(trade.initial_targets):
                     is_target_hit = (trade.side == 'LONG' and current_price >= target_price) or \
                                     (trade.side == 'SHORT' and current_price <= target_price)
                     
-                    if is_target_hit:
-                        logger.info(f"TRADE {trade.symbol}: Alvo de TP em ${target_price:.4f} atingido!")
-                        if not trade.total_initial_targets or trade.total_initial_targets <= 0:
-                            logger.warning(f"TRADE {trade.symbol}: 'total_initial_targets' inválido ({trade.total_initial_targets}). Impossível calcular fechamento parcial.")
-                            continue
+                    if not is_target_hit:
+                        continue
 
-                        qty_to_close = trade.qty / trade.total_initial_targets
-                        
-                        position_idx_to_close = 0  # Padrão para One-Way
-                        if trade.side == 'LONG':
-                            position_idx_to_close = 1
-                        elif trade.side == 'SHORT':
-                            position_idx_to_close = 2
-                        
-                        close_result = await close_partial_position(
-                            api_key, 
-                            api_secret, 
-                            trade.symbol, 
-                            qty_to_close, 
-                            trade.side,
-                            position_idx_to_close  # a função resolve o estado real; mantemos por compat
+                    # Calcula a fração a fechar (fixa por design)
+                    if not trade.total_initial_targets or trade.total_initial_targets <= 0:
+                        logger.warning(f"TRADE {trade.symbol}: 'total_initial_targets' inválido ({trade.total_initial_targets}). Impossível calcular fechamento parcial.")
+                        continue
+
+                    qty_to_close = trade.qty / trade.total_initial_targets
+
+                    # Determinar índice de posição em modo hedge; em one-way será ignorado pela service
+                    position_idx_to_close = 0
+                    if trade.side == 'LONG':
+                        position_idx_to_close = 1
+                    elif trade.side == 'SHORT':
+                        position_idx_to_close = 2
+
+                    logger.info(
+                        "[tp:crossed] symbol=%s side=%s target=%.4f last=%.4f msg='preço cruzou TP; tentando executar redução'",
+                        trade.symbol, trade.side, float(target_price), float(current_price)
+                    )
+
+                    close_result = await close_partial_position(
+                        api_key,
+                        api_secret,
+                        trade.symbol,
+                        qty_to_close,
+                        trade.side,
+                        position_idx_to_close
+                    )
+
+                    if close_result.get("success"):
+                        # Somente aqui consideramos TP 'EXECUTADO'
+                        targets_executados_este_ciclo.append(target_price)
+                        try:
+                            trade.remaining_qty = (trade.remaining_qty or trade.qty) - qty_to_close
+                            if trade.remaining_qty < 0:
+                                trade.remaining_qty = 0.0
+                        except Exception:
+                            # fallback para coerência mínima
+                            trade.remaining_qty = max(0.0, (trade.remaining_qty or 0.0) - qty_to_close)
+
+                        message_was_edited = True
+                        status_title_update = "🎯 Take Profit EXECUTADO!"
+                        logger.info(
+                            "[tp:executed] symbol=%s side=%s target=%.4f qty_closed=%.6f remaining=%.6f",
+                            trade.symbol, trade.side, float(target_price), float(qty_to_close), float(trade.remaining_qty or 0.0)
                         )
-                        if close_result.get("success"):
-                            targets_hit_this_run.append(target_price)
-                            trade.remaining_qty -= qty_to_close
-                        else:
-                            logger.error(f"TRADE {trade.symbol}: Falha ao fechar posição parcial para o alvo ${target_price:.4f}. Erro: {close_result.get('error')}")
-
-            if targets_hit_this_run:
-                trade.initial_targets = [t for t in trade.initial_targets if t not in targets_hit_this_run]
-                message_was_edited = True
-                status_title_update = "🎯 Take Profit Atingido!"
-
-            # --- ESTRATÉGIA DE STOP ---
-            if user.stop_strategy == 'BREAK_EVEN':
-                if targets_hit_this_run and not trade.is_breakeven:
-                    new_stop_loss = trade.entry_price
-                    is_valid_to_set = (trade.side == 'LONG' and new_stop_loss < current_price) or \
-                                      (trade.side == 'SHORT' and new_stop_loss > current_price)
-                    if not is_valid_to_set:
-                        logger.warning(f"[Break-Even {trade.symbol}] BE inválido vs preço atual "
-                                       f"(side={trade.side}, entry={new_stop_loss:.4f}, last={current_price:.4f}). Ignorando este ciclo.")
                     else:
-                        sl_result = await modify_position_stop_loss(api_key, api_secret, trade.symbol, new_stop_loss)
-                        if sl_result.get("success"):
-                            trade.is_breakeven = True
-                            trade.current_stop_loss = new_stop_loss
-                            message_was_edited = True
-                            status_title_update = "🛡️ Stop Movido (Break-Even)"
-                        else:
-                            logger.error(f"TRADE {trade.symbol}: Falha ao mover SL para Break-Even. Erro: {sl_result.get('error', 'desconhecido')}")
+                        # NÃO remaja targets nem mexe em remaining_qty; apenas loga erro
+                        err = close_result.get("error", "desconhecido")
+                        logger.error(
+                            "[tp:failed] symbol=%s side=%s target=%.4f reason=%s",
+                            trade.symbol, trade.side, float(target_price), err
+                        )
+
+            # Remoção de targets somente após execuções confirmadas
+            if targets_executados_este_ciclo:
+                trade.initial_targets = [t for t in trade.initial_targets if t not in targets_executados_este_ciclo]
+                message_was_edited = True
+                # Se já havia um título (ex.: Stop-Gain), mantemos o mais “forte”
+                if not status_title_update:
+                    status_title_update = "🎯 Take Profit EXECUTADO!"
+
+            # --- BREAK_EVEN por TP (1º TP -> entrada; subsequentes -> preço do TP) ---
+            if user.stop_strategy == 'BREAK_EVEN' and targets_executados_este_ciclo:
+                # Escolhe o TP de referência deste ciclo (o mais "distante" a favor)
+                tp_ref = max(targets_executados_este_ciclo) if trade.side == 'LONG' else min(targets_executados_este_ciclo)
+
+                if not trade.is_breakeven:
+                    desired_sl = float(trade.entry_price)
+                    reason = "Break-Even Ativado (1º TP)"
+                else:
+                    desired_sl = float(tp_ref)
+                    reason = f"Break-Even Avançado (TP {tp_ref:.4f})"
+
+                # Regras de melhoria e validade vs preço atual
+                is_improvement = (trade.side == 'LONG' and desired_sl > (trade.current_stop_loss or float('-inf'))) or \
+                                (trade.side == 'SHORT' and desired_sl < (trade.current_stop_loss or float('inf')))
+                is_valid_to_set = (trade.side == 'LONG' and desired_sl < current_price) or \
+                                (trade.side == 'SHORT' and desired_sl > current_price)
+
+                if is_improvement and is_valid_to_set:
+                    sl_result = await modify_position_stop_loss(api_key, api_secret, trade.symbol, desired_sl)
+                    if sl_result.get("success"):
+                        trade.is_breakeven = True
+                        trade.current_stop_loss = desired_sl
+                        message_was_edited = True
+                        status_title_update = f"🛡️ {reason}"
+                        logger.info(
+                            "[be:set] symbol=%s side=%s desired_sl=%.4f last=%.4f",
+                            trade.symbol, trade.side, desired_sl, float(current_price)
+                        )
+                    else:
+                        logger.error(
+                            "[be:failed] symbol=%s desired_sl=%.4f reason=%s",
+                            trade.symbol, desired_sl, sl_result.get('error', 'desconhecido')
+                        )
+                else:
+                    logger.info(
+                        "[be:skip] symbol=%s improvement=%s valid=%s desired=%.4f last=%.4f current_stop=%.4f",
+                        trade.symbol, is_improvement, is_valid_to_set, desired_sl, float(current_price), float(trade.current_stop_loss or 0.0)
+                    )
             
             elif user.stop_strategy == 'TRAILING_STOP':
                 first_tp_hit = trade.total_initial_targets is not None and \
@@ -291,22 +340,16 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                     log_prefix = f"[Trailing Stop {trade.symbol}]"
                     if not trade.is_breakeven:
                         new_stop_loss = trade.entry_price
-                        is_valid_to_set = (trade.side == 'LONG' and new_stop_loss < current_price) or \
-                                          (trade.side == 'SHORT' and new_stop_loss > current_price)
-                        if not is_valid_to_set:
-                            logger.warning(f"{log_prefix} Break-Even inválido vs preço atual "
-                                           f"(side={trade.side}, entry={new_stop_loss:.4f}, last={current_price:.4f}). Ignorando este ajuste neste ciclo.")
+                        logger.info(f"{log_prefix} Primeiro alvo executado. Movendo SL para Break-Even em ${new_stop_loss:.4f}.")
+                        sl_result = await modify_position_stop_loss(api_key, api_secret, trade.symbol, new_stop_loss)
+                        if sl_result.get("success"):
+                            trade.is_breakeven = True
+                            trade.current_stop_loss = new_stop_loss
+                            trade.trail_high_water_mark = new_stop_loss
+                            message_was_edited = True
+                            status_title_update = "🛡️ Stop Movido (Break-Even)"
                         else:
-                            logger.info(f"{log_prefix} Primeiro alvo atingido. Movendo SL para Break-Even em ${new_stop_loss:.4f}.")
-                            sl_result = await modify_position_stop_loss(api_key, api_secret, trade.symbol, new_stop_loss)
-                            if sl_result.get("success"):
-                                trade.is_breakeven = True
-                                trade.current_stop_loss = new_stop_loss
-                                trade.trail_high_water_mark = new_stop_loss
-                                message_was_edited = True
-                                status_title_update = "🛡️ Stop Movido (Break-Even)"
-                            else:
-                                logger.error(f"{log_prefix} Falha ao mover SL para Break-Even. Erro: {sl_result.get('error', 'desconhecido')}")
+                            logger.error(f"{log_prefix} Falha ao mover SL para Break-Even. Erro: {sl_result.get('error', 'desconhecido')}")
                     else:
                         if trade.trail_high_water_mark is None:
                             trade.trail_high_water_mark = trade.entry_price
@@ -320,11 +363,12 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                             logger.info(f"{log_prefix} Novo pico de preço: ${new_hwm:.4f}")
                             trade.trail_high_water_mark = new_hwm
 
-                        trail_distance = abs(trade.entry_price - trade.stop_loss) if trade.stop_loss is not None else trade.entry_price * 0.02
-                        potential_new_sl = trade.trail_high_water_mark - trail_distance if trade.side == 'LONG' else trade.trail_high_water_mark + trail_distance
+                        trail_distance = abs(trade.entry_price - (trade.stop_loss or trade.entry_price * 0.98)) \
+                                         if trade.stop_loss is not None else trade.entry_price * 0.02
+                        potential_new_sl = new_hwm - trail_distance if trade.side == 'LONG' else new_hwm + trail_distance
                         
-                        is_improvement = (trade.side == 'LONG' and (trade.current_stop_loss is None or potential_new_sl > trade.current_stop_loss)) or \
-                                         (trade.side == 'SHORT' and (trade.current_stop_loss is None or potential_new_sl < trade.current_stop_loss))
+                        is_improvement = (trade.side == 'LONG' and potential_new_sl > (trade.current_stop_loss or float('-inf'))) or \
+                                         (trade.side == 'SHORT' and potential_new_sl < (trade.current_stop_loss or float('inf')))
                         
                         if is_improvement:
                             is_valid_to_set = (trade.side == 'LONG' and potential_new_sl < current_price) or \
@@ -337,9 +381,8 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                                     status_title_update = "📈 Trailing Stop Ajustado"
                                 else:
                                     logger.error(f"{log_prefix} Falha ao mover Trailing SL. Erro: {sl_result.get('error', 'desconhecido')}")
-                            else:
-                                logger.debug(f"{log_prefix} SL proposto não é válido vs preço atual (side={trade.side}, sl={potential_new_sl:.4f}, last={current_price:.4f}).")
 
+            # --- Atualização da mensagem do Telegram ---
             if message_was_edited and trade.notification_message_id:
                 try:
                     pnl_data = live_pnl_map.get(trade.symbol)
@@ -357,13 +400,11 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                         try:
                             pnl_data = live_pnl_map.get(trade.symbol)
                             msg_text = _generate_trade_status_message(trade, "🔄 Status Sincronizado", pnl_data, current_price)
-                            
                             new_message = await application.bot.send_message(
                                 chat_id=user.telegram_id,
                                 text=msg_text,
                                 parse_mode='HTML'
                             )
-                            
                             trade.notification_message_id = new_message.message_id
                             db.commit()
                             logger.info(f"Mensagem de trade para {trade.symbol} recriada com novo ID: {new_message.message_id}")
@@ -371,6 +412,7 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                             logger.error(f"Falha CRÍTICA ao tentar recriar a mensagem de status para {trade.symbol}: {send_e}", exc_info=True)
 
         else:
+            # (inalterado) Detetive de fechamento
             logger.info(f"[tracker] Posição para {trade.symbol} não encontrada. Usando o detetive...")
             closed_info_result = await get_last_closed_trade_info(api_key, api_secret, trade.symbol)
             final_message = ""
@@ -390,7 +432,7 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                     trade.status = 'CLOSED_LOSS' if pnl < 0 else 'CLOSED_STOP_GAIN'
                     emoji = "🛑" if pnl < 0 else "✅"
                     final_message = f"{emoji} <b>Posição Fechada (STOP)</b>\n<b>Moeda:</b> {trade.symbol}\n<b>Resultado Final:</b> ${pnl:,.2f}"
-                else: 
+                else:
                     trade.status = 'CLOSED_GHOST'
                     final_message = f"ℹ️ Posição em <b>{trade.symbol}</b> foi fechada na corretora.\n<b>Resultado:</b> ${pnl:,.2f}"
             else:

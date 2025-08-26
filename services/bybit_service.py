@@ -1,11 +1,13 @@
 import logging
 import asyncio
+import os
+import random
 from typing import Dict, Any
 from datetime import datetime, time, timedelta
 from pybit.unified_trading import HTTP
 from pybit.exceptions import InvalidRequestError
 from database.models import User
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN, ROUND_CEILING
 
 logger = logging.getLogger(__name__)
 INSTRUMENT_INFO_CACHE: Dict[str, Any] = {}
@@ -20,6 +22,13 @@ def _round_down_to_tick(price: Decimal, tick: Decimal) -> Decimal:
     if tick <= 0:
         return price
     return (price // tick) * tick
+
+def _round_up_to_tick(price: Decimal, tick: Decimal) -> Decimal:
+    if tick <= 0:
+        return price
+    # arredonda para o múltiplo de tick acima
+    return ( (price / tick).to_integral_value(rounding=ROUND_CEILING) ) * tick
+
 
 async def get_instrument_info(symbol: str) -> Dict[str, Any]:
     """
@@ -451,99 +460,145 @@ async def close_partial_position(api_key: str, api_secret: str, symbol: str, qty
         return {"success": False, "error": str(e)}
 
 async def modify_position_stop_loss(api_key: str, api_secret: str, symbol: str, new_stop_loss: float) -> dict:
-    """Modifica o Stop Loss de uma posição aberta garantindo:
-    - arredondamento ao tickSize
-    - coerência com o lado REAL da posição (Buy/Sell)
-    - SL válido vs preço atual (evita 10001 'should lower/higher than base_price')
-    - positionIdx em Hedge (quando aplicável)
     """
+    Modifica o Stop Loss com margem de segurança anti-race + retry inteligente:
+    - Detecta lado real da posição (Buy/Sell).
+    - Arredonda ao tick (down p/ LONG, up p/ SHORT).
+    - Garante SL estritamente além do Last por N ticks (TF_SAFETY_TICKS, default=2).
+    - Retry em 10001, aumentando a folga (+1 tick por tentativa) e refazendo o cálculo com backoff+jitter.
+    """
+    SAFETY_TICKS_BASE = int(os.getenv("TF_SAFETY_TICKS", "2"))
+    RETRY_MAX = int(os.getenv("TF_RETRY_MAX", "3"))
+    RETRY_BASE_MS = int(os.getenv("TF_RETRY_BASE_MS", "120"))
+
     try:
         # 1) Regras do instrumento (tick)
         instrument_rules = await get_instrument_info(symbol)
         if not instrument_rules.get("success"):
             error_msg = instrument_rules.get("error", f"Regras do instrumento {symbol} não encontradas.")
-            logger.error(f"Falha ao obter regras para {symbol} antes de modificar SL: {error_msg}")
+            logger.error(f"[modify_sl] Falha regras {symbol}: {error_msg}")
             return {"success": False, "error": error_msg}
-        tick_size = instrument_rules.get("tickSize", Decimal("0"))
 
-        # Helpers locais
-        def _round_up_to_tick(price: Decimal, tick: Decimal) -> Decimal:
-            if tick <= 0:
-                return price
-            # ceil para múltiplo do tick
-            mult_floor = (price / tick).to_integral_value(rounding=ROUND_DOWN)
-            candidate = mult_floor * tick
-            if candidate < price:
-                candidate = (mult_floor + 1) * tick
-            return candidate
+        tick_size: Decimal = instrument_rules.get("tickSize", Decimal("0")) or Decimal("0")
+        if tick_size <= 0:
+            return {"success": False, "error": f"tickSize inválido para {symbol}."}
+
+        desired = Decimal(str(new_stop_loss))
 
         def _sync_call():
-            try:
-                session = get_session(api_key, api_secret)
+            session = get_session(api_key, api_secret)
 
-                # 2) Descobre a posição atual (lado real + idx)
+            def resolve_side_and_last():
+                # lado real da posição
                 pos_resp = session.get_positions(category="linear", symbol=symbol)
                 if pos_resp.get("retCode") != 0:
-                    return {"success": False, "error": pos_resp.get("retMsg", "Falha ao obter posição atual")}
-                pos_items = (pos_resp.get("result", {}) or {}).get("list", []) or []
-                pos_open = [p for p in pos_items if float(p.get("size") or 0) > 0]
-                if not pos_open:
-                    logger.warning(f"[bybit_service] modify_position_stop_loss: nenhuma posição aberta em {symbol}.")
-                    return {"success": False, "error": "no_open_position"}
+                    return None, None, pos_resp.get("retMsg", "falha get_positions")
+                pos_list = (pos_resp.get("result", {}) or {}).get("list", []) or []
+                pos = next((p for p in pos_list if float(p.get("size", 0) or 0) > 0), None)
+                if not pos:
+                    return None, None, "Nenhuma posição aberta encontrada para ajustar SL."
+                pos_side_api = pos.get("side")  # "Buy" (LONG) ou "Sell" (SHORT)
 
-                p0 = pos_open[0]
-                pos_side_api = (p0.get("side") or "").strip()  # "Buy" (LONG) ou "Sell" (SHORT)
-                pos_idx_api = int(p0.get("positionIdx") or 0)
+                # last price
+                t = session.get_tickers(category="linear", symbol=symbol)
+                if t.get("retCode") != 0 or not (t.get("result", {}).get("list") or []):
+                    return None, None, t.get("retMsg", "falha get_tickers")
+                last = Decimal(str(t["result"]["list"][0]["lastPrice"]))
 
-                # 3) Preço atual
-                t_resp = session.get_tickers(category="linear", symbol=symbol)
-                if t_resp.get("retCode") != 0 or not (t_resp.get("result", {}).get("list") or []):
-                    return {"success": False, "error": t_resp.get("retMsg", "Falha ao obter preço atual")}
-                last_price = Decimal(str(t_resp["result"]["list"][0]["lastPrice"]))
+                return pos_side_api, last, None
 
-                # 4) Arredondamento do SL ao tick + ajustes vs regra (Buy < last, Sell > last)
-                sl_price_decimal = Decimal(str(new_stop_loss))
-                rounded_sl_price = _round_down_to_tick(sl_price_decimal, tick_size)
-                adjusted_price = rounded_sl_price
+            def calc_adjusted_sl(pos_side_api: str, last: Decimal, safety_ticks: int) -> Decimal | None:
+                is_long = (pos_side_api == "Buy")
+                is_short = (pos_side_api == "Sell")
 
-                if pos_side_api == "Buy":
-                    # Para LONG, SL precisa ser ESTRITAMENTE menor que o preço atual
-                    if adjusted_price >= last_price:
-                        adjusted_price = _round_down_to_tick(last_price - tick_size, tick_size)
+                # arredonda ao tick conforme direção
+                if is_long:
+                    rounded_desired = _round_down_to_tick(desired, tick_size)
                 else:
-                    # Para SHORT, SL precisa ser ESTRITAMENTE maior que o preço atual
-                    if adjusted_price <= last_price:
-                        adjusted_price = _round_up_to_tick(last_price + tick_size, tick_size)
+                    rounded_desired = _round_up_to_tick(desired, tick_size)
 
-                logger.info(
-                    f"Modificando SL para {symbol}: side={pos_side_api}, "
-                    f"Original={sl_price_decimal}, Tick={tick_size}, "
-                    f"Rounded={rounded_sl_price}, Last={last_price}, Adjusted={adjusted_price}"
-                )
-
-                # 5) Monta payload; em Hedge, incluir idx da posição aberta (1=LONG/Buy, 2=SHORT/Sell)
-                payload = {"category": "linear", "symbol": symbol, "stopLoss": str(adjusted_price)}
-                # Heurística: se o idx retornado for 1 ou 2, incluir. Em one-way Bybit ignora com segurança.
-                if pos_idx_api in (1, 2):
-                    payload["positionIdx"] = pos_idx_api
-
-                # Log seguro do payload
-                _safe_log_order_payload("modify_sl", payload)
-
-                # 6) Chamada à API
-                response = session.set_trading_stop(**payload)
-                if response.get('retCode') == 0:
-                    return {"success": True, "data": response['result']}
+                # aplica margem de segurança dinâmica
+                if is_long:
+                    raw_limit = last - (tick_size * safety_ticks)
+                    limit_floor = _round_down_to_tick(raw_limit, tick_size)
+                    if limit_floor >= last:
+                        limit_floor = limit_floor - tick_size
+                    adjusted = min(rounded_desired, limit_floor)
+                    if not (adjusted < last):
+                        return None  # inválido vs preço base
                 else:
-                    msg = response.get('retMsg')
-                    return {"success": False, "error": msg}
+                    raw_limit = last + (tick_size * safety_ticks)
+                    limit_ceil = _round_up_to_tick(raw_limit, tick_size)
+                    if limit_ceil <= last:
+                        limit_ceil = limit_ceil + tick_size
+                    adjusted = max(rounded_desired, limit_ceil)
+                    if not (adjusted > last):
+                        return None  # inválido vs preço base
 
-            except InvalidRequestError as e:
-                # "not modified" não é erro funcional
-                if "not modified" in str(e).lower():
-                    logger.info(f"SL para {symbol} já está no valor alvo. Tratando como sucesso.")
-                    return {"success": True, "data": {"note": "not modified"}}
-                raise e
+                return adjusted
+
+            last_error = None
+
+            for attempt in range(1, RETRY_MAX + 1):
+                pos_side_api, last, err = resolve_side_and_last()
+                if err:
+                    last_error = err
+                    logger.error("[modify_sl:resolve_fail] symbol=%s attempt=%s reason=%s", symbol, attempt, err)
+                    # Se falha em resolver lado/preço, não adianta tentar 10001; mas ainda tentamos recuperar nas próximas
+                    # caso fosse um 5xx temporário.
+                else:
+                    safety_ticks = SAFETY_TICKS_BASE + (attempt - 1)  # aumenta 1 a cada tentativa
+                    adjusted = calc_adjusted_sl(pos_side_api, last, safety_ticks)
+                    logger.info(
+                        "[modify_sl:calc] symbol=%s attempt=%s side=%s desired=%s tick=%s last=%s safety_ticks=%s adjusted=%s",
+                        symbol, attempt, pos_side_api, str(desired), str(tick_size), str(last), safety_ticks, str(adjusted)
+                    )
+
+                    if adjusted is None:
+                        last_error = "SL calculado inválido vs preço atual (anti-race)."
+                    else:
+                        payload = {"category": "linear", "symbol": symbol, "stopLoss": str(adjusted)}
+                        logger.info("[order_payload:modify_sl] %s", {
+                            "category": "linear", "symbol": symbol,
+                            "price": "omitted", "takeProfit": "omitted",
+                            "stopLoss": str(adjusted), "reduceOnly": False, "positionIdx": "omitted"
+                        })
+
+                        try:
+                            response = session.set_trading_stop(**payload)
+                            if response.get('retCode') == 0:
+                                return {"success": True, "data": response['result']}
+                            else:
+                                last_error = response.get('retMsg')
+                                logger.error("[modify_sl:api_fail] symbol=%s attempt=%s retMsg=%s", symbol, attempt, last_error)
+                        except InvalidRequestError as e:
+                            emsg = str(e)
+                            emsg_low = emsg.lower()
+                            # not modified → sucesso (no-op)
+                            if "not modified" in emsg_low:
+                                logger.info("[modify_sl:noop] %s", emsg)
+                                return {"success": True, "data": {"note": "not modified"}}
+
+                            # 10001 → possível race vs base_price → retry
+                            if "10001" in emsg or "should lower than base_price" in emsg_low or "should higher than base_price" in emsg_low:
+                                last_error = emsg
+                                logger.warning("[modify_sl:retry_10001] symbol=%s attempt=%s reason=%s", symbol, attempt, emsg)
+                            # 10002 / timestamp / recv_window → pequeno backoff e retry
+                            elif "10002" in emsg or "timestamp" in emsg_low or "recv_window" in emsg_low:
+                                last_error = emsg
+                                logger.warning("[modify_sl:retry_10002] symbol=%s attempt=%s reason=%s", symbol, attempt, emsg)
+                            else:
+                                # erro não recuperável → aborta
+                                logger.error("[modify_sl:abort] symbol=%s attempt=%s reason=%s", symbol, attempt, emsg)
+                                return {"success": False, "error": emsg}
+
+                # Backoff com jitter antes da próxima tentativa
+                if attempt < RETRY_MAX:
+                    sleep_ms = (RETRY_BASE_MS * (2 ** (attempt - 1))) + int(random.uniform(0, 150))
+                    time.sleep(sleep_ms / 1000.0)
+
+            # esgotou tentativas
+            return {"success": False, "error": last_error or "Falha desconhecida ao ajustar SL."}
 
         return await asyncio.to_thread(_sync_call)
 
@@ -801,7 +856,8 @@ async def get_closed_pnl_breakdown(api_key: str, api_secret: str, start_time: da
 # --- POSIÇÕES ABERTAS COM PNL ATUAL ---
 async def get_open_positions_with_pnl(api_key: str, api_secret: str) -> dict:
     """
-    Lista posições abertas com avgPrice, markPrice e P/L atual (valor e %).
+    Lista posições abertas com avgPrice, markPrice e P/L atual (valor e %), deduplicando por (symbol, side, positionIdx).
+    Mantém apenas uma entrada por chave; se houver duplicatas, fica a de maior size.
     """
     def _sync_call():
         try:
@@ -809,15 +865,21 @@ async def get_open_positions_with_pnl(api_key: str, api_secret: str) -> dict:
             resp = session.get_positions(category="linear", settleCoin="USDT")
             if resp.get("retCode") != 0:
                 return {"success": False, "error": resp.get("retMsg", "erro")}
-            out = []
+
+            seen = {}  # key -> item
             for p in (resp.get("result", {}).get("list", []) or []):
                 size = float(p.get("size", 0) or 0)
                 if size <= 0:
                     continue
+
                 symbol = p.get("symbol")
-                side = "LONG" if (p.get("side") == "Buy") else "SHORT"
+                pos_side_api = p.get("side")  # "Buy" ou "Sell"
+                side = "LONG" if (pos_side_api == "Buy") else "SHORT"
                 entry = float(p.get("avgPrice", 0) or 0)
                 mark = float((p.get("markPrice") or 0) or 0)
+                pos_idx = int(p.get("positionIdx", 0))
+                key = (symbol, side, pos_idx)
+
                 # se mark vier 0, tenta buscar via tickers
                 if not mark and symbol:
                     try:
@@ -825,15 +887,16 @@ async def get_open_positions_with_pnl(api_key: str, api_secret: str) -> dict:
                         mark = float(t["result"]["list"][0]["lastPrice"])
                     except Exception:
                         pass
+
                 if not entry or not mark:
-                    # não dá pra calcular PnL sem preço
                     pnl = 0.0
                     pnl_pct = 0.0
                 else:
                     diff = (mark - entry) if side == "LONG" else (entry - mark)
                     pnl = diff * size
                     pnl_pct = (diff / entry) * 100.0 if entry else 0.0
-                out.append({
+
+                item = {
                     "symbol": symbol,
                     "side": side,
                     "size": size,
@@ -841,8 +904,20 @@ async def get_open_positions_with_pnl(api_key: str, api_secret: str) -> dict:
                     "mark": mark,
                     "unrealized_pnl": pnl,
                     "unrealized_pnl_pct": pnl_pct,
-                    "position_idx": int(p.get("positionIdx", 0))
-                })
+                    "position_idx": pos_idx
+                }
+
+                if key in seen:
+                    # mantém a maior posição e loga para auditoria
+                    if size > seen[key]["size"]:
+                        logger.info("[positions:dedupe:replace] key=%s old_size=%.8f new_size=%.8f", key, seen[key]["size"], size)
+                        seen[key] = item
+                    else:
+                        logger.info("[positions:dedupe:skip] key=%s keep_size=%.8f skip_size=%.8f", key, seen[key]["size"], size)
+                else:
+                    seen[key] = item
+
+            out = list(seen.values())
             return {"success": True, "data": out}
         except Exception as e:
             logger.error(f"Exceção em get_open_positions_with_pnl: {e}", exc_info=True)
