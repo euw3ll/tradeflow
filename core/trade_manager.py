@@ -184,9 +184,9 @@ async def process_new_signal(signal_data: dict, application: Application, source
                 # 1. Verifica se há uma pausa ativa para a direção do sinal
                 signal_side = signal_data.get('order_type')
                 is_paused = False
-                if signal_side == 'LONG' and user.long_trades_paused_until and datetime.now(pytz.utc) < user.long_trades_paused_until:
+                if signal_side == 'LONG' and user.long_trades_paused_until and datetime.utcnow() < user.long_trades_paused_until:
                     is_paused = True
-                elif signal_side == 'SHORT' and user.short_trades_paused_until and datetime.now(pytz.utc) < user.short_trades_paused_until:
+                elif signal_side == 'SHORT' and user.short_trades_paused_until and datetime.utcnow() < user.short_trades_paused_until:
                     is_paused = True
                 
                 if is_paused:

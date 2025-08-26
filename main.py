@@ -34,6 +34,8 @@ from services.telethon_service import start_signal_monitor
 from core.position_tracker import run_tracker
 
 import warnings
+from telegram.ext import PTBUserWarning
+warnings.filterwarnings("ignore", category=PTBUserWarning)
 warnings.filterwarnings("ignore", category=UserWarning, module="telegram.ext.conversationhandler")
 logging.getLogger("telegram").setLevel(logging.ERROR)
 logging.getLogger("telegram.ext").setLevel(logging.ERROR)
