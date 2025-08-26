@@ -71,7 +71,7 @@ def get_session(api_key: str, api_secret: str) -> HTTP:
         api_key=api_key,
         api_secret=api_secret,
         timeout=30,
-        recv_window=10000 
+        recv_window=30000  # ↑ aumentamos para mitigar 10002 por drift/latência
     )
 
 def _resolve_position_index(session, symbol: str, close_side: str) -> Dict[str, Any]:
@@ -289,9 +289,9 @@ async def get_market_price(symbol: str) -> dict:
 
 async def close_partial_position(api_key: str, api_secret: str, symbol: str, qty_to_close: float, side: str, position_idx: int) -> dict:
     """Fecha parte de uma posição com Market/ReduceOnly.
-    - Detecta One-Way vs Hedge e o lado REAL da posição no exchange.
-    - Usa o lado real para definir o 'close_side' correto (contrário da posição).
-    - Em 10001 (position idx not match), faz 1 retry alternando a estratégia.
+    - Detecta o lado REAL da posição no exchange (não confia no `side` recebido).
+    - Aplica One-Way vs Hedge automaticamente (usa/omite positionIdx conforme o modo).
+    - Em 110017 (reduceOnly mesmo lado) e 10001 (idx/mode), faz retry defensivo.
     """
     async def pre_flight_checks():
         if symbol not in INSTRUMENT_INFO_CACHE:
@@ -305,51 +305,62 @@ async def close_partial_position(api_key: str, api_secret: str, symbol: str, qty
 
             session = get_session(api_key, api_secret)
 
-            # === 0) Descobre a posição ATUAL no exchange (não confia no parâmetro 'side') ===
+            # 0) Descobre a(s) posição(ões) atual(is) na corretora
             pos_resp = session.get_positions(category="linear", symbol=symbol)
             if pos_resp.get("retCode") != 0:
                 return {"success": False, "error": pos_resp.get("retMsg", "Falha ao obter posições atuais")}
             pos_items = (pos_resp.get("result", {}) or {}).get("list", []) or []
-            # Seleciona apenas posições com size > 0
             pos_open = [p for p in pos_items if float(p.get("size") or 0) > 0]
 
             if not pos_open:
                 logger.warning(f"[bybit_service] close_partial: nenhuma posição aberta em {symbol}. Nada a fechar.")
                 return {"success": True, "skipped": True, "reason": "no_open_position"}
 
-            # Em One-Way haverá 1 item; em Hedge podem existir 1 (apenas um lado) ou 2 (ambos os lados)
-            # Pegamos a posição que realmente está aberta (size>0). Se houver 2 (raro), fecharemos a que tiver size>0 condizente.
-            # Priorizamos a primeira por simplicidade (poderia somar qtys e fechar proporcional se preciso).
+            # Se houver mais de uma (hedge com ambos os lados), priorizamos a primeira com size>0.
             p0 = pos_open[0]
             pos_side_api = (p0.get("side") or "").strip()  # "Buy" (LONG) ou "Sell" (SHORT)
             pos_idx_api = int(p0.get("positionIdx") or 0)
 
-            # Lado correto para REDUZIR: contrário do lado da posição
-            # - Se posição atual é Buy (LONG) => close_side deve ser "Sell"
-            # - Se posição atual é Sell (SHORT) => close_side deve ser "Buy"
+            # 1) Lado correto de fechamento é o CONTRÁRIO do lado da posição
             close_side = "Sell" if pos_side_api == "Buy" else "Buy"
 
-            # === 1) Ajusta qty pela regra do instrumento ===
+            # 2) Ajuste de quantidade ao step e checagens mínimas
             qty_raw = Decimal(str(qty_to_close))
             qty_adj = _round_down_to_step(qty_raw, instrument_rules["qtyStep"])
-            logger.info(f"[bybit_service] close_partial {symbol}: raw={qty_raw}, step={instrument_rules['qtyStep']}, minQty={instrument_rules['minOrderQty']} => adj={qty_adj}")
-
+            logger.info(
+                f"[bybit_service] close_partial {symbol}: raw={qty_raw}, "
+                f"step={instrument_rules['qtyStep']}, minQty={instrument_rules['minOrderQty']} => adj={qty_adj}"
+            )
             if qty_adj < instrument_rules["minOrderQty"]:
-                logger.warning(f"Quantidade a fechar para {symbol} ({qty_adj:f}) é menor que o mínimo permitido. Ignorando fechamento parcial.")
+                logger.warning(f"Quantidade a fechar para {symbol} ({qty_adj:f}) < mínimo permitido. Ignorando.")
                 return {"success": True, "skipped": True, "reason": "qty_less_than_min_order_qty"}
 
-            # === 2) Resolve mode/idx automaticamente com base no LADO DE FECHAMENTO ===
+            # 3) Resolve modo e índice de posição
+            #    - One-Way: omitir positionIdx
+            #    - Hedge: usar idx do lado da POSIÇÃO (não do lado da ordem)
             resolve = _resolve_position_index(session, symbol, close_side)
             mode = resolve.get("mode", "unknown")
             auto_idx = resolve.get("positionIdx", None)
 
-            # Em hedge, se o resolver não retornou idx por algum motivo, usamos o idx da posição aberta (pos_idx_api)
-            if mode == "hedge" and auto_idx is None:
-                auto_idx = pos_idx_api if pos_idx_api in (1, 2) else (1 if close_side == "Sell" else 2)
+            # Se hedge e o resolver não retornou idx, usar o índice da posição real
+            if mode == "hedge":
+                if auto_idx is None:
+                    if pos_idx_api in (1, 2):
+                        auto_idx = pos_idx_api
+                    else:
+                        # fallback por mapeamento do lado da POSIÇÃO
+                        auto_idx = 1 if pos_side_api == "Buy" else 2
+            else:
+                # one-way: não enviar positionIdx
+                auto_idx = None
 
-            logger.info(f"[bybit_service] resolver: symbol={symbol}, mode={mode}, pos_side_api={pos_side_api}, close_side={close_side}, auto_idx={auto_idx}, pos_idx_api={pos_idx_api}")
+            logger.info(
+                f"[bybit_service] resolver: symbol={symbol}, mode={mode}, "
+                f"pos_side_api={pos_side_api}, close_side={close_side}, "
+                f"auto_idx={auto_idx}, pos_idx_api={pos_idx_api}, details={resolve.get('details')}"
+            )
 
-            # === 3) Monta payload base ===
+            # 4) Monta payload base
             payload = {
                 "category": "linear",
                 "symbol": symbol,
@@ -358,24 +369,24 @@ async def close_partial_position(api_key: str, api_secret: str, symbol: str, qty
                 "qty": str(qty_adj),
                 "reduceOnly": True,
             }
-            # Em Hedge, usar índice detectado; em One-Way, omitir
             if auto_idx is not None:
-                payload["positionIdx"] = auto_idx
+                payload["positionIdx"] = auto_idx  # em hedge, vincula ao lado da posição aberta
 
             def _try_place(p):
                 _safe_log_order_payload("close_partial:first_try", p)
                 return session.place_order(**p)
 
-            # === 4) Primeira tentativa ===
+            # 5) Primeira tentativa
             try:
                 response = _try_place(payload)
                 if response.get('retCode') == 0:
                     return {"success": True, "data": response['result']}
-                msg = response.get('retMsg', '')
-                # Caso 110017 (reduce-only com mesmo lado da posição), tentamos inverter close_side (defensivo)
-                if "reduce-only order has same side" in msg.lower():
+                msg = response.get('retMsg', '') or ''
+                # 110017: reduce-only com mesmo lado da posição (corrida entre leitura e envio)
+                if "reduce-only order has same side" in msg.lower() or "110017" in msg:
                     raise InvalidRequestError(msg)
-                if "position idx not match" in msg.lower():
+                # 10001: idx/mode mismatch
+                if "position idx not match" in msg.lower() or "10001" in msg:
                     raise InvalidRequestError(msg)
                 return {"success": False, "error": msg}
 
@@ -385,21 +396,23 @@ async def close_partial_position(api_key: str, api_secret: str, symbol: str, qty
                 alt_strategy = None
 
                 if "reduce-only order has same side" in text or "110017" in text:
-                    # Defensive retry: inverte o lado de fechamento, pois a posição pode ter virado entre leitura e envio
+                    # Defensive: posição pode ter virado entre leitura e envio → inverter lado e ajustar idx
                     alt_payload["side"] = "Buy" if payload["side"] == "Sell" else "Sell"
-                    # Ajusta idx padrão em Hedge (1 => reduzir LONG/Buy, 2 => reduzir SHORT/Sell)
                     if "positionIdx" in alt_payload:
-                        alt_payload["positionIdx"] = 1 if alt_payload["side"] == "Sell" else 2
+                        # idx deve permanecer atrelado ao lado da POSIÇÃO alvo (flip de ordem não muda qual posição queremos reduzir)
+                        # portanto, se flipou a ordem, manter o idx original (da posição aberta)
+                        alt_payload["positionIdx"] = payload.get("positionIdx", pos_idx_api or (1 if pos_side_api == "Buy" else 2))
                     alt_strategy = f"flip_side_{payload['side']}_to_{alt_payload['side']}"
-                    logger.warning(f"[bybit_service] 110017 detectado para {symbol}. Retry invertendo lado: {alt_strategy}")
+                    logger.warning(f"[bybit_service] 110017 detectado para {symbol}. Retry: {alt_strategy}")
 
                 elif "position idx not match" in text or "10001" in text:
-                    # Estratégia da Etapa 2 (alternar presença do idx)
+                    # Alternar presença do idx
                     if "positionIdx" in alt_payload:
                         alt_payload.pop("positionIdx", None)
                         alt_strategy = "remove_positionIdx"
                     else:
-                        alt_payload["positionIdx"] = 1 if alt_payload["side"] == "Sell" else 2
+                        # em hedge, forçar idx coerente com a POSIÇÃO
+                        alt_payload["positionIdx"] = pos_idx_api if pos_idx_api in (1, 2) else (1 if pos_side_api == "Buy" else 2)
                         alt_strategy = f"force_positionIdx_{alt_payload['positionIdx']}"
                     logger.warning(f"[bybit_service] 10001 detectado para {symbol}. Retry com '{alt_strategy}'.")
 
@@ -411,8 +424,18 @@ async def close_partial_position(api_key: str, api_secret: str, symbol: str, qty
                     resp2 = session.place_order(**alt_payload)
                     if resp2.get('retCode') == 0:
                         logger.info(f"[bybit_service] retry sucesso para {symbol} com estratégia '{alt_strategy}'.")
-                        return {"success": True, "data": resp2['result'], "retry": True, "retry_strategy": alt_strategy}
-                    return {"success": False, "error": resp2.get('retMsg', 'Falha no retry'), "retry": True, "retry_strategy": alt_strategy}
+                        return {
+                            "success": True,
+                            "data": resp2['result'],
+                            "retry": True,
+                            "retry_strategy": alt_strategy
+                        }
+                    return {
+                        "success": False,
+                        "error": resp2.get('retMsg', 'Falha no retry'),
+                        "retry": True,
+                        "retry_strategy": alt_strategy
+                    }
                 except InvalidRequestError as e2:
                     return {"success": False, "error": str(e2), "retry": True, "retry_strategy": alt_strategy}
 
@@ -427,39 +450,98 @@ async def close_partial_position(api_key: str, api_secret: str, symbol: str, qty
         logger.error(f"Exceção em close_partial_position (async): {e}", exc_info=True)
         return {"success": False, "error": str(e)}
 
-
 async def modify_position_stop_loss(api_key: str, api_secret: str, symbol: str, new_stop_loss: float) -> dict:
-    """Modifica o Stop Loss de uma posição aberta, garantindo a precisão do preço (tick size)."""
+    """Modifica o Stop Loss de uma posição aberta garantindo:
+    - arredondamento ao tickSize
+    - coerência com o lado REAL da posição (Buy/Sell)
+    - SL válido vs preço atual (evita 10001 'should lower/higher than base_price')
+    - positionIdx em Hedge (quando aplicável)
+    """
     try:
-        # --- INÍCIO DA NOVA LÓGICA ---
-        # 1. Busca as regras do instrumento para obter o tickSize (deve usar o cache)
+        # 1) Regras do instrumento (tick)
         instrument_rules = await get_instrument_info(symbol)
         if not instrument_rules.get("success"):
             error_msg = instrument_rules.get("error", f"Regras do instrumento {symbol} não encontradas.")
             logger.error(f"Falha ao obter regras para {symbol} antes de modificar SL: {error_msg}")
             return {"success": False, "error": error_msg}
-
-        # 2. Arredonda o preço do stop loss para o tick size correto
         tick_size = instrument_rules.get("tickSize", Decimal("0"))
-        sl_price_decimal = Decimal(str(new_stop_loss))
-        rounded_sl_price = _round_down_to_tick(sl_price_decimal, tick_size)
-        
-        logger.info(f"Modificando SL para {symbol}: Original: {sl_price_decimal}, Arredondado ({tick_size}): {rounded_sl_price}")
-        # --- FIM DA NOVA LÓGICA ---
 
-        # 3. Executa a chamada à API em uma thread separada
+        # Helpers locais
+        def _round_up_to_tick(price: Decimal, tick: Decimal) -> Decimal:
+            if tick <= 0:
+                return price
+            # ceil para múltiplo do tick
+            mult_floor = (price / tick).to_integral_value(rounding=ROUND_DOWN)
+            candidate = mult_floor * tick
+            if candidate < price:
+                candidate = (mult_floor + 1) * tick
+            return candidate
+
         def _sync_call():
             try:
                 session = get_session(api_key, api_secret)
-                payload = {"category": "linear", "symbol": symbol, "stopLoss": str(rounded_sl_price)}
+
+                # 2) Descobre a posição atual (lado real + idx)
+                pos_resp = session.get_positions(category="linear", symbol=symbol)
+                if pos_resp.get("retCode") != 0:
+                    return {"success": False, "error": pos_resp.get("retMsg", "Falha ao obter posição atual")}
+                pos_items = (pos_resp.get("result", {}) or {}).get("list", []) or []
+                pos_open = [p for p in pos_items if float(p.get("size") or 0) > 0]
+                if not pos_open:
+                    logger.warning(f"[bybit_service] modify_position_stop_loss: nenhuma posição aberta em {symbol}.")
+                    return {"success": False, "error": "no_open_position"}
+
+                p0 = pos_open[0]
+                pos_side_api = (p0.get("side") or "").strip()  # "Buy" (LONG) ou "Sell" (SHORT)
+                pos_idx_api = int(p0.get("positionIdx") or 0)
+
+                # 3) Preço atual
+                t_resp = session.get_tickers(category="linear", symbol=symbol)
+                if t_resp.get("retCode") != 0 or not (t_resp.get("result", {}).get("list") or []):
+                    return {"success": False, "error": t_resp.get("retMsg", "Falha ao obter preço atual")}
+                last_price = Decimal(str(t_resp["result"]["list"][0]["lastPrice"]))
+
+                # 4) Arredondamento do SL ao tick + ajustes vs regra (Buy < last, Sell > last)
+                sl_price_decimal = Decimal(str(new_stop_loss))
+                rounded_sl_price = _round_down_to_tick(sl_price_decimal, tick_size)
+                adjusted_price = rounded_sl_price
+
+                if pos_side_api == "Buy":
+                    # Para LONG, SL precisa ser ESTRITAMENTE menor que o preço atual
+                    if adjusted_price >= last_price:
+                        adjusted_price = _round_down_to_tick(last_price - tick_size, tick_size)
+                else:
+                    # Para SHORT, SL precisa ser ESTRITAMENTE maior que o preço atual
+                    if adjusted_price <= last_price:
+                        adjusted_price = _round_up_to_tick(last_price + tick_size, tick_size)
+
+                logger.info(
+                    f"Modificando SL para {symbol}: side={pos_side_api}, "
+                    f"Original={sl_price_decimal}, Tick={tick_size}, "
+                    f"Rounded={rounded_sl_price}, Last={last_price}, Adjusted={adjusted_price}"
+                )
+
+                # 5) Monta payload; em Hedge, incluir idx da posição aberta (1=LONG/Buy, 2=SHORT/Sell)
+                payload = {"category": "linear", "symbol": symbol, "stopLoss": str(adjusted_price)}
+                # Heurística: se o idx retornado for 1 ou 2, incluir. Em one-way Bybit ignora com segurança.
+                if pos_idx_api in (1, 2):
+                    payload["positionIdx"] = pos_idx_api
+
+                # Log seguro do payload
                 _safe_log_order_payload("modify_sl", payload)
+
+                # 6) Chamada à API
                 response = session.set_trading_stop(**payload)
                 if response.get('retCode') == 0:
                     return {"success": True, "data": response['result']}
-                return {"success": False, "error": response.get('retMsg')}
+                else:
+                    msg = response.get('retMsg')
+                    return {"success": False, "error": msg}
+
             except InvalidRequestError as e:
+                # "not modified" não é erro funcional
                 if "not modified" in str(e).lower():
-                    logger.info(f"SL para {symbol} já está em {rounded_sl_price}. Tratando como sucesso.")
+                    logger.info(f"SL para {symbol} já está no valor alvo. Tratando como sucesso.")
                     return {"success": True, "data": {"note": "not modified"}}
                 raise e
 
