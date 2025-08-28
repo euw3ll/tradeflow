@@ -206,13 +206,12 @@ async def check_pending_orders_for_user(application: Application, user: User, db
 async def check_active_trades_for_user(application: Application, user: User, db: Session):
     """
     Verifica e gerencia os trades ativos, com edição de mensagem para atualizações.
-
     Regras:
     - TP só é considerado 'executado' após sucesso na redução (retCode == 0).
     - BREAK_EVEN/TRAILING_STOP podem ser ativados de duas formas:
         (A) Padrão: após o 1º TP.
         (B) Opcional por PnL: se user.be_trigger_pct / user.ts_trigger_pct > 0 (sem depender do 1º TP).
-          Esses campos são opcionais no modelo; se não existirem ou forem 0/None, ignora-se o gatilho por PnL.
+    Esses campos são opcionais no modelo; se não existirem ou forem 0/None, ignora-se o gatilho por PnL.
     - Semântica do OFF (user.is_active == False): não abre novas posições nem deixa ordens pendentes,
       mas ESTE gerenciador continua atuando normalmente nas posições abertas.
     """
@@ -376,7 +375,7 @@ async def check_active_trades_for_user(application: Application, user: User, db:
             if user.stop_strategy == 'TRAILING_STOP':
                 # Começo do TS: (A) após 1º TP (padrão) ou (B) por PnL opcional
                 first_tp_hit = trade.total_initial_targets is not None and \
-                               trade.initial_targets is not None and \
+                                 trade.initial_targets is not None and \
                                len(trade.initial_targets) < trade.total_initial_targets
                 ts_started = first_tp_hit or (ts_trigger_pct > 0 and pnl_pct >= ts_trigger_pct)
 
@@ -436,6 +435,7 @@ async def check_active_trades_for_user(application: Application, user: User, db:
 
         else:
             # --- DETETIVE DE FECHAMENTO COM RETENTATIVAS ---
+            # COMENTÁRIO: Lógica de fechamento refatorada para ser mais resiliente e precisa.
             logger.info(f"[tracker] Posição para {trade.symbol} não encontrada. Ativando detetive paciente...")
             
             closed_info_result = {"success": False}  # Começa como falha
@@ -455,7 +455,7 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                     logger.info("[detetive] Falha na tentativa. Aguardando 20 segundos antes de tentar novamente...")
                     await asyncio.sleep(20)
             
-            # Prossegue com a lógica original, usando o resultado final das tentativas
+            # Prossegue com a lógica, usando o resultado final das tentativas
             if closed_info_result.get("success"):
                 closed_data = closed_info_result["data"]
                 pnl = float(closed_data.get("closedPnl", 0.0))
@@ -477,7 +477,7 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                     emoji = "✅" if pnl >= 0 else "🔻"
                     final_message = f"{emoji} <b>Posição Fechada ({resultado_str})</b>\n<b>Moeda:</b> {trade.symbol}\n<b>Resultado:</b> ${pnl:,.2f}"
             else:
-                # Se mesmo após as tentativas falhar, mantém o comportamento original
+                # Se mesmo após as tentativas falhar, mantém o comportamento original de fallback.
                 logger.error(f"[detetive] Falha ao obter detalhes de fechamento para {trade.symbol} após 3 tentativas.")
                 trade.status = 'CLOSED_GHOST'
                 trade.closed_at = func.now()
@@ -486,7 +486,6 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                 final_message = f"ℹ️ Posição em <b>{trade.symbol}</b> foi fechada na corretora. Detalhes de P/L não puderam ser obtidos via API."
 
             await _send_or_edit_trade_message(application, user, trade, db, final_message)
-
 
 async def run_tracker(application: Application):
     """Função principal que roda o verificador em loop para TODOS os usuários."""
