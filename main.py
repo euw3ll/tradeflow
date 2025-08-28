@@ -32,7 +32,11 @@ from bot.handlers import (
     ask_circuit_pause, receive_circuit_pause, ASKING_CIRCUIT_PAUSE,
     ask_ma_timeframe, set_ma_timeframe,
     ask_rsi_oversold, receive_rsi_oversold, ASKING_RSI_OVERSOLD,
-    ask_rsi_overbought, receive_rsi_overbought, ASKING_RSI_OVERBOUGHT
+    ask_rsi_overbought, receive_rsi_overbought, ASKING_RSI_OVERBOUGHT,
+    show_risk_menu_handler,
+    show_stopgain_menu_handler,
+    show_circuit_menu_handler,
+    back_to_settings_menu_handler,
 )
 from database.session import init_db
 from services.telethon_service import start_signal_monitor
@@ -215,6 +219,11 @@ async def main():
     application.add_handler(CallbackQueryHandler(set_ma_timeframe, pattern='^set_ma_timeframe_'))
     application.add_handler(rsi_oversold_conv)
     application.add_handler(rsi_overbought_conv)
+
+    application.add_handler(CallbackQueryHandler(show_risk_menu_handler, pattern='^settings_risk$'))
+    application.add_handler(CallbackQueryHandler(show_stopgain_menu_handler, pattern='^settings_stopgain$'))
+    application.add_handler(CallbackQueryHandler(show_circuit_menu_handler, pattern='^settings_circuit$'))
+    application.add_handler(CallbackQueryHandler(back_to_settings_menu_handler, pattern='^back_to_settings_menu$'))
 
 
     logger.info("Bot configurado. Iniciando todos os serviços...")

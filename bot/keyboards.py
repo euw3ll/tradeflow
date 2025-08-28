@@ -69,43 +69,96 @@ def confirm_remove_keyboard():
     ]
     return InlineKeyboardMarkup(keyboard)
 
-def settings_menu_keyboard(user_settings):
+def settings_menu_keyboard(user) -> InlineKeyboardMarkup:
     """
-    Retorna o teclado do menu de configurações, mostrando os valores atuais.
+    Menu raiz de Configurações: agora exibe categorias (submenus).
+    Mantém itens simples úteis no raiz (Whitelist e Filtros).
     """
-    entry_percent = user_settings.entry_size_percent
-    max_leverage = user_settings.max_leverage
-    min_confidence = user_settings.min_confidence
-
-    stop_gain_trigger = user_settings.stop_gain_trigger_pct
-    stop_gain_lock = user_settings.stop_gain_lock_pct
-
-    circuit_threshold = user_settings.circuit_breaker_threshold
-    circuit_pause = user_settings.circuit_breaker_pause_minutes
-    circuit_text = f"Disjuntor: {circuit_threshold} perdas" if circuit_threshold > 0 else "Disjuntor: Desativado"
-
-    # --- INÍCIO DA NOVA LÓGICA ---
-    # Define o texto do botão de estratégia de stop dinamicamente
-    if user_settings.stop_strategy == 'TRAILING_STOP':
-        strategy_text = "Estratégia de Stop: Trailing Stop 📈"
-    else:
-        strategy_text = "Estratégia de Stop: Break-Even 🛡️"
-    # --- FIM DA NOVA LÓGICA ---
-
-    keyboard = [
-        [InlineKeyboardButton(f"Tamanho da Entrada: {entry_percent:.2f}%", callback_data='set_entry_percent')],
-        [InlineKeyboardButton(f"Alavancagem Máxima: {max_leverage}x", callback_data='set_max_leverage')],
-        [InlineKeyboardButton(f"Confiança Mínima (IA): {min_confidence:.2f}%", callback_data='set_min_confidence')],
-        [InlineKeyboardButton(strategy_text, callback_data='set_stop_strategy')], # <-- NOVO BOTÃO
-        [InlineKeyboardButton(f"Gatilho Stop-Gain: {stop_gain_trigger:.2f}%", callback_data='set_stop_gain_trigger')],
-        [InlineKeyboardButton(f"Segurança Stop-Gain: {stop_gain_lock:.2f}%", callback_data='set_stop_gain_lock')],
-        [InlineKeyboardButton("✅ Whitelist de Moedas", callback_data='set_coin_whitelist')],
-        [InlineKeyboardButton(circuit_text, callback_data='set_circuit_threshold')],
-        [InlineKeyboardButton(f"Pausa Disjuntor: {circuit_pause} min", callback_data='set_circuit_pause')],
-        [InlineKeyboardButton("Filtros de Sinais 🔬", callback_data='signal_filters_menu')],
-        [InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data='back_to_main_menu')]
+    kb = [
+        [
+            InlineKeyboardButton("🧮 Risco & Tamanho", callback_data="settings_risk"),
+            InlineKeyboardButton("🛡️ Stop-Gain", callback_data="settings_stopgain"),
+        ],
+        [
+            InlineKeyboardButton("🚫 Disjuntor", callback_data="settings_circuit"),
+            InlineKeyboardButton("✅ Whitelist", callback_data="set_coin_whitelist"),
+        ],
+        [
+            InlineKeyboardButton("🔬 Filtros de Sinais", callback_data="signal_filters_menu"),
+        ],
+        [
+            InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data="back_to_main_menu"),
+        ],
     ]
-    return InlineKeyboardMarkup(keyboard)
+    return InlineKeyboardMarkup(kb)
+
+
+def risk_menu_keyboard(user) -> InlineKeyboardMarkup:
+    """
+    Submenu: Risco & Tamanho.
+    Mostra valores atuais no rótulo para reforço de contexto.
+    """
+    entry_pct = f"{float(getattr(user, 'entry_size_percent', 0) or 0):.1f}%"
+    leverage  = f"{int(getattr(user, 'max_leverage', 0) or 0)}x"
+    min_conf  = f"{float(getattr(user, 'min_confidence', 0) or 0):.1f}%"
+
+    kb = [
+        [
+            InlineKeyboardButton(f"📥 Tamanho de Entrada ({entry_pct})", callback_data="set_entry_percent"),
+        ],
+        [
+            InlineKeyboardButton(f"⚙️ Alavancagem Máx. ({leverage})", callback_data="set_max_leverage"),
+        ],
+        [
+            InlineKeyboardButton(f"🎯 Confiança Mín. ({min_conf})", callback_data="set_min_confidence"),
+        ],
+        [
+            InlineKeyboardButton("⬅️ Voltar", callback_data="back_to_settings_menu"),
+        ],
+    ]
+    return InlineKeyboardMarkup(kb)
+
+
+def stopgain_menu_keyboard(user) -> InlineKeyboardMarkup:
+    """
+    Submenu: Stop-Gain (gatilho e trava).
+    """
+    trigger = f"{float(getattr(user, 'stop_gain_trigger_pct', 0) or 0):.2f}%"
+    lock    = f"{float(getattr(user, 'stop_gain_lock_pct', 0) or 0):.2f}%"
+
+    kb = [
+        [
+            InlineKeyboardButton(f"🚀 Gatilho Stop-Gain ({trigger})", callback_data="set_stop_gain_trigger"),
+        ],
+        [
+            InlineKeyboardButton(f"🔒 Trava Stop-Gain ({lock})", callback_data="set_stop_gain_lock"),
+        ],
+        [
+            InlineKeyboardButton("⬅️ Voltar", callback_data="back_to_settings_menu"),
+        ],
+    ]
+    return InlineKeyboardMarkup(kb)
+
+
+def circuit_menu_keyboard(user) -> InlineKeyboardMarkup:
+    """
+    Submenu: Disjuntor (threshold e pausa).
+    """
+    threshold = f"{int(getattr(user, 'circuit_breaker_threshold', 0) or 0)}"
+    pause     = f"{int(getattr(user, 'circuit_breaker_pause_minutes', 0) or 0)} min"
+
+    kb = [
+        [
+            InlineKeyboardButton(f"⚡ Limite do Disjuntor ({threshold})", callback_data="set_circuit_threshold"),
+        ],
+        [
+            InlineKeyboardButton(f"⏸️ Pausa após Disparo ({pause})", callback_data="set_circuit_pause"),
+        ],
+        [
+            InlineKeyboardButton("⬅️ Voltar", callback_data="back_to_settings_menu"),
+        ],
+    ]
+    return InlineKeyboardMarkup(kb)
 
 
 def bot_config_keyboard(user_settings):
