@@ -1,9 +1,11 @@
 import logging
 import asyncio
+from telegram import Update
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters, 
-    ConversationHandler, CallbackQueryHandler
+    ConversationHandler, CallbackQueryHandler, ContextTypes
 )
+from telegram.error import TelegramError
 from utils.config import TELEGRAM_TOKEN
 from bot.handlers import (
     start, receive_invite_code, cancel, WAITING_CODE,
@@ -62,6 +64,20 @@ async def run_ptb(application: Application, queue: asyncio.Queue):
     await application.start()
     await application.updater.start_polling()
     logger.info("✅ Bot do Telegram (PTB) ativo.")
+
+async def on_error(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Error handler global: loga a exceção e avisa o usuário (em chat privado)."""
+    logger = logging.getLogger(__name__)
+    logger.error("Unhandled error", exc_info=context.error)
+    try:
+        if update and update.effective_chat and update.effective_chat.type == "private":
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="⚠️ Ocorreu um erro inesperado. Já registrei aqui e vou corrigir.",
+            )
+    except TelegramError:
+        # Evita encadear erros caso o envio falhe
+        pass
 
 async def main():
     """Configura os handlers e inicia o PTB e o Telethon em paralelo."""
@@ -230,6 +246,7 @@ async def main():
     application.add_handler(CallbackQueryHandler(show_circuit_menu_handler, pattern='^settings_circuit$'))
     application.add_handler(CallbackQueryHandler(back_to_settings_menu_handler, pattern='^back_to_settings_menu$'))
 
+    application.add_error_handler(on_error)
 
     logger.info("Bot configurado. Iniciando todos os serviços...")
 

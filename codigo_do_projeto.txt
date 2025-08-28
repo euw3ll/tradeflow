@@ -58,7 +58,9 @@ from bot.handlers import (
     ask_circuit_pause, receive_circuit_pause, ASKING_CIRCUIT_PAUSE,
     ask_ma_timeframe, set_ma_timeframe,
     ask_rsi_oversold, receive_rsi_oversold, ASKING_RSI_OVERSOLD,
-    ask_rsi_overbought, receive_rsi_overbought, ASKING_RSI_OVERBOUGHT
+    ask_rsi_overbought, receive_rsi_overbought, ASKING_RSI_OVERBOUGHT,
+    show_risk_menu_handler, show_stopgain_menu_handler, show_circuit_menu_handler,
+    back_to_settings_menu_handler, back_from_whitelist_handler
 )
 from database.session import init_db
 from services.telethon_service import start_signal_monitor
@@ -146,11 +148,18 @@ async def main():
         fallbacks=[CommandHandler("cancel", cancel)], per_message=False, per_user=True,
     )
     whitelist_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(ask_coin_whitelist, pattern='^set_coin_whitelist$')],
-        states={ ASKING_COIN_WHITELIST: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_coin_whitelist)] },
-        # MUDANÇA: 'per_message' alterado para False para manter o estado da conversa.
-        fallbacks=[CommandHandler("cancel", cancel)], per_message=False, per_user=True,
-    )
+    entry_points=[CallbackQueryHandler(ask_coin_whitelist, pattern='^set_coin_whitelist$')],
+    states={
+        ASKING_COIN_WHITELIST: [
+            # novo: permite clicar em "Voltar" enquanto está no prompt
+            CallbackQueryHandler(back_from_whitelist_handler, pattern='^back_to_settings_menu$'),
+            # já existia: captura o texto enviado com a lista
+            MessageHandler(filters.TEXT & ~filters.COMMAND, receive_coin_whitelist),
+        ]
+    },
+    fallbacks=[CommandHandler("cancel", cancel)],
+    per_message=False, per_user=True,
+)
     stop_gain_trigger_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(ask_stop_gain_trigger, pattern='^set_stop_gain_trigger$')],
         states={ ASKING_STOP_GAIN_TRIGGER: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_stop_gain_trigger)] },
@@ -241,6 +250,11 @@ async def main():
     application.add_handler(CallbackQueryHandler(set_ma_timeframe, pattern='^set_ma_timeframe_'))
     application.add_handler(rsi_oversold_conv)
     application.add_handler(rsi_overbought_conv)
+
+    application.add_handler(CallbackQueryHandler(show_risk_menu_handler, pattern='^settings_risk$'))
+    application.add_handler(CallbackQueryHandler(show_stopgain_menu_handler, pattern='^settings_stopgain$'))
+    application.add_handler(CallbackQueryHandler(show_circuit_menu_handler, pattern='^settings_circuit$'))
+    application.add_handler(CallbackQueryHandler(back_to_settings_menu_handler, pattern='^back_to_settings_menu$'))
 
 
     logger.info("Bot configurado. Iniciando todos os serviços...")
@@ -1620,10 +1634,18 @@ MEMECOINS: Set[str] = {
     'DOGEUSDT', 'SHIBUSDT', 'PEPEUSDT', 'WIFUSDT', 'FLOKIUSDT', 'BONKUSDT'
 }
 
+# Moedas "blue chips" clássicas
+BLUECHIPS: Set[str] = {'BTCUSDT', 'ETHUSDT', 'BNBUSDT'}
+
+# Camada de infraestrutura / oráculos
+INFRA: Set[str] = {'LINKUSDT', 'GRTUSDT', 'FILUSDT'}
+
 # Dicionário que mapeia a palavra-chave da categoria para o Set de moedas
 CATEGORIES = {
+    'bluechips': BLUECHIPS,
     'altcoins': ALTCOINS_L1_L2,
     'defi': DEFI,
+    'infra': INFRA,
     'memecoins': MEMECOINS,
 }
 
@@ -2504,7 +2526,8 @@ from .keyboards import (
     main_menu_keyboard, confirm_remove_keyboard, admin_menu_keyboard, 
     dashboard_menu_keyboard, settings_menu_keyboard, view_targets_keyboard, 
     bot_config_keyboard, performance_menu_keyboard, confirm_manual_close_keyboard,
-    signal_filters_keyboard, ma_timeframe_keyboard
+    signal_filters_keyboard, ma_timeframe_keyboard, risk_menu_keyboard,
+    stopgain_menu_keyboard, circuit_menu_keyboard,
     )
 from utils.security import encrypt_data, decrypt_data
 from services.bybit_service import (
@@ -2534,6 +2557,35 @@ ASKING_COIN_WHITELIST = 15
 ) = range(20, 24)
 
 logger = logging.getLogger(__name__)
+
+# ---- helpers (resumos no topo dos submenus) ----
+def _risk_summary(user) -> str:
+    try:
+        return (
+            f"• Entrada: {float(getattr(user,'entry_size_percent',0) or 0):.1f}%  |  "
+            f"Alav.: {int(getattr(user,'max_leverage',0) or 0)}x  |  "
+            f"Conf.: {float(getattr(user,'min_confidence',0) or 0):.1f}%"
+        )
+    except Exception:
+        return "• Parâmetros indisponíveis"
+
+def _stopgain_summary(user) -> str:
+    try:
+        return (
+            f"• Gatilho: {float(getattr(user,'stop_gain_trigger_pct',0) or 0):.2f}%  |  "
+            f"Trava: {float(getattr(user,'stop_gain_lock_pct',0) or 0):.2f}%"
+        )
+    except Exception:
+        return "• Parâmetros indisponíveis"
+
+def _circuit_summary(user) -> str:
+    try:
+        return (
+            f"• Limite: {int(getattr(user,'circuit_breaker_threshold',0) or 0)}  |  "
+            f"Pausa: {int(getattr(user,'circuit_breaker_pause_minutes',0) or 0)} min"
+        )
+    except Exception:
+        return "• Parâmetros indisponíveis"
 
 # --- FLUXO DE USUÁRIO (START, CADASTRO, MENUS) ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -3131,231 +3183,165 @@ async def back_to_channels_handler(update: Update, context: ContextTypes.DEFAULT
 # já estavam definidas acima.
 
 async def user_settings_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Exibe o menu de configurações de trade com os valores atuais do usuário."""
+    """Abre o menu raiz de Configurações (texto padronizado + teclado novo)."""
     query = update.callback_query
     await query.answer()
-    user_id = update.effective_user.id
-    
     db = SessionLocal()
     try:
-        user = db.query(User).filter_by(telegram_id=user_id).first()
-        if user:
-            await query.edit_message_text(
-                "<b>⚙️ Configurações de Trade</b>\n\n"
-                "Aqui você pode definir seus parâmetros de risco e automação.",
-                parse_mode='HTML',
-                reply_markup=settings_menu_keyboard(user)
-            )
+        user = db.query(User).filter(User.telegram_id == query.from_user.id).first()
+        if not user:
+            await query.edit_message_text("Não encontrei seu usuário. Use /start para registrar.")
+            return
+
+        header = (
+            "⚙️ <b>Configurações de Trade</b>\n"
+            "<i>Escolha uma categoria para ajustar seus parâmetros.</i>"
+        )
+        await query.edit_message_text(
+            text=header,
+            reply_markup=settings_menu_keyboard(user),
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.error(f"[settings] Erro ao abrir menu raiz de Configurações: {e}", exc_info=True)
+        await query.edit_message_text("Não foi possível abrir as Configurações agora.")
     finally:
         db.close()
 
-async def ask_entry_percent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Pergunta ao usuário qual a nova porcentagem da banca por entrada."""
-    query = update.callback_query
-    await query.answer()
-    
-    context.user_data['settings_message_id'] = query.message.message_id
-    
-    await query.edit_message_text(
-        "Envie a porcentagem da sua banca em USDT que você deseja usar para cada entrada.\n\n"
-        "Exemplo: se você tem $100 e define `10`, cada entrada terá o valor de $10.\n"
-        "Envie apenas o número (ex: `10` para 10%)."
-    )
-    return ASKING_ENTRY_PERCENT
-
-async def receive_entry_percent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Recebe, valida e salva a nova porcentagem de entrada."""
-    user_id = update.effective_user.id
-    message_id_to_edit = context.user_data.get('settings_message_id')
-    
-    await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id)
-
-    try:
-        percent_value = float(update.message.text.replace(',', '.'))
-        if not (0.1 <= percent_value <= 100):
-            raise ValueError("Valor fora do range permitido (0.1 a 100)")
-
-        db = SessionLocal()
-        try:
-            user = db.query(User).filter_by(telegram_id=user_id).first()
-            user.entry_size_percent = percent_value
-            db.commit()
-            
-            api_key = decrypt_data(user.api_key_encrypted)
-            api_secret = decrypt_data(user.api_secret_encrypted)
-            account_info = await get_account_info(api_key, api_secret)
-            
-            usdt_balance = 0.0
-            if account_info.get("success"):
-                balances = account_info.get("data", [])
-                if balances:
-                    coin_list = balances[0].get('coin', [])
-                    for coin in coin_list:
-                        if coin.get('coin') == 'USDT':
-                            usdt_balance = float(coin.get('walletBalance', 0))
-                            break
-            
-            entry_value = usdt_balance * (percent_value / 100)
-            
-            feedback_text = (
-                f"✅ Tamanho da entrada atualizado para <b>{percent_value:.2f}%</b>.\n\n"
-                f"Com seu saldo atual, cada entrada será de aprox. <b>${entry_value:,.2f} USDT</b>."
-            )
-
-            if percent_value > 25:
-                feedback_text += "\n\n⚠️ <b>Atenção:</b> Uma porcentagem acima de 25% é considerada de altíssimo risco!"
-
-            await context.bot.edit_message_text(
-                chat_id=update.effective_chat.id,
-                message_id=message_id_to_edit,
-                text=feedback_text,
-                parse_mode='HTML',
-                reply_markup=settings_menu_keyboard(user)
-            )
-        finally:
-            db.close()
-
-    except (ValueError, TypeError):
-        await context.bot.edit_message_text(
-            chat_id=update.effective_chat.id,
-            message_id=message_id_to_edit,
-            text="❌ Valor inválido. Por favor, tente novamente com um número entre 0.1 e 100 (ex: 10)."
-        )
-        return ASKING_ENTRY_PERCENT
-
-    return ConversationHandler.END        
-
-async def ask_max_leverage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Pergunta ao usuário qual a nova alavancagem máxima."""
-    query = update.callback_query
-    await query.answer()
-    
-    context.user_data['settings_message_id'] = query.message.message_id
-    
-    await query.edit_message_text(
-        "Qual a alavancagem máxima que o bot deve usar?\n"
-        "Envie apenas o número (ex: `10` para 10x)."
-    )
-    return ASKING_MAX_LEVERAGE
-
-async def receive_max_leverage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Recebe, valida e salva a nova alavancagem máxima."""
-    user_id = update.effective_user.id
-    message_id_to_edit = context.user_data.get('settings_message_id')
-
-    try:
-        leverage_value = int(update.message.text)
-        if not (1 <= leverage_value <= 125):
-            raise ValueError("Alavancagem fora do limite (1-125)")
-
-        db = SessionLocal()
-        try:
-            user = db.query(User).filter_by(telegram_id=user_id).first()
-            user.max_leverage = leverage_value
-            db.commit()
-            
-            await context.bot.edit_message_text(
-                chat_id=update.effective_chat.id,
-                message_id=message_id_to_edit,
-                text=f"✅ Alavancagem máxima atualizada para {leverage_value}x.\n\n"
-                     "Selecione outra opção para editar ou volte.",
-                reply_markup=settings_menu_keyboard(user)
-            )
-        finally:
-            db.close()
-
-    except (ValueError, TypeError):
-        await context.bot.edit_message_text(
-            chat_id=update.effective_chat.id,
-            message_id=message_id_to_edit,
-            text="❌ Valor inválido. Por favor, tente novamente com um número inteiro (ex: 10)."
-        )
-        return ASKING_MAX_LEVERAGE
-    finally:
-        await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id)
-
-    return ConversationHandler.END
-
-async def ask_min_confidence(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Pergunta ao usuário qual o novo valor de confiança mínima."""
-    query = update.callback_query
-    await query.answer()
-    context.user_data['settings_message_id'] = query.message.message_id
-    await query.edit_message_text("Envie o valor da confiança mínima da IA (ex: 75 para 75%).\nSinais com confiança abaixo disso serão ignorados.")
-    return ASKING_MIN_CONFIDENCE
-
-async def receive_min_confidence(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Recebe, valida e salva o novo valor de confiança."""
-    user_id = update.effective_user.id
-    message_id_to_edit = context.user_data.get('settings_message_id')
-    
-    await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id)
-
-    try:
-        confidence_value = float(update.message.text.replace(',', '.'))
-        if not (0 <= confidence_value <= 100):
-            raise ValueError("Valor fora do range permitido (0-100)")
-
-        db = SessionLocal()
-        try:
-            user = db.query(User).filter_by(telegram_id=user_id).first()
-            user.min_confidence = confidence_value
-            db.commit()
-            
-            await context.bot.edit_message_text(
-                chat_id=update.effective_chat.id,
-                message_id=message_id_to_edit,
-                text=f"✅ Confiança mínima atualizada para {confidence_value:.2f}%.\n\n"
-                     "Selecione outra opção para editar ou volte.",
-                reply_markup=settings_menu_keyboard(user)
-            )
-        finally:
-            db.close()
-
-        return ConversationHandler.END
-
-    except (ValueError, TypeError):
-        logger.warning(f"Usuário {user_id} enviou um valor inválido para confiança: {update.message.text}")
-        
-        await context.bot.edit_message_text(
-            chat_id=update.effective_chat.id,
-            message_id=message_id_to_edit,
-            text="❌ <b>Valor inválido.</b>\nPor favor, envie apenas um número entre 0 e 100 (ex: 75).",
-            parse_mode='HTML'
-        )
-        
-        return ASKING_MIN_CONFIDENCE
-    
-async def toggle_stop_strategy_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Alterna a estratégia de stop loss do usuário entre Break-Even e Trailing Stop."""
-    query = update.callback_query
-    await query.answer()
-    user_id = update.effective_user.id
-
+# ---- RISCO & TAMANHO ----
+async def receive_entry_percent(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip().replace("%", "").replace(",", ".")
     db = SessionLocal()
     try:
-        user = db.query(User).filter(User.telegram_id == user_id).first()
-        if user:
-            # Lógica para alternar a estratégia
-            if user.stop_strategy == 'BREAK_EVEN':
-                user.stop_strategy = 'TRAILING_STOP'
-            else:
-                user.stop_strategy = 'BREAK_EVEN'
-            db.commit()
-            
-            # Atualiza o menu para refletir a mudança imediatamente
-            await query.edit_message_text(
-                "<b>⚙️ Configurações de Trade</b>\n\n"
-                "Aqui você pode definir seus parâmetros de risco e automação.",
-                parse_mode='HTML',
-                reply_markup=settings_menu_keyboard(user)
-            )
-    except BadRequest as e:
-        if "Message is not modified" in str(e):
-            # Ignora o erro se a mensagem não mudou (cliques rápidos)
-            pass
+        value = float(text)
+        if value <= 0 or value > 100:
+            await update.message.reply_text("Valor inválido. Envie um número entre 0 e 100 (ex.: 3.5).")
+            return ConversationHandler.END
+        user = db.query(User).filter_by(telegram_id=update.effective_user.id).first()
+        if not user:
+            await update.message.reply_text("Usuário não encontrado. Use /start para registrar."); return ConversationHandler.END
+        user.entry_size_percent = value; db.commit()
+        try: await update.message.delete()
+        except Exception: pass
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"🧮 <b>Risco & Tamanho</b>\n✅ Tamanho de entrada salvo: <b>{value:.1f}%</b>",
+            reply_markup=risk_menu_keyboard(user), parse_mode="HTML",
+        )
+    except ValueError:
+        await update.message.reply_text("Não entendi. Envie um número (ex.: 3.5).")
+    except Exception as e:
+        db.rollback(); logger.error(f"[settings] entry_size_percent: {e}", exc_info=True)
+        await update.message.reply_text("Erro ao salvar. Tente novamente.")
+    finally:
+        db.close()
+    return ConversationHandler.END
+
+
+async def receive_max_leverage(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip().lower().replace("x", "")
+    db = SessionLocal()
+    try:
+        value = int(float(text))
+        if value < 1 or value > 125:
+            await update.message.reply_text("Valor inválido. Envie um inteiro entre 1 e 125 (ex.: 10).")
+            return ConversationHandler.END
+        user = db.query(User).filter_by(telegram_id=update.effective_user.id).first()
+        if not user:
+            await update.message.reply_text("Usuário não encontrado. Use /start para registrar."); return ConversationHandler.END
+        user.max_leverage = value; db.commit()
+        try: await update.message.delete()
+        except Exception: pass
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"🧮 <b>Risco & Tamanho</b>\n✅ Alavancagem máxima salva: <b>{value}x</b>",
+            reply_markup=risk_menu_keyboard(user), parse_mode="HTML",
+        )
+    except ValueError:
+        await update.message.reply_text("Não entendi. Envie um número inteiro (ex.: 10).")
+    except Exception as e:
+        db.rollback(); logger.error(f"[settings] max_leverage: {e}", exc_info=True)
+        await update.message.reply_text("Erro ao salvar. Tente novamente.")
+    finally:
+        db.close()
+    return ConversationHandler.END
+
+
+async def receive_min_confidence(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip().replace("%", "").replace(",", ".")
+    db = SessionLocal()
+    try:
+        value = float(text)
+        if value < 0 or value > 100:
+            await update.message.reply_text("Valor inválido. Envie um número entre 0 e 100 (ex.: 70).")
+            return ConversationHandler.END
+        user = db.query(User).filter_by(telegram_id=update.effective_user.id).first()
+        if not user:
+            await update.message.reply_text("Usuário não encontrado. Use /start para registrar."); return ConversationHandler.END
+        user.min_confidence = value; db.commit()
+        try: await update.message.delete()
+        except Exception: pass
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"🧮 <b>Risco & Tamanho</b>\n✅ Confiança mínima salva: <b>{value:.1f}%</b>",
+            reply_markup=risk_menu_keyboard(user), parse_mode="HTML",
+        )
+    except ValueError:
+        await update.message.reply_text("Não entendi. Envie um número (ex.: 70).")
+    except Exception as e:
+        db.rollback(); logger.error(f"[settings] min_confidence: {e}", exc_info=True)
+        await update.message.reply_text("Erro ao salvar. Tente novamente.")
+    finally:
+        db.close()
+    return ConversationHandler.END
+
+    
+def _current_strategy_value(user) -> str:
+    return (str(getattr(user, "stop_strategy", None) or
+                getattr(user, "stop_strategy_mode", None) or
+                getattr(user, "stop_strategy_type", None) or "breakeven")).lower()
+
+def _next_strategy_value(value: str) -> str:
+    return "trailing" if value.startswith("b") else "breakeven"
+
+def _stopgain_summary(user) -> str:
+    trigger = float(getattr(user, 'stop_gain_trigger_pct', 0) or 0)
+    lock    = float(getattr(user, 'stop_gain_lock_pct', 0) or 0)
+    cur     = _current_strategy_value(user)
+    label   = "Breakeven" if cur.startswith("b") else "Trailing"
+    return f"• Estratégia: {label}  |  Gatilho: {trigger:.2f}%  |  Trava: {lock:.2f}%"
+
+async def toggle_stop_strategy_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.telegram_id == query.from_user.id).first()
+        if not user:
+            await query.edit_message_text("Não encontrei seu usuário. Use /start para registrar.")
+            return
+        cur = _current_strategy_value(user)
+        nxt = _next_strategy_value(cur)
+
+        if hasattr(user, "stop_strategy"):
+            user.stop_strategy = nxt
+        elif hasattr(user, "stop_strategy_mode"):
+            user.stop_strategy_mode = nxt
+        elif hasattr(user, "stop_strategy_type"):
+            user.stop_strategy_type = nxt
         else:
-            logger.error(f"Erro ao editar mensagem em toggle_stop_strategy: {e}")
+            setattr(user, "stop_strategy", nxt)
+
+        db.commit()
+        header = ("🛡️ <b>Stop-Gain</b>\n<i>Configure estratégia, gatilho e trava.</i>\n\n"
+                  f"{_stopgain_summary(user)}")
+        await query.edit_message_text(text=header,
+                                      reply_markup=stopgain_menu_keyboard(user),
+                                      parse_mode="HTML")
+    except Exception as e:
+        db.rollback()
+        logger.error(f"[settings] toggle_stop_strategy_handler erro: {e}", exc_info=True)
+        await query.edit_message_text("Erro ao alternar estratégia.")
     finally:
         db.close()
     
@@ -3689,33 +3675,37 @@ async def performance_menu_handler(update: Update, context: ContextTypes.DEFAULT
 
 # --- FLUXO DE CONFIGURAÇÃO DE WHITELIST ---
 
-async def ask_coin_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Pergunta ao usuário sua nova whitelist de moedas."""
+async def ask_coin_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Prompt para editar Whitelist com instruções e categorias."""
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     query = update.callback_query
     await query.answer()
-    user_id = update.effective_user.id
-    
-    context.user_data['settings_message_id'] = query.message.message_id
-    
-    db = SessionLocal()
-    try:
-        user = db.query(User).filter_by(telegram_id=user_id).first()
-        current_whitelist = user.coin_whitelist if user else 'todas'
-    finally:
-        db.close()
 
-    instructions = (
-        f"<b>✅ Whitelist de Moedas</b>\n\n"
-        f"Sua configuração atual é: <code>{current_whitelist}</code>\n\n"
-        f"Envie uma lista de moedas e/ou categorias separadas por vírgula.\n\n"
-        f"<b>Exemplos:</b>\n"
-        f"• <code>todas</code> (para operar todos os sinais)\n"
-        f"• <code>btcusdt, ethusdt, solusdt</code>\n"
-        f"• <code>memecoins, btcusdt</code> (opera moedas meme + BTC)\n\n"
-        f"<b>Categorias disponíveis:</b> <code>memecoins</code>, <code>altcoins</code>, <code>defi</code>."
+    text = (
+        "✅ <b>Whitelist de Moedas</b>\n"
+        "Você pode definir exatamente <i>quais moedas</i> o bot poderá operar.\n\n"
+        "🧩 <b>Como usar</b>\n"
+        "• Digite tickers separados por vírgula (ex.: <code>BTCUSDT,ETHUSDT,SOLUSDT</code>)\n"
+        "• Pode misturar <b>tickers</b> com <b>categorias</b>\n"
+        "• Use <code>todas</code> para liberar todos os pares\n\n"
+        "📦 <b>Categorias disponíveis</b>\n"
+        "• <b>bluechips</b> → BTC, ETH, BNB\n"
+        "• <b>altcoins</b> → SOL, XRP, ADA, AVAX, DOT, MATIC, LINK...\n"
+        "• <b>defi</b> → UNI, AAVE, MKR, SNX, COMP, CRV...\n"
+        "• <b>infra</b> → LINK, GRT, FIL\n"
+        "• <b>memecoins</b> → DOGE, SHIB, PEPE, WIF, FLOKI, BONK\n\n"
+        "ℹ️ Exemplos válidos:\n"
+        "• <code>bluechips</code>\n"
+        "• <code>memecoins,altcoins</code>\n"
+        "• <code>BTCUSDT,ETHUSDT,defi</code>\n\n"
+        "⬅️ Clique em <b>Voltar</b> para cancelar sem alterações."
     )
-    
-    await query.edit_message_text(text=instructions, parse_mode='HTML')
+
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ Voltar", callback_data="back_to_settings_menu")]
+    ])
+
+    await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
     return ASKING_COIN_WHITELIST
 
 async def receive_coin_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -3894,147 +3884,159 @@ async def toggle_bot_status_handler(update: Update, context: ContextTypes.DEFAUL
     finally:
         db.close()
 
-async def ask_stop_gain_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Pergunta o gatilho de ativação do Stop-Gain."""
+async def ask_entry_percent(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    context.user_data['settings_message_id'] = query.message.message_id
-    await query.edit_message_text(
-        "Envie o percentual de lucro para ATIVAR o Stop-Gain.\n\n"
-        "Exemplo: `1.5` para 1.5%. Se o lucro da posição atingir este valor, o stop será movido para um nível seguro.\n"
-        "Envie `0` para desativar."
-    )
+    await query.edit_message_text("📥 Envie o <b>tamanho de entrada</b> em % (ex.: 3.5)", parse_mode="HTML")
+    return ASKING_ENTRY_PERCENT
+
+async def ask_max_leverage(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("⚙️ Envie a <b>alavancagem máxima</b> (ex.: 5, 10, 20)", parse_mode="HTML")
+    return ASKING_MAX_LEVERAGE
+
+async def ask_min_confidence(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("🎯 Envie a <b>confiança mínima</b> em % (ex.: 70)", parse_mode="HTML")
+    return ASKING_MIN_CONFIDENCE
+
+async def ask_stop_gain_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("🚀 Envie o <b>gatilho</b> do Stop-Gain em % (ex.: 3)", parse_mode="HTML")
     return ASKING_STOP_GAIN_TRIGGER
 
-async def receive_stop_gain_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Recebe e salva o gatilho do Stop-Gain."""
-    user_id = update.effective_user.id
-    message_id_to_edit = context.user_data.get('settings_message_id')
-    await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id)
-    try:
-        value = float(update.message.text.replace(',', '.'))
-        if not (0 <= value <= 100): raise ValueError("Valor fora do range")
-
-        db = SessionLocal()
-        try:
-            user = db.query(User).filter_by(telegram_id=user_id).first()
-            user.stop_gain_trigger_pct = value
-            db.commit()
-            feedback = f"✅ Gatilho Stop-Gain atualizado para {value:.2f}%." if value > 0 else "✅ Stop-Gain desativado."
-            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit,
-                text=feedback, reply_markup=settings_menu_keyboard(user))
-        finally:
-            db.close()
-    except (ValueError, TypeError):
-        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit,
-            text="❌ Valor inválido. Envie um número (ex: 1.5).")
-        return ASKING_STOP_GAIN_TRIGGER
-    return ConversationHandler.END
-
-async def ask_stop_gain_lock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Pergunta o nível de segurança do Stop-Gain."""
+async def ask_stop_gain_lock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    context.user_data['settings_message_id'] = query.message.message_id
-    await query.edit_message_text(
-        "Envie o percentual de lucro MÍNIMO a ser garantido pelo Stop-Gain.\n\n"
-        "Exemplo: `0.5` para 0.5%. Após o gatilho ser ativado, o stop será movido para garantir este lucro."
-    )
+    await query.edit_message_text("🔒 Envie a <b>trava</b> do Stop-Gain em % (ex.: 1)", parse_mode="HTML")
     return ASKING_STOP_GAIN_LOCK
 
-async def receive_stop_gain_lock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Recebe e salva o nível de segurança do Stop-Gain."""
-    user_id = update.effective_user.id
-    message_id_to_edit = context.user_data.get('settings_message_id')
-    await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id)
-    try:
-        value = float(update.message.text.replace(',', '.'))
-        if not (0 <= value <= 100): raise ValueError("Valor fora do range")
-
-        db = SessionLocal()
-        try:
-            user = db.query(User).filter_by(telegram_id=user_id).first()
-            user.stop_gain_lock_pct = value
-            db.commit()
-            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit,
-                text=f"✅ Nível de segurança do Stop-Gain atualizado para {value:.2f}%.",
-                reply_markup=settings_menu_keyboard(user))
-        finally:
-            db.close()
-    except (ValueError, TypeError):
-        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit,
-            text="❌ Valor inválido. Envie um número (ex: 0.5).")
-        return ASKING_STOP_GAIN_LOCK
-    return ConversationHandler.END
-
-async def ask_circuit_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Pergunta o gatilho de perdas do Disjuntor."""
+async def ask_circuit_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    context.user_data['settings_message_id'] = query.message.message_id
-    await query.edit_message_text(
-        "Envie o número de perdas ativas para ATIVAR o disjuntor.\n\n"
-        "Exemplo: `3`. Se houver 3 ou mais trades perdendo na mesma direção, o bot pausa.\n"
-        "Envie `0` para desativar."
-    )
+    await query.edit_message_text("⚡ Envie o <b>limite</b> do disjuntor (inteiro, ex.: 3)", parse_mode="HTML")
     return ASKING_CIRCUIT_THRESHOLD
 
-async def receive_circuit_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Recebe e salva o gatilho do Disjuntor."""
-    user_id = update.effective_user.id
-    message_id_to_edit = context.user_data.get('settings_message_id')
-    await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id)
-    try:
-        value = int(update.message.text)
-        if not (0 <= value <= 20): raise ValueError("Valor fora do range")
-
-        db = SessionLocal()
-        try:
-            user = db.query(User).filter_by(telegram_id=user_id).first()
-            user.circuit_breaker_threshold = value
-            db.commit()
-            feedback = f"✅ Disjuntor ativado para {value} perdas." if value > 0 else "✅ Disjuntor desativado."
-            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit,
-                text=feedback, reply_markup=settings_menu_keyboard(user))
-        finally:
-            db.close()
-    except (ValueError, TypeError):
-        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit,
-            text="❌ Valor inválido. Envie um número inteiro (ex: 3).")
-        return ASKING_CIRCUIT_THRESHOLD
-    return ConversationHandler.END
-
-async def ask_circuit_pause(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Pergunta o tempo de pausa do Disjuntor."""
+async def ask_circuit_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    context.user_data['settings_message_id'] = query.message.message_id
-    await query.edit_message_text("Envie o tempo em MINUTOS que o bot ficará pausado após o disjuntor ser ativado.\n\nExemplo: `60`.")
+    await query.edit_message_text("⏸️ Envie a <b>pausa</b> após disparo (minutos, ex.: 120)", parse_mode="HTML")
     return ASKING_CIRCUIT_PAUSE
 
-async def receive_circuit_pause(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Recebe e salva o tempo de pausa do Disjuntor."""
-    user_id = update.effective_user.id
-    message_id_to_edit = context.user_data.get('settings_message_id')
-    await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id)
+# ---- STOP-GAIN ----
+async def receive_stop_gain_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip().replace("%", "").replace(",", ".")
+    db = SessionLocal()
     try:
-        value = int(update.message.text)
-        if not (1 <= value <= 1440): raise ValueError("Valor fora do range")
+        value = float(text)
+        if value < 0 or value > 100:
+            await update.message.reply_text("Valor inválido. Envie entre 0 e 100 (ex.: 3)."); return ConversationHandler.END
+        user = db.query(User).filter_by(telegram_id=update.effective_user.id).first()
+        if not user:
+            await update.message.reply_text("Usuário não encontrado. Use /start para registrar."); return ConversationHandler.END
+        user.stop_gain_trigger_pct = value; db.commit()
+        try: await update.message.delete()
+        except Exception: pass
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"🛡️ <b>Stop-Gain</b>\n✅ Gatilho salvo: <b>{value:.2f}%</b>",
+            reply_markup=stopgain_menu_keyboard(user), parse_mode="HTML",
+        )
+    except ValueError:
+        await update.message.reply_text("Não entendi. Envie um número (ex.: 3).")
+    except Exception as e:
+        db.rollback(); logger.error(f"[settings] stop_gain_trigger_pct: {e}", exc_info=True)
+        await update.message.reply_text("Erro ao salvar. Tente novamente.")
+    finally:
+        db.close()
+    return ConversationHandler.END
 
-        db = SessionLocal()
-        try:
-            user = db.query(User).filter_by(telegram_id=user_id).first()
-            user.circuit_breaker_pause_minutes = value
-            db.commit()
-            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit,
-                text=f"✅ Tempo de pausa do disjuntor atualizado para {value} minutos.",
-                reply_markup=settings_menu_keyboard(user))
-        finally:
-            db.close()
-    except (ValueError, TypeError):
-        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit,
-            text="❌ Valor inválido. Envie um número inteiro (ex: 60).")
-        return ASKING_CIRCUIT_PAUSE
+
+async def receive_stop_gain_lock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip().replace("%", "").replace(",", ".")
+    db = SessionLocal()
+    try:
+        value = float(text)
+        if value < 0 or value > 100:
+            await update.message.reply_text("Valor inválido. Envie entre 0 e 100 (ex.: 1)."); return ConversationHandler.END
+        user = db.query(User).filter_by(telegram_id=update.effective_user.id).first()
+        if not user:
+            await update.message.reply_text("Usuário não encontrado. Use /start para registrar."); return ConversationHandler.END
+        user.stop_gain_lock_pct = value; db.commit()
+        try: await update.message.delete()
+        except Exception: pass
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"🛡️ <b>Stop-Gain</b>\n✅ Trava salva: <b>{value:.2f}%</b>",
+            reply_markup=stopgain_menu_keyboard(user), parse_mode="HTML",
+        )
+    except ValueError:
+        await update.message.reply_text("Não entendi. Envie um número (ex.: 1).")
+    except Exception as e:
+        db.rollback(); logger.error(f"[settings] stop_gain_lock_pct: {e}", exc_info=True)
+        await update.message.reply_text("Erro ao salvar. Tente novamente.")
+    finally:
+        db.close()
+    return ConversationHandler.END
+
+# ---- DISJUNTOR ----
+async def receive_circuit_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    db = SessionLocal()
+    try:
+        value = int(float(text))
+        if value < 0 or value > 1000:
+            await update.message.reply_text("Valor inválido. Envie um inteiro entre 0 e 1000 (ex.: 3).")
+            return ConversationHandler.END
+        user = db.query(User).filter_by(telegram_id=update.effective_user.id).first()
+        if not user:
+            await update.message.reply_text("Usuário não encontrado. Use /start para registrar."); return ConversationHandler.END
+        user.circuit_breaker_threshold = value; db.commit()
+        try: await update.message.delete()
+        except Exception: pass
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"🚫 <b>Disjuntor</b>\n✅ Limite salvo: <b>{value}</b>",
+            reply_markup=circuit_menu_keyboard(user), parse_mode="HTML",
+        )
+    except ValueError:
+        await update.message.reply_text("Não entendi. Envie um número inteiro (ex.: 3).")
+    except Exception as e:
+        db.rollback(); logger.error(f"[settings] circuit_breaker_threshold: {e}", exc_info=True)
+        await update.message.reply_text("Erro ao salvar. Tente novamente.")
+    finally:
+        db.close()
+    return ConversationHandler.END
+
+async def receive_circuit_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip().lower().replace("min", "").replace("m", "")
+    db = SessionLocal()
+    try:
+        value = int(float(text))
+        if value < 0 or value > 1440:
+            await update.message.reply_text("Valor inválido. Envie um inteiro entre 0 e 1440 (ex.: 120).")
+            return ConversationHandler.END
+        user = db.query(User).filter_by(telegram_id=update.effective_user.id).first()
+        if not user:
+            await update.message.reply_text("Usuário não encontrado. Use /start para registrar."); return ConversationHandler.END
+        user.circuit_breaker_pause_minutes = value; db.commit()
+        try: await update.message.delete()
+        except Exception: pass
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"🚫 <b>Disjuntor</b>\n✅ Pausa salva: <b>{value} min</b>",
+            reply_markup=circuit_menu_keyboard(user), parse_mode="HTML",
+        )
+    except ValueError:
+        await update.message.reply_text("Não entendi. Envie um número inteiro (ex.: 120).")
+    except Exception as e:
+        db.rollback(); logger.error(f"[settings] circuit_breaker_pause_minutes: {e}", exc_info=True)
+        await update.message.reply_text("Erro ao salvar. Tente novamente.")
+    finally:
+        db.close()
     return ConversationHandler.END
 
 async def signal_filters_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4233,6 +4235,82 @@ async def receive_rsi_overbought(update: Update, context: ContextTypes.DEFAULT_T
         return ASKING_RSI_OVERBOUGHT
     return ConversationHandler.END
 
+async def show_risk_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.telegram_id == query.from_user.id).first()
+        if not user:
+            await query.edit_message_text("Não encontrei seu usuário. Use /start para registrar.")
+            return
+        header = ("🧮 <b>Risco & Tamanho</b>\n<i>Ajuste parâmetros de risco e tamanho de posição.</i>\n\n"
+                  f"{_risk_summary(user)}")
+        await query.edit_message_text(text=header, reply_markup=risk_menu_keyboard(user), parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"[settings] submenu Risco: {e}", exc_info=True)
+        await query.edit_message_text("Não foi possível abrir o submenu de Risco agora.")
+    finally:
+        db.close()
+
+async def show_stopgain_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.telegram_id == query.from_user.id).first()
+        if not user:
+            await query.edit_message_text("Não encontrei seu usuário. Use /start para registrar.")
+            return
+        header = ("🛡️ <b>Stop-Gain</b>\n<i>Configure gatilho e trava do stop-gain.</i>\n\n"
+                  f"{_stopgain_summary(user)}")
+        await query.edit_message_text(text=header, reply_markup=stopgain_menu_keyboard(user), parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"[settings] submenu Stop-Gain: {e}", exc_info=True)
+        await query.edit_message_text("Não foi possível abrir o submenu de Stop-Gain agora.")
+    finally:
+        db.close()
+
+async def show_circuit_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.telegram_id == query.from_user.id).first()
+        if not user:
+            await query.edit_message_text("Não encontrei seu usuário. Use /start para registrar.")
+            return
+        header = ("🚫 <b>Disjuntor</b>\n<i>Defina limite e pausa após disparo.</i>\n\n"
+                  f"{_circuit_summary(user)}")
+        await query.edit_message_text(text=header, reply_markup=circuit_menu_keyboard(user), parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"[settings] submenu Disjuntor: {e}", exc_info=True)
+        await query.edit_message_text("Não foi possível abrir o submenu de Disjuntor agora.")
+    finally:
+        db.close()
+
+async def back_to_settings_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.telegram_id == query.from_user.id).first()
+        if not user:
+            await query.edit_message_text("Não encontrei seu usuário. Use /start para registrar.")
+            return
+        header = "⚙️ <b>Configurações de Trade</b>\n<i>Escolha uma categoria para ajustar seus parâmetros.</i>"
+        await query.edit_message_text(text=header, reply_markup=settings_menu_keyboard(user), parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"[settings] voltar menu raiz: {e}", exc_info=True)
+        await query.edit_message_text("Não foi possível voltar ao menu de configurações agora.")
+    finally:
+        db.close()
+
+async def back_from_whitelist_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sai do estado de edição da Whitelist e volta ao menu de Configurações."""
+    # reaproveita o handler existente para renderizar o menu
+    await back_to_settings_menu_handler(update, context)
+    return ConversationHandler.END
 
 ========================================
 # Arquivo: bot/keyboards.py
@@ -4309,44 +4387,64 @@ def confirm_remove_keyboard():
     ]
     return InlineKeyboardMarkup(keyboard)
 
-def settings_menu_keyboard(user_settings):
-    """
-    Retorna o teclado do menu de configurações, mostrando os valores atuais.
-    """
-    entry_percent = user_settings.entry_size_percent
-    max_leverage = user_settings.max_leverage
-    min_confidence = user_settings.min_confidence
-
-    stop_gain_trigger = user_settings.stop_gain_trigger_pct
-    stop_gain_lock = user_settings.stop_gain_lock_pct
-
-    circuit_threshold = user_settings.circuit_breaker_threshold
-    circuit_pause = user_settings.circuit_breaker_pause_minutes
-    circuit_text = f"Disjuntor: {circuit_threshold} perdas" if circuit_threshold > 0 else "Disjuntor: Desativado"
-
-    # --- INÍCIO DA NOVA LÓGICA ---
-    # Define o texto do botão de estratégia de stop dinamicamente
-    if user_settings.stop_strategy == 'TRAILING_STOP':
-        strategy_text = "Estratégia de Stop: Trailing Stop 📈"
-    else:
-        strategy_text = "Estratégia de Stop: Break-Even 🛡️"
-    # --- FIM DA NOVA LÓGICA ---
-
-    keyboard = [
-        [InlineKeyboardButton(f"Tamanho da Entrada: {entry_percent:.2f}%", callback_data='set_entry_percent')],
-        [InlineKeyboardButton(f"Alavancagem Máxima: {max_leverage}x", callback_data='set_max_leverage')],
-        [InlineKeyboardButton(f"Confiança Mínima (IA): {min_confidence:.2f}%", callback_data='set_min_confidence')],
-        [InlineKeyboardButton(strategy_text, callback_data='set_stop_strategy')], # <-- NOVO BOTÃO
-        [InlineKeyboardButton(f"Gatilho Stop-Gain: {stop_gain_trigger:.2f}%", callback_data='set_stop_gain_trigger')],
-        [InlineKeyboardButton(f"Segurança Stop-Gain: {stop_gain_lock:.2f}%", callback_data='set_stop_gain_lock')],
-        [InlineKeyboardButton("✅ Whitelist de Moedas", callback_data='set_coin_whitelist')],
-        [InlineKeyboardButton(circuit_text, callback_data='set_circuit_threshold')],
-        [InlineKeyboardButton(f"Pausa Disjuntor: {circuit_pause} min", callback_data='set_circuit_pause')],
-        [InlineKeyboardButton("Filtros de Sinais 🔬", callback_data='signal_filters_menu')],
-        [InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data='back_to_main_menu')]
+def settings_menu_keyboard(user) -> InlineKeyboardMarkup:
+    kb = [
+        [
+            InlineKeyboardButton("🧮 Risco & Tamanho", callback_data="settings_risk"),
+            InlineKeyboardButton("🛡️ Stop-Gain", callback_data="settings_stopgain"),
+        ],
+        [
+            InlineKeyboardButton("🚫 Disjuntor", callback_data="settings_circuit"),
+            InlineKeyboardButton("✅ Whitelist", callback_data="set_coin_whitelist"),
+        ],
+        [InlineKeyboardButton("🔬 Filtros de Sinais", callback_data="signal_filters_menu")],
+        [InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data="back_to_main_menu")],
     ]
-    return InlineKeyboardMarkup(keyboard)
+    return InlineKeyboardMarkup(kb)
 
+
+def risk_menu_keyboard(user) -> InlineKeyboardMarkup:
+    entry_pct = f"{float(getattr(user, 'entry_size_percent', 0) or 0):.1f}%"
+    leverage  = f"{int(getattr(user, 'max_leverage', 0) or 0)}x"
+    min_conf  = f"{float(getattr(user, 'min_confidence', 0) or 0):.1f}%"
+    kb = [
+        [InlineKeyboardButton(f"📥 Tamanho de Entrada ({entry_pct})", callback_data="set_entry_percent")],
+        [InlineKeyboardButton(f"⚙️ Alavancagem Máx. ({leverage})", callback_data="set_max_leverage")],
+        [InlineKeyboardButton(f"🎯 Confiança Mín. ({min_conf})", callback_data="set_min_confidence")],
+        [InlineKeyboardButton("⬅️ Voltar", callback_data="back_to_settings_menu")],
+    ]
+    return InlineKeyboardMarkup(kb)
+
+def _read_stop_strategy_label(user) -> str:
+    raw = (getattr(user, "stop_strategy", None)
+           or getattr(user, "stop_strategy_mode", None)
+           or getattr(user, "stop_strategy_type", None)
+           or "breakeven")
+    raw = str(raw).lower()
+    return "Breakeven" if raw.startswith("b") else "Trailing"
+
+def stopgain_menu_keyboard(user) -> InlineKeyboardMarkup:
+    trigger = f"{float(getattr(user, 'stop_gain_trigger_pct', 0) or 0):.2f}%"
+    lock    = f"{float(getattr(user, 'stop_gain_lock_pct', 0) or 0):.2f}%"
+    strategy_label = _read_stop_strategy_label(user)
+
+    kb = [
+        [InlineKeyboardButton(f"🧭 Estratégia: {strategy_label}", callback_data="set_stop_strategy")],
+        [InlineKeyboardButton(f"🚀 Gatilho Stop-Gain ({trigger})", callback_data="set_stop_gain_trigger")],
+        [InlineKeyboardButton(f"🔒 Trava Stop-Gain ({lock})", callback_data="set_stop_gain_lock")],
+        [InlineKeyboardButton("⬅️ Voltar", callback_data="back_to_settings_menu")],
+    ]
+    return InlineKeyboardMarkup(kb)
+
+def circuit_menu_keyboard(user) -> InlineKeyboardMarkup:
+    threshold = f"{int(getattr(user, 'circuit_breaker_threshold', 0) or 0)}"
+    pause     = f"{int(getattr(user, 'circuit_breaker_pause_minutes', 0) or 0)} min"
+    kb = [
+        [InlineKeyboardButton(f"⚡ Limite do Disjuntor ({threshold})", callback_data="set_circuit_threshold")],
+        [InlineKeyboardButton(f"⏸️ Pausa após Disparo ({pause})", callback_data="set_circuit_pause")],
+        [InlineKeyboardButton("⬅️ Voltar", callback_data="back_to_settings_menu")],
+    ]
+    return InlineKeyboardMarkup(kb)
 
 def bot_config_keyboard(user_settings):
     """

@@ -31,6 +31,7 @@ from core.trade_manager import _execute_trade, _execute_limit_order_for_user
 from core.performance_service import generate_performance_report
 from services.currency_service import get_usd_to_brl_rate
 from sqlalchemy.sql import func
+from core.whitelist_service import CATEGORIES
 
 # Estados para as conversas
 (WAITING_CODE, WAITING_API_KEY, WAITING_API_SECRET, CONFIRM_REMOVE_API) = range(4)
@@ -1196,38 +1197,71 @@ async def ask_coin_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
     return ASKING_COIN_WHITELIST
 
-async def receive_coin_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Recebe, valida e salva a nova whitelist."""
-    user_id = update.effective_user.id
-    message_id_to_edit = context.user_data.get('settings_message_id')
-    
-    # Apaga a mensagem do usuário para manter o chat limpo
-    await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id)
-
-    # Normaliza a entrada: remove espaços extras e converte para minúsculas
-    whitelist_text = update.message.text.lower().strip()
-    
+async def receive_coin_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Salva whitelist enviada pelo usuário e retorna ao menu de Configurações.
+    Aceita tickers (ex.: BTCUSDT) e keywords de categorias (ex.: bluechips, defi, memecoins, infra, altcoins).
+    """
+    text = (update.message.text or "").strip()
     db = SessionLocal()
     try:
-        user = db.query(User).filter_by(telegram_id=user_id).first()
-        if user:
-            user.coin_whitelist = whitelist_text
-            db.commit()
-            
-            feedback_text = (
-                f"✅ Whitelist de moedas atualizada para: <code>{whitelist_text}</code>"
-            )
+        if not text:
+            await update.message.reply_text("Envie ao menos 1 ticker ou categoria. Ex.: BTCUSDT,ETHUSDT ou bluechips")
+            return ConversationHandler.END
 
-            await context.bot.edit_message_text(
-                chat_id=update.effective_chat.id,
-                message_id=message_id_to_edit,
-                text=feedback_text,
-                parse_mode='HTML',
-                reply_markup=settings_menu_keyboard(user)
-            )
+        # Normalização básica
+        raw_items = [i.strip().upper() for i in text.split(",") if i.strip()]
+        unique_items = []
+        seen = set()
+        for i in raw_items:
+            if i not in seen:
+                unique_items.append(i)
+                seen.add(i)
+
+        # Dica: não expandimos categorias na string salva; mantemos como o usuário enviou.
+        # A checagem em tempo de execução usa core.whitelist_service.is_coin_in_whitelist(...)
+        normalized = ",".join(unique_items)
+
+        user = db.query(User).filter(User.telegram_id == update.effective_user.id).first()
+        if not user:
+            await update.message.reply_text("Usuário não encontrado. Use /start para registrar.")
+            return ConversationHandler.END
+
+        # Se seu modelo for user.coin_whitelist_str ou similar, ajuste o campo aqui:
+        if hasattr(user, "coin_whitelist"):
+            user.coin_whitelist = normalized
+        elif hasattr(user, "coin_whitelist_str"):
+            user.coin_whitelist_str = normalized
+        else:
+            # cria atributo em runtime para evitar quebra; ideal é usar o nome real do seu modelo
+            setattr(user, "coin_whitelist", normalized)
+
+        db.commit()
+
+        # Apaga a mensagem do usuário para manter a timeline limpa (se possível)
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+
+        # Mensagem de confirmação + retorno ao menu raiz de Configurações
+        header = (
+            "⚙️ <b>Configurações de Trade</b>\n"
+            "<i>Whitelist atualizada com sucesso.</i>\n\n"
+            f"📦 <b>Lista salva</b>: <code>{normalized}</code>"
+        )
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=header,
+            reply_markup=settings_menu_keyboard(user),
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        db.rollback()
+        logger.error(f"[settings] receive_coin_whitelist erro: {e}", exc_info=True)
+        await update.message.reply_text("Erro ao salvar a whitelist. Tente novamente.")
     finally:
         db.close()
-
     return ConversationHandler.END
 
 async def list_closed_trades_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
