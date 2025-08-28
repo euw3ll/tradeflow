@@ -1163,33 +1163,37 @@ async def performance_menu_handler(update: Update, context: ContextTypes.DEFAULT
 
 # --- FLUXO DE CONFIGURAÇÃO DE WHITELIST ---
 
-async def ask_coin_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Pergunta ao usuário sua nova whitelist de moedas."""
+async def ask_coin_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Prompt para editar Whitelist com instruções e categorias."""
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     query = update.callback_query
     await query.answer()
-    user_id = update.effective_user.id
-    
-    context.user_data['settings_message_id'] = query.message.message_id
-    
-    db = SessionLocal()
-    try:
-        user = db.query(User).filter_by(telegram_id=user_id).first()
-        current_whitelist = user.coin_whitelist if user else 'todas'
-    finally:
-        db.close()
 
-    instructions = (
-        f"<b>✅ Whitelist de Moedas</b>\n\n"
-        f"Sua configuração atual é: <code>{current_whitelist}</code>\n\n"
-        f"Envie uma lista de moedas e/ou categorias separadas por vírgula.\n\n"
-        f"<b>Exemplos:</b>\n"
-        f"• <code>todas</code> (para operar todos os sinais)\n"
-        f"• <code>btcusdt, ethusdt, solusdt</code>\n"
-        f"• <code>memecoins, btcusdt</code> (opera moedas meme + BTC)\n\n"
-        f"<b>Categorias disponíveis:</b> <code>memecoins</code>, <code>altcoins</code>, <code>defi</code>."
+    text = (
+        "✅ <b>Whitelist de Moedas</b>\n"
+        "Você pode definir exatamente <i>quais moedas</i> o bot poderá operar.\n\n"
+        "🧩 <b>Como usar</b>\n"
+        "• Digite tickers separados por vírgula (ex.: <code>BTCUSDT,ETHUSDT,SOLUSDT</code>)\n"
+        "• Pode misturar <b>tickers</b> com <b>categorias</b>\n"
+        "• Use <code>todas</code> para liberar todos os pares\n\n"
+        "📦 <b>Categorias disponíveis</b>\n"
+        "• <b>bluechips</b> → BTC, ETH, BNB\n"
+        "• <b>altcoins</b> → SOL, XRP, ADA, AVAX, DOT, MATIC, LINK...\n"
+        "• <b>defi</b> → UNI, AAVE, MKR, SNX, COMP, CRV...\n"
+        "• <b>infra</b> → LINK, GRT, FIL\n"
+        "• <b>memecoins</b> → DOGE, SHIB, PEPE, WIF, FLOKI, BONK\n\n"
+        "ℹ️ Exemplos válidos:\n"
+        "• <code>bluechips</code>\n"
+        "• <code>memecoins,altcoins</code>\n"
+        "• <code>BTCUSDT,ETHUSDT,defi</code>\n\n"
+        "⬅️ Clique em <b>Voltar</b> para cancelar sem alterações."
     )
-    
-    await query.edit_message_text(text=instructions, parse_mode='HTML')
+
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ Voltar", callback_data="back_to_settings_menu")]
+    ])
+
+    await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
     return ASKING_COIN_WHITELIST
 
 async def receive_coin_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1789,3 +1793,9 @@ async def back_to_settings_menu_handler(update: Update, context: ContextTypes.DE
         await query.edit_message_text("Não foi possível voltar ao menu de configurações agora.")
     finally:
         db.close()
+
+async def back_from_whitelist_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sai do estado de edição da Whitelist e volta ao menu de Configurações."""
+    # reaproveita o handler existente para renderizar o menu
+    await back_to_settings_menu_handler(update, context)
+    return ConversationHandler.END

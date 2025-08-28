@@ -33,10 +33,8 @@ from bot.handlers import (
     ask_ma_timeframe, set_ma_timeframe,
     ask_rsi_oversold, receive_rsi_oversold, ASKING_RSI_OVERSOLD,
     ask_rsi_overbought, receive_rsi_overbought, ASKING_RSI_OVERBOUGHT,
-    show_risk_menu_handler,
-    show_stopgain_menu_handler,
-    show_circuit_menu_handler,
-    back_to_settings_menu_handler,
+    show_risk_menu_handler, show_stopgain_menu_handler, show_circuit_menu_handler,
+    back_to_settings_menu_handler, back_from_whitelist_handler
 )
 from database.session import init_db
 from services.telethon_service import start_signal_monitor
@@ -124,11 +122,18 @@ async def main():
         fallbacks=[CommandHandler("cancel", cancel)], per_message=False, per_user=True,
     )
     whitelist_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(ask_coin_whitelist, pattern='^set_coin_whitelist$')],
-        states={ ASKING_COIN_WHITELIST: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_coin_whitelist)] },
-        # MUDANÇA: 'per_message' alterado para False para manter o estado da conversa.
-        fallbacks=[CommandHandler("cancel", cancel)], per_message=False, per_user=True,
-    )
+    entry_points=[CallbackQueryHandler(ask_coin_whitelist, pattern='^set_coin_whitelist$')],
+    states={
+        ASKING_COIN_WHITELIST: [
+            # novo: permite clicar em "Voltar" enquanto está no prompt
+            CallbackQueryHandler(back_from_whitelist_handler, pattern='^back_to_settings_menu$'),
+            # já existia: captura o texto enviado com a lista
+            MessageHandler(filters.TEXT & ~filters.COMMAND, receive_coin_whitelist),
+        ]
+    },
+    fallbacks=[CommandHandler("cancel", cancel)],
+    per_message=False, per_user=True,
+)
     stop_gain_trigger_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(ask_stop_gain_trigger, pattern='^set_stop_gain_trigger$')],
         states={ ASKING_STOP_GAIN_TRIGGER: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_stop_gain_trigger)] },

@@ -24,10 +24,18 @@ MEMECOINS: Set[str] = {
     'DOGEUSDT', 'SHIBUSDT', 'PEPEUSDT', 'WIFUSDT', 'FLOKIUSDT', 'BONKUSDT'
 }
 
+# Moedas "blue chips" clássicas
+BLUECHIPS: Set[str] = {'BTCUSDT', 'ETHUSDT', 'BNBUSDT'}
+
+# Camada de infraestrutura / oráculos
+INFRA: Set[str] = {'LINKUSDT', 'GRTUSDT', 'FILUSDT'}
+
 # Dicionário que mapeia a palavra-chave da categoria para o Set de moedas
 CATEGORIES = {
+    'bluechips': BLUECHIPS,
     'altcoins': ALTCOINS_L1_L2,
     'defi': DEFI,
+    'infra': INFRA,
     'memecoins': MEMECOINS,
 }
 
