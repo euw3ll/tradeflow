@@ -97,10 +97,21 @@ def risk_menu_keyboard(user) -> InlineKeyboardMarkup:
     ]
     return InlineKeyboardMarkup(kb)
 
+def _read_stop_strategy_label(user) -> str:
+    raw = (getattr(user, "stop_strategy", None)
+           or getattr(user, "stop_strategy_mode", None)
+           or getattr(user, "stop_strategy_type", None)
+           or "breakeven")
+    raw = str(raw).lower()
+    return "Breakeven" if raw.startswith("b") else "Trailing"
+
 def stopgain_menu_keyboard(user) -> InlineKeyboardMarkup:
     trigger = f"{float(getattr(user, 'stop_gain_trigger_pct', 0) or 0):.2f}%"
     lock    = f"{float(getattr(user, 'stop_gain_lock_pct', 0) or 0):.2f}%"
+    strategy_label = _read_stop_strategy_label(user)
+
     kb = [
+        [InlineKeyboardButton(f"🧭 Estratégia: {strategy_label}", callback_data="set_stop_strategy")],
         [InlineKeyboardButton(f"🚀 Gatilho Stop-Gain ({trigger})", callback_data="set_stop_gain_trigger")],
         [InlineKeyboardButton(f"🔒 Trava Stop-Gain ({lock})", callback_data="set_stop_gain_lock")],
         [InlineKeyboardButton("⬅️ Voltar", callback_data="back_to_settings_menu")],

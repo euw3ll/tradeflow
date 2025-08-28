@@ -784,36 +784,52 @@ async def receive_min_confidence(update: Update, context: ContextTypes.DEFAULT_T
     return ConversationHandler.END
 
     
+def _current_strategy_value(user) -> str:
+    return (str(getattr(user, "stop_strategy", None) or
+                getattr(user, "stop_strategy_mode", None) or
+                getattr(user, "stop_strategy_type", None) or "breakeven")).lower()
+
+def _next_strategy_value(value: str) -> str:
+    return "trailing" if value.startswith("b") else "breakeven"
+
+def _stopgain_summary(user) -> str:
+    trigger = float(getattr(user, 'stop_gain_trigger_pct', 0) or 0)
+    lock    = float(getattr(user, 'stop_gain_lock_pct', 0) or 0)
+    cur     = _current_strategy_value(user)
+    label   = "Breakeven" if cur.startswith("b") else "Trailing"
+    return f"• Estratégia: {label}  |  Gatilho: {trigger:.2f}%  |  Trava: {lock:.2f}%"
+
 async def toggle_stop_strategy_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Alterna a estratégia de stop loss do usuário entre Break-Even e Trailing Stop."""
     query = update.callback_query
     await query.answer()
-    user_id = update.effective_user.id
-
     db = SessionLocal()
     try:
-        user = db.query(User).filter(User.telegram_id == user_id).first()
-        if user:
-            # Lógica para alternar a estratégia
-            if user.stop_strategy == 'BREAK_EVEN':
-                user.stop_strategy = 'TRAILING_STOP'
-            else:
-                user.stop_strategy = 'BREAK_EVEN'
-            db.commit()
-            
-            # Atualiza o menu para refletir a mudança imediatamente
-            await query.edit_message_text(
-                "<b>⚙️ Configurações de Trade</b>\n\n"
-                "Aqui você pode definir seus parâmetros de risco e automação.",
-                parse_mode='HTML',
-                reply_markup=settings_menu_keyboard(user)
-            )
-    except BadRequest as e:
-        if "Message is not modified" in str(e):
-            # Ignora o erro se a mensagem não mudou (cliques rápidos)
-            pass
+        user = db.query(User).filter(User.telegram_id == query.from_user.id).first()
+        if not user:
+            await query.edit_message_text("Não encontrei seu usuário. Use /start para registrar.")
+            return
+        cur = _current_strategy_value(user)
+        nxt = _next_strategy_value(cur)
+
+        if hasattr(user, "stop_strategy"):
+            user.stop_strategy = nxt
+        elif hasattr(user, "stop_strategy_mode"):
+            user.stop_strategy_mode = nxt
+        elif hasattr(user, "stop_strategy_type"):
+            user.stop_strategy_type = nxt
         else:
-            logger.error(f"Erro ao editar mensagem em toggle_stop_strategy: {e}")
+            setattr(user, "stop_strategy", nxt)
+
+        db.commit()
+        header = ("🛡️ <b>Stop-Gain</b>\n<i>Configure estratégia, gatilho e trava.</i>\n\n"
+                  f"{_stopgain_summary(user)}")
+        await query.edit_message_text(text=header,
+                                      reply_markup=stopgain_menu_keyboard(user),
+                                      parse_mode="HTML")
+    except Exception as e:
+        db.rollback()
+        logger.error(f"[settings] toggle_stop_strategy_handler erro: {e}", exc_info=True)
+        await query.edit_message_text("Erro ao alternar estratégia.")
     finally:
         db.close()
     
