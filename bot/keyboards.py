@@ -70,10 +70,6 @@ def confirm_remove_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 def settings_menu_keyboard(user) -> InlineKeyboardMarkup:
-    """
-    Menu raiz de Configurações: agora exibe categorias (submenus).
-    Mantém itens simples úteis no raiz (Whitelist e Filtros).
-    """
     kb = [
         [
             InlineKeyboardButton("🧮 Risco & Tamanho", callback_data="settings_risk"),
@@ -83,83 +79,43 @@ def settings_menu_keyboard(user) -> InlineKeyboardMarkup:
             InlineKeyboardButton("🚫 Disjuntor", callback_data="settings_circuit"),
             InlineKeyboardButton("✅ Whitelist", callback_data="set_coin_whitelist"),
         ],
-        [
-            InlineKeyboardButton("🔬 Filtros de Sinais", callback_data="signal_filters_menu"),
-        ],
-        [
-            InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data="back_to_main_menu"),
-        ],
+        [InlineKeyboardButton("🔬 Filtros de Sinais", callback_data="signal_filters_menu")],
+        [InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data="back_to_main_menu")],
     ]
     return InlineKeyboardMarkup(kb)
 
 
 def risk_menu_keyboard(user) -> InlineKeyboardMarkup:
-    """
-    Submenu: Risco & Tamanho.
-    Mostra valores atuais no rótulo para reforço de contexto.
-    """
     entry_pct = f"{float(getattr(user, 'entry_size_percent', 0) or 0):.1f}%"
     leverage  = f"{int(getattr(user, 'max_leverage', 0) or 0)}x"
     min_conf  = f"{float(getattr(user, 'min_confidence', 0) or 0):.1f}%"
-
     kb = [
-        [
-            InlineKeyboardButton(f"📥 Tamanho de Entrada ({entry_pct})", callback_data="set_entry_percent"),
-        ],
-        [
-            InlineKeyboardButton(f"⚙️ Alavancagem Máx. ({leverage})", callback_data="set_max_leverage"),
-        ],
-        [
-            InlineKeyboardButton(f"🎯 Confiança Mín. ({min_conf})", callback_data="set_min_confidence"),
-        ],
-        [
-            InlineKeyboardButton("⬅️ Voltar", callback_data="back_to_settings_menu"),
-        ],
+        [InlineKeyboardButton(f"📥 Tamanho de Entrada ({entry_pct})", callback_data="set_entry_percent")],
+        [InlineKeyboardButton(f"⚙️ Alavancagem Máx. ({leverage})", callback_data="set_max_leverage")],
+        [InlineKeyboardButton(f"🎯 Confiança Mín. ({min_conf})", callback_data="set_min_confidence")],
+        [InlineKeyboardButton("⬅️ Voltar", callback_data="back_to_settings_menu")],
     ]
     return InlineKeyboardMarkup(kb)
-
 
 def stopgain_menu_keyboard(user) -> InlineKeyboardMarkup:
-    """
-    Submenu: Stop-Gain (gatilho e trava).
-    """
     trigger = f"{float(getattr(user, 'stop_gain_trigger_pct', 0) or 0):.2f}%"
     lock    = f"{float(getattr(user, 'stop_gain_lock_pct', 0) or 0):.2f}%"
-
     kb = [
-        [
-            InlineKeyboardButton(f"🚀 Gatilho Stop-Gain ({trigger})", callback_data="set_stop_gain_trigger"),
-        ],
-        [
-            InlineKeyboardButton(f"🔒 Trava Stop-Gain ({lock})", callback_data="set_stop_gain_lock"),
-        ],
-        [
-            InlineKeyboardButton("⬅️ Voltar", callback_data="back_to_settings_menu"),
-        ],
+        [InlineKeyboardButton(f"🚀 Gatilho Stop-Gain ({trigger})", callback_data="set_stop_gain_trigger")],
+        [InlineKeyboardButton(f"🔒 Trava Stop-Gain ({lock})", callback_data="set_stop_gain_lock")],
+        [InlineKeyboardButton("⬅️ Voltar", callback_data="back_to_settings_menu")],
     ]
     return InlineKeyboardMarkup(kb)
-
 
 def circuit_menu_keyboard(user) -> InlineKeyboardMarkup:
-    """
-    Submenu: Disjuntor (threshold e pausa).
-    """
     threshold = f"{int(getattr(user, 'circuit_breaker_threshold', 0) or 0)}"
     pause     = f"{int(getattr(user, 'circuit_breaker_pause_minutes', 0) or 0)} min"
-
     kb = [
-        [
-            InlineKeyboardButton(f"⚡ Limite do Disjuntor ({threshold})", callback_data="set_circuit_threshold"),
-        ],
-        [
-            InlineKeyboardButton(f"⏸️ Pausa após Disparo ({pause})", callback_data="set_circuit_pause"),
-        ],
-        [
-            InlineKeyboardButton("⬅️ Voltar", callback_data="back_to_settings_menu"),
-        ],
+        [InlineKeyboardButton(f"⚡ Limite do Disjuntor ({threshold})", callback_data="set_circuit_threshold")],
+        [InlineKeyboardButton(f"⏸️ Pausa após Disparo ({pause})", callback_data="set_circuit_pause")],
+        [InlineKeyboardButton("⬅️ Voltar", callback_data="back_to_settings_menu")],
     ]
     return InlineKeyboardMarkup(kb)
-
 
 def bot_config_keyboard(user_settings):
     """

@@ -46,6 +46,7 @@ ASKING_COIN_WHITELIST = 15
 
 logger = logging.getLogger(__name__)
 
+# ---- helpers (resumos no topo dos submenus) ----
 def _risk_summary(user) -> str:
     try:
         return (
@@ -695,145 +696,93 @@ async def user_settings_handler(update: Update, context: ContextTypes.DEFAULT_TY
     finally:
         db.close()
 
-async def ask_entry_percent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Pergunta ao usuário qual a nova porcentagem da banca por entrada."""
-    query = update.callback_query
-    await query.answer()
-    
-    context.user_data['settings_message_id'] = query.message.message_id
-    
-    await query.edit_message_text(
-        "Envie a porcentagem da sua banca em USDT que você deseja usar para cada entrada.\n\n"
-        "Exemplo: se você tem $100 e define `10`, cada entrada terá o valor de $10.\n"
-        "Envie apenas o número (ex: `10` para 10%)."
-    )
-    return ASKING_ENTRY_PERCENT
-
-# ======================
-# RISCO & TAMANHO
-# ======================
+# ---- RISCO & TAMANHO ----
 async def receive_entry_percent(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Salva % de entrada e recarrega o submenu de Risco & Tamanho."""
     text = (update.message.text or "").strip().replace("%", "").replace(",", ".")
     db = SessionLocal()
     try:
         value = float(text)
         if value <= 0 or value > 100:
             await update.message.reply_text("Valor inválido. Envie um número entre 0 e 100 (ex.: 3.5).")
-            return
-        user = db.query(User).filter(User.telegram_id == update.effective_user.id).first()
+            return ConversationHandler.END
+        user = db.query(User).filter_by(telegram_id=update.effective_user.id).first()
         if not user:
-            await update.message.reply_text("Usuário não encontrado. Use /start para registrar.")
-            return
-        user.entry_size_percent = value
-        db.commit()
-        try:
-            await update.message.delete()
-        except Exception:
-            pass
+            await update.message.reply_text("Usuário não encontrado. Use /start para registrar."); return ConversationHandler.END
+        user.entry_size_percent = value; db.commit()
+        try: await update.message.delete()
+        except Exception: pass
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text=f"🧮 <b>Risco & Tamanho</b>\n✅ Tamanho de entrada salvo: <b>{value:.1f}%</b>",
-            reply_markup=risk_menu_keyboard(user),
-            parse_mode="HTML",
+            reply_markup=risk_menu_keyboard(user), parse_mode="HTML",
         )
     except ValueError:
         await update.message.reply_text("Não entendi. Envie um número (ex.: 3.5).")
     except Exception as e:
-        db.rollback()
-        logger.error(f"[settings] Erro ao salvar entry_size_percent: {e}", exc_info=True)
+        db.rollback(); logger.error(f"[settings] entry_size_percent: {e}", exc_info=True)
         await update.message.reply_text("Erro ao salvar. Tente novamente.")
     finally:
-        db.close()    
+        db.close()
+    return ConversationHandler.END
 
-async def ask_max_leverage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Pergunta ao usuário qual a nova alavancagem máxima."""
-    query = update.callback_query
-    await query.answer()
-    
-    context.user_data['settings_message_id'] = query.message.message_id
-    
-    await query.edit_message_text(
-        "Qual a alavancagem máxima que o bot deve usar?\n"
-        "Envie apenas o número (ex: `10` para 10x)."
-    )
-    return ASKING_MAX_LEVERAGE
 
 async def receive_max_leverage(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Salva alavancagem máxima e recarrega o submenu de Risco & Tamanho."""
     text = (update.message.text or "").strip().lower().replace("x", "")
     db = SessionLocal()
     try:
         value = int(float(text))
         if value < 1 or value > 125:
             await update.message.reply_text("Valor inválido. Envie um inteiro entre 1 e 125 (ex.: 10).")
-            return
-        user = db.query(User).filter(User.telegram_id == update.effective_user.id).first()
+            return ConversationHandler.END
+        user = db.query(User).filter_by(telegram_id=update.effective_user.id).first()
         if not user:
-            await update.message.reply_text("Usuário não encontrado. Use /start para registrar.")
-            return
-        user.max_leverage = value
-        db.commit()
-        try:
-            await update.message.delete()
-        except Exception:
-            pass
+            await update.message.reply_text("Usuário não encontrado. Use /start para registrar."); return ConversationHandler.END
+        user.max_leverage = value; db.commit()
+        try: await update.message.delete()
+        except Exception: pass
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text=f"🧮 <b>Risco & Tamanho</b>\n✅ Alavancagem máxima salva: <b>{value}x</b>",
-            reply_markup=risk_menu_keyboard(user),
-            parse_mode="HTML",
+            reply_markup=risk_menu_keyboard(user), parse_mode="HTML",
         )
     except ValueError:
         await update.message.reply_text("Não entendi. Envie um número inteiro (ex.: 10).")
     except Exception as e:
-        db.rollback()
-        logger.error(f"[settings] Erro ao salvar max_leverage: {e}", exc_info=True)
+        db.rollback(); logger.error(f"[settings] max_leverage: {e}", exc_info=True)
         await update.message.reply_text("Erro ao salvar. Tente novamente.")
     finally:
         db.close()
+    return ConversationHandler.END
 
-async def ask_min_confidence(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Pergunta ao usuário qual o novo valor de confiança mínima."""
-    query = update.callback_query
-    await query.answer()
-    context.user_data['settings_message_id'] = query.message.message_id
-    await query.edit_message_text("Envie o valor da confiança mínima da IA (ex: 75 para 75%).\nSinais com confiança abaixo disso serão ignorados.")
-    return ASKING_MIN_CONFIDENCE
 
 async def receive_min_confidence(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Salva confiança mínima e recarrega o submenu de Risco & Tamanho."""
     text = (update.message.text or "").strip().replace("%", "").replace(",", ".")
     db = SessionLocal()
     try:
         value = float(text)
         if value < 0 or value > 100:
-            await update.message.reply_text("Valor inválido. Envie um número entre 0 e 100 (ex.: 65).")
-            return
-        user = db.query(User).filter(User.telegram_id == update.effective_user.id).first()
+            await update.message.reply_text("Valor inválido. Envie um número entre 0 e 100 (ex.: 70).")
+            return ConversationHandler.END
+        user = db.query(User).filter_by(telegram_id=update.effective_user.id).first()
         if not user:
-            await update.message.reply_text("Usuário não encontrado. Use /start para registrar.")
-            return
-        user.min_confidence = value
-        db.commit()
-        try:
-            await update.message.delete()
-        except Exception:
-            pass
+            await update.message.reply_text("Usuário não encontrado. Use /start para registrar."); return ConversationHandler.END
+        user.min_confidence = value; db.commit()
+        try: await update.message.delete()
+        except Exception: pass
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text=f"🧮 <b>Risco & Tamanho</b>\n✅ Confiança mínima salva: <b>{value:.1f}%</b>",
-            reply_markup=risk_menu_keyboard(user),
-            parse_mode="HTML",
+            reply_markup=risk_menu_keyboard(user), parse_mode="HTML",
         )
     except ValueError:
-        await update.message.reply_text("Não entendi. Envie um número (ex.: 65).")
+        await update.message.reply_text("Não entendi. Envie um número (ex.: 70).")
     except Exception as e:
-        db.rollback()
-        logger.error(f"[settings] Erro ao salvar min_confidence: {e}", exc_info=True)
+        db.rollback(); logger.error(f"[settings] min_confidence: {e}", exc_info=True)
         await update.message.reply_text("Erro ao salvar. Tente novamente.")
     finally:
         db.close()
+    return ConversationHandler.END
+
     
 async def toggle_stop_strategy_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Alterna a estratégia de stop loss do usuário entre Break-Even e Trailing Stop."""
@@ -1403,184 +1352,160 @@ async def toggle_bot_status_handler(update: Update, context: ContextTypes.DEFAUL
     finally:
         db.close()
 
-async def ask_stop_gain_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Pergunta o gatilho de ativação do Stop-Gain."""
+async def ask_entry_percent(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    context.user_data['settings_message_id'] = query.message.message_id
-    await query.edit_message_text(
-        "Envie o percentual de lucro para ATIVAR o Stop-Gain.\n\n"
-        "Exemplo: `1.5` para 1.5%. Se o lucro da posição atingir este valor, o stop será movido para um nível seguro.\n"
-        "Envie `0` para desativar."
-    )
+    await query.edit_message_text("📥 Envie o <b>tamanho de entrada</b> em % (ex.: 3.5)", parse_mode="HTML")
+    return ASKING_ENTRY_PERCENT
+
+async def ask_max_leverage(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("⚙️ Envie a <b>alavancagem máxima</b> (ex.: 5, 10, 20)", parse_mode="HTML")
+    return ASKING_MAX_LEVERAGE
+
+async def ask_min_confidence(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("🎯 Envie a <b>confiança mínima</b> em % (ex.: 70)", parse_mode="HTML")
+    return ASKING_MIN_CONFIDENCE
+
+async def ask_stop_gain_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("🚀 Envie o <b>gatilho</b> do Stop-Gain em % (ex.: 3)", parse_mode="HTML")
     return ASKING_STOP_GAIN_TRIGGER
 
+async def ask_stop_gain_lock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("🔒 Envie a <b>trava</b> do Stop-Gain em % (ex.: 1)", parse_mode="HTML")
+    return ASKING_STOP_GAIN_LOCK
+
+async def ask_circuit_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("⚡ Envie o <b>limite</b> do disjuntor (inteiro, ex.: 3)", parse_mode="HTML")
+    return ASKING_CIRCUIT_THRESHOLD
+
+async def ask_circuit_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("⏸️ Envie a <b>pausa</b> após disparo (minutos, ex.: 120)", parse_mode="HTML")
+    return ASKING_CIRCUIT_PAUSE
+
+# ---- STOP-GAIN ----
 async def receive_stop_gain_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Salva o gatilho de stop-gain (%) e recarrega o submenu de Stop-Gain."""
     text = (update.message.text or "").strip().replace("%", "").replace(",", ".")
     db = SessionLocal()
     try:
         value = float(text)
         if value < 0 or value > 100:
-            await update.message.reply_text("Valor inválido. Envie um número entre 0 e 100 (ex.: 2.5).")
-            return
-        user = db.query(User).filter(User.telegram_id == update.effective_user.id).first()
+            await update.message.reply_text("Valor inválido. Envie entre 0 e 100 (ex.: 3)."); return ConversationHandler.END
+        user = db.query(User).filter_by(telegram_id=update.effective_user.id).first()
         if not user:
-            await update.message.reply_text("Usuário não encontrado. Use /start para registrar.")
-            return
-        user.stop_gain_trigger_pct = value
-        db.commit()
-        try:
-            await update.message.delete()
-        except Exception:
-            pass
+            await update.message.reply_text("Usuário não encontrado. Use /start para registrar."); return ConversationHandler.END
+        user.stop_gain_trigger_pct = value; db.commit()
+        try: await update.message.delete()
+        except Exception: pass
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text=f"🛡️ <b>Stop-Gain</b>\n✅ Gatilho salvo: <b>{value:.2f}%</b>",
-            reply_markup=stopgain_menu_keyboard(user),
-            parse_mode="HTML",
+            reply_markup=stopgain_menu_keyboard(user), parse_mode="HTML",
         )
     except ValueError:
-        await update.message.reply_text("Não entendi. Envie um número (ex.: 2.5).")
+        await update.message.reply_text("Não entendi. Envie um número (ex.: 3).")
     except Exception as e:
-        db.rollback()
-        logger.error(f"[settings] Erro ao salvar stop_gain_trigger_pct: {e}", exc_info=True)
+        db.rollback(); logger.error(f"[settings] stop_gain_trigger_pct: {e}", exc_info=True)
         await update.message.reply_text("Erro ao salvar. Tente novamente.")
     finally:
         db.close()
+    return ConversationHandler.END
 
-async def ask_stop_gain_lock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Pergunta o nível de segurança do Stop-Gain."""
-    query = update.callback_query
-    await query.answer()
-    context.user_data['settings_message_id'] = query.message.message_id
-    await query.edit_message_text(
-        "Envie o percentual de lucro MÍNIMO a ser garantido pelo Stop-Gain.\n\n"
-        "Exemplo: `0.5` para 0.5%. Após o gatilho ser ativado, o stop será movido para garantir este lucro."
-    )
-    return ASKING_STOP_GAIN_LOCK
 
 async def receive_stop_gain_lock(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Salva a trava de stop-gain (%) e recarrega o submenu de Stop-Gain."""
     text = (update.message.text or "").strip().replace("%", "").replace(",", ".")
     db = SessionLocal()
     try:
         value = float(text)
         if value < 0 or value > 100:
-            await update.message.reply_text("Valor inválido. Envie um número entre 0 e 100 (ex.: 0.5).")
-            return
-        user = db.query(User).filter(User.telegram_id == update.effective_user.id).first()
+            await update.message.reply_text("Valor inválido. Envie entre 0 e 100 (ex.: 1)."); return ConversationHandler.END
+        user = db.query(User).filter_by(telegram_id=update.effective_user.id).first()
         if not user:
-            await update.message.reply_text("Usuário não encontrado. Use /start para registrar.")
-            return
-        user.stop_gain_lock_pct = value
-        db.commit()
-        try:
-            await update.message.delete()
-        except Exception:
-            pass
+            await update.message.reply_text("Usuário não encontrado. Use /start para registrar."); return ConversationHandler.END
+        user.stop_gain_lock_pct = value; db.commit()
+        try: await update.message.delete()
+        except Exception: pass
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text=f"🛡️ <b>Stop-Gain</b>\n✅ Trava salva: <b>{value:.2f}%</b>",
-            reply_markup=stopgain_menu_keyboard(user),
-            parse_mode="HTML",
+            reply_markup=stopgain_menu_keyboard(user), parse_mode="HTML",
         )
     except ValueError:
-        await update.message.reply_text("Não entendi. Envie um número (ex.: 0.5).")
+        await update.message.reply_text("Não entendi. Envie um número (ex.: 1).")
     except Exception as e:
-        db.rollback()
-        logger.error(f"[settings] Erro ao salvar stop_gain_lock_pct: {e}", exc_info=True)
+        db.rollback(); logger.error(f"[settings] stop_gain_lock_pct: {e}", exc_info=True)
         await update.message.reply_text("Erro ao salvar. Tente novamente.")
     finally:
         db.close()
+    return ConversationHandler.END
 
-async def ask_circuit_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Pergunta o gatilho de perdas do Disjuntor."""
-    query = update.callback_query
-    await query.answer()
-    context.user_data['settings_message_id'] = query.message.message_id
-    await query.edit_message_text(
-        "Envie o número de perdas ativas para ATIVAR o disjuntor.\n\n"
-        "Exemplo: `3`. Se houver 3 ou mais trades perdendo na mesma direção, o bot pausa.\n"
-        "Envie `0` para desativar."
-    )
-    return ASKING_CIRCUIT_THRESHOLD
-
+# ---- DISJUNTOR ----
 async def receive_circuit_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Salva o limite do disjuntor (número de eventos) e recarrega o submenu de Disjuntor."""
     text = (update.message.text or "").strip()
     db = SessionLocal()
     try:
         value = int(float(text))
         if value < 0 or value > 1000:
             await update.message.reply_text("Valor inválido. Envie um inteiro entre 0 e 1000 (ex.: 3).")
-            return
-        user = db.query(User).filter(User.telegram_id == update.effective_user.id).first()
+            return ConversationHandler.END
+        user = db.query(User).filter_by(telegram_id=update.effective_user.id).first()
         if not user:
-            await update.message.reply_text("Usuário não encontrado. Use /start para registrar.")
-            return
-        user.circuit_breaker_threshold = value
-        db.commit()
-        try:
-            await update.message.delete()
-        except Exception:
-            pass
+            await update.message.reply_text("Usuário não encontrado. Use /start para registrar."); return ConversationHandler.END
+        user.circuit_breaker_threshold = value; db.commit()
+        try: await update.message.delete()
+        except Exception: pass
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text=f"🚫 <b>Disjuntor</b>\n✅ Limite salvo: <b>{value}</b>",
-            reply_markup=circuit_menu_keyboard(user),
-            parse_mode="HTML",
+            reply_markup=circuit_menu_keyboard(user), parse_mode="HTML",
         )
     except ValueError:
         await update.message.reply_text("Não entendi. Envie um número inteiro (ex.: 3).")
     except Exception as e:
-        db.rollback()
-        logger.error(f"[settings] Erro ao salvar circuit_breaker_threshold: {e}", exc_info=True)
+        db.rollback(); logger.error(f"[settings] circuit_breaker_threshold: {e}", exc_info=True)
         await update.message.reply_text("Erro ao salvar. Tente novamente.")
     finally:
         db.close()
-
-async def ask_circuit_pause(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Pergunta o tempo de pausa do Disjuntor."""
-    query = update.callback_query
-    await query.answer()
-    context.user_data['settings_message_id'] = query.message.message_id
-    await query.edit_message_text("Envie o tempo em MINUTOS que o bot ficará pausado após o disjuntor ser ativado.\n\nExemplo: `60`.")
-    return ASKING_CIRCUIT_PAUSE
+    return ConversationHandler.END
 
 async def receive_circuit_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Salva a pausa após o disparo (minutos) e recarrega o submenu de Disjuntor."""
     text = (update.message.text or "").strip().lower().replace("min", "").replace("m", "")
     db = SessionLocal()
     try:
         value = int(float(text))
         if value < 0 or value > 1440:
-            await update.message.reply_text("Valor inválido. Envie um inteiro entre 0 e 1440 (ex.: 60).")
-            return
-        user = db.query(User).filter(User.telegram_id == update.effective_user.id).first()
+            await update.message.reply_text("Valor inválido. Envie um inteiro entre 0 e 1440 (ex.: 120).")
+            return ConversationHandler.END
+        user = db.query(User).filter_by(telegram_id=update.effective_user.id).first()
         if not user:
-            await update.message.reply_text("Usuário não encontrado. Use /start para registrar.")
-            return
-        user.circuit_breaker_pause_minutes = value
-        db.commit()
-        try:
-            await update.message.delete()
-        except Exception:
-            pass
+            await update.message.reply_text("Usuário não encontrado. Use /start para registrar."); return ConversationHandler.END
+        user.circuit_breaker_pause_minutes = value; db.commit()
+        try: await update.message.delete()
+        except Exception: pass
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text=f"🚫 <b>Disjuntor</b>\n✅ Pausa salva: <b>{value} min</b>",
-            reply_markup=circuit_menu_keyboard(user),
-            parse_mode="HTML",
+            reply_markup=circuit_menu_keyboard(user), parse_mode="HTML",
         )
     except ValueError:
-        await update.message.reply_text("Não entendi. Envie um número inteiro (ex.: 60).")
+        await update.message.reply_text("Não entendi. Envie um número inteiro (ex.: 120).")
     except Exception as e:
-        db.rollback()
-        logger.error(f"[settings] Erro ao salvar circuit_breaker_pause_minutes: {e}", exc_info=True)
+        db.rollback(); logger.error(f"[settings] circuit_breaker_pause_minutes: {e}", exc_info=True)
         await update.message.reply_text("Erro ao salvar. Tente novamente.")
     finally:
         db.close()
+    return ConversationHandler.END
 
 async def signal_filters_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Exibe o menu de configuração de filtros de sinais."""
@@ -1778,9 +1703,7 @@ async def receive_rsi_overbought(update: Update, context: ContextTypes.DEFAULT_T
         return ASKING_RSI_OVERBOUGHT
     return ConversationHandler.END
 
-# [FUNÇÃO NOVA]
 async def show_risk_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Abre o submenu: Risco & Tamanho (com resumo)."""
     query = update.callback_query
     await query.answer()
     db = SessionLocal()
@@ -1789,26 +1712,16 @@ async def show_risk_menu_handler(update: Update, context: ContextTypes.DEFAULT_T
         if not user:
             await query.edit_message_text("Não encontrei seu usuário. Use /start para registrar.")
             return
-
-        header = (
-            "🧮 <b>Risco & Tamanho</b>\n"
-            "<i>Ajuste parâmetros de risco e tamanho de posição.</i>\n\n"
-            f"{_risk_summary(user)}"
-        )
-        await query.edit_message_text(
-            text=header,
-            reply_markup=risk_menu_keyboard(user),
-            parse_mode="HTML",
-        )
+        header = ("🧮 <b>Risco & Tamanho</b>\n<i>Ajuste parâmetros de risco e tamanho de posição.</i>\n\n"
+                  f"{_risk_summary(user)}")
+        await query.edit_message_text(text=header, reply_markup=risk_menu_keyboard(user), parse_mode="HTML")
     except Exception as e:
-        logger.error(f"[settings] Erro ao abrir submenu Risco: {e}", exc_info=True)
+        logger.error(f"[settings] submenu Risco: {e}", exc_info=True)
         await query.edit_message_text("Não foi possível abrir o submenu de Risco agora.")
     finally:
         db.close()
 
-# [FUNÇÃO NOVA]
 async def show_stopgain_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Abre o submenu: Stop-Gain (com resumo)."""
     query = update.callback_query
     await query.answer()
     db = SessionLocal()
@@ -1817,26 +1730,16 @@ async def show_stopgain_menu_handler(update: Update, context: ContextTypes.DEFAU
         if not user:
             await query.edit_message_text("Não encontrei seu usuário. Use /start para registrar.")
             return
-
-        header = (
-            "🛡️ <b>Stop-Gain</b>\n"
-            "<i>Configure gatilho e trava do stop-gain.</i>\n\n"
-            f"{_stopgain_summary(user)}"
-        )
-        await query.edit_message_text(
-            text=header,
-            reply_markup=stopgain_menu_keyboard(user),
-            parse_mode="HTML",
-        )
+        header = ("🛡️ <b>Stop-Gain</b>\n<i>Configure gatilho e trava do stop-gain.</i>\n\n"
+                  f"{_stopgain_summary(user)}")
+        await query.edit_message_text(text=header, reply_markup=stopgain_menu_keyboard(user), parse_mode="HTML")
     except Exception as e:
-        logger.error(f"[settings] Erro ao abrir submenu Stop-Gain: {e}", exc_info=True)
+        logger.error(f"[settings] submenu Stop-Gain: {e}", exc_info=True)
         await query.edit_message_text("Não foi possível abrir o submenu de Stop-Gain agora.")
     finally:
         db.close()
 
-# [FUNÇÃO NOVA]
 async def show_circuit_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Abre o submenu: Disjuntor (com resumo)."""
     query = update.callback_query
     await query.answer()
     db = SessionLocal()
@@ -1845,26 +1748,16 @@ async def show_circuit_menu_handler(update: Update, context: ContextTypes.DEFAUL
         if not user:
             await query.edit_message_text("Não encontrei seu usuário. Use /start para registrar.")
             return
-
-        header = (
-            "🚫 <b>Disjuntor</b>\n"
-            "<i>Defina limite e pausa após disparo.</i>\n\n"
-            f"{_circuit_summary(user)}"
-        )
-        await query.edit_message_text(
-            text=header,
-            reply_markup=circuit_menu_keyboard(user),
-            parse_mode="HTML",
-        )
+        header = ("🚫 <b>Disjuntor</b>\n<i>Defina limite e pausa após disparo.</i>\n\n"
+                  f"{_circuit_summary(user)}")
+        await query.edit_message_text(text=header, reply_markup=circuit_menu_keyboard(user), parse_mode="HTML")
     except Exception as e:
-        logger.error(f"[settings] Erro ao abrir submenu Disjuntor: {e}", exc_info=True)
+        logger.error(f"[settings] submenu Disjuntor: {e}", exc_info=True)
         await query.edit_message_text("Não foi possível abrir o submenu de Disjuntor agora.")
     finally:
         db.close()
 
-# [FUNÇÃO NOVA]
 async def back_to_settings_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Volta ao menu raiz de Configurações (texto padronizado)."""
     query = update.callback_query
     await query.answer()
     db = SessionLocal()
@@ -1873,18 +1766,10 @@ async def back_to_settings_menu_handler(update: Update, context: ContextTypes.DE
         if not user:
             await query.edit_message_text("Não encontrei seu usuário. Use /start para registrar.")
             return
-
-        header = (
-            "⚙️ <b>Configurações de Trade</b>\n"
-            "<i>Escolha uma categoria para ajustar seus parâmetros.</i>"
-        )
-        await query.edit_message_text(
-            text=header,
-            reply_markup=settings_menu_keyboard(user),
-            parse_mode="HTML",
-        )
+        header = "⚙️ <b>Configurações de Trade</b>\n<i>Escolha uma categoria para ajustar seus parâmetros.</i>"
+        await query.edit_message_text(text=header, reply_markup=settings_menu_keyboard(user), parse_mode="HTML")
     except Exception as e:
-        logger.error(f"[settings] Erro ao voltar ao menu raiz: {e}", exc_info=True)
+        logger.error(f"[settings] voltar menu raiz: {e}", exc_info=True)
         await query.edit_message_text("Não foi possível voltar ao menu de configurações agora.")
     finally:
         db.close()
