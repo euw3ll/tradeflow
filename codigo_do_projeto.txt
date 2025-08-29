@@ -735,13 +735,12 @@ async def check_pending_orders_for_user(application: Application, user: User, db
 async def check_active_trades_for_user(application: Application, user: User, db: Session):
     """
     Verifica e gerencia os trades ativos, com edição de mensagem para atualizações.
-
     Regras:
     - TP só é considerado 'executado' após sucesso na redução (retCode == 0).
     - BREAK_EVEN/TRAILING_STOP podem ser ativados de duas formas:
         (A) Padrão: após o 1º TP.
         (B) Opcional por PnL: se user.be_trigger_pct / user.ts_trigger_pct > 0 (sem depender do 1º TP).
-          Esses campos são opcionais no modelo; se não existirem ou forem 0/None, ignora-se o gatilho por PnL.
+    Esses campos são opcionais no modelo; se não existirem ou forem 0/None, ignora-se o gatilho por PnL.
     - Semântica do OFF (user.is_active == False): não abre novas posições nem deixa ordens pendentes,
       mas ESTE gerenciador continua atuando normalmente nas posições abertas.
     """
@@ -905,7 +904,7 @@ async def check_active_trades_for_user(application: Application, user: User, db:
             if user.stop_strategy == 'TRAILING_STOP':
                 # Começo do TS: (A) após 1º TP (padrão) ou (B) por PnL opcional
                 first_tp_hit = trade.total_initial_targets is not None and \
-                               trade.initial_targets is not None and \
+                                 trade.initial_targets is not None and \
                                len(trade.initial_targets) < trade.total_initial_targets
                 ts_started = first_tp_hit or (ts_trigger_pct > 0 and pnl_pct >= ts_trigger_pct)
 
@@ -965,6 +964,7 @@ async def check_active_trades_for_user(application: Application, user: User, db:
 
         else:
             # --- DETETIVE DE FECHAMENTO COM RETENTATIVAS ---
+            # COMENTÁRIO: Lógica de fechamento refatorada para ser mais resiliente e precisa.
             logger.info(f"[tracker] Posição para {trade.symbol} não encontrada. Ativando detetive paciente...")
             
             closed_info_result = {"success": False}  # Começa como falha
@@ -984,7 +984,7 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                     logger.info("[detetive] Falha na tentativa. Aguardando 20 segundos antes de tentar novamente...")
                     await asyncio.sleep(20)
             
-            # Prossegue com a lógica original, usando o resultado final das tentativas
+            # Prossegue com a lógica, usando o resultado final das tentativas
             if closed_info_result.get("success"):
                 closed_data = closed_info_result["data"]
                 pnl = float(closed_data.get("closedPnl", 0.0))
@@ -1006,7 +1006,7 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                     emoji = "✅" if pnl >= 0 else "🔻"
                     final_message = f"{emoji} <b>Posição Fechada ({resultado_str})</b>\n<b>Moeda:</b> {trade.symbol}\n<b>Resultado:</b> ${pnl:,.2f}"
             else:
-                # Se mesmo após as tentativas falhar, mantém o comportamento original
+                # Se mesmo após as tentativas falhar, mantém o comportamento original de fallback.
                 logger.error(f"[detetive] Falha ao obter detalhes de fechamento para {trade.symbol} após 3 tentativas.")
                 trade.status = 'CLOSED_GHOST'
                 trade.closed_at = func.now()
@@ -1015,7 +1015,6 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                 final_message = f"ℹ️ Posição em <b>{trade.symbol}</b> foi fechada na corretora. Detalhes de P/L não puderam ser obtidos via API."
 
             await _send_or_edit_trade_message(application, user, trade, db, final_message)
-
 
 async def run_tracker(application: Application):
     """Função principal que roda o verificador em loop para TODOS os usuários."""
@@ -1340,15 +1339,19 @@ async def _execute_trade(signal_data: dict, user: User, application: Application
         stop_loss = signal_data['stop_loss']
         
         all_targets = signal_data.get('targets') or []
-        take_profit_1 = all_targets[0] if all_targets else "N/A"
         num_targets = len(all_targets)
 
-        tp_text = f"${float(take_profit_1):,.4f}" if isinstance(take_profit_1, (int, float)) else take_profit_1
-        
-        if num_targets > 1:
-            tp_text += f" (de {num_targets} alvos)"
+        # COMENTÁRIO: Lógica de formatação dos TPs foi refatorada para listar todos os alvos.
+        tp_text_lines = []
+        if all_targets:
+            tp_text_lines.append("  - 🎯 <b>Alvos (TPs):</b>")
+            for i, target in enumerate(all_targets, 1):
+                price = float(target)
+                tp_text_lines.append(f"    - T{i}: ${price:,.4f}")
+        else:
+            tp_text_lines.append("  - 🎯 <b>Take Profit:</b> N/A")
+        tp_text = "\n".join(tp_text_lines)
 
-        # Adiciona a linha de Confiança à mensagem, se o dado existir.
         confidence_text = ""
         signal_confidence = signal_data.get('confidence')
         if signal_confidence is not None:
@@ -1363,7 +1366,7 @@ async def _execute_trade(signal_data: dict, user: User, application: Application
             f"  - 💵 <b>Preço de Entrada:</b> ${entry_price:,.4f}\n"
             f"  - 💰 <b>Margem:</b> ${margin:,.2f}\n"
             f"  - 🛡️ <b>Stop Loss:</b> ${stop_loss:,.4f}\n"
-            f"  - 🎯 <b>Take Profit 1:</b> {tp_text}"
+            f"{tp_text}"
         )
         sent_message = await application.bot.send_message(chat_id=user.telegram_id, text=message, parse_mode='HTML')
 
@@ -1583,14 +1586,18 @@ async def _execute_limit_order_for_user(signal_data: dict, user: User, applicati
     if limit_order_result.get("success"):
         order_id = limit_order_result["data"]["orderId"]
         
+        # COMENTÁRIO: Lógica de formatação dos TPs foi refatorada para listar todos os alvos.
         all_targets = signal_data.get('targets') or []
-        take_profit_1 = all_targets[0] if all_targets else "N/A"
-        num_targets = len(all_targets)
-        tp_text = f"${float(take_profit_1):,.4f}" if isinstance(take_profit_1, (int, float)) else take_profit_1
-        if num_targets > 1:
-            tp_text += f" (de {num_targets} alvos)"
+        tp_text_lines = []
+        if all_targets:
+            tp_text_lines.append("  - 🎯 <b>Alvos (TPs):</b>")
+            for i, target in enumerate(all_targets, 1):
+                price = float(target)
+                tp_text_lines.append(f"    - T{i}: ${price:,.4f}")
+        else:
+            tp_text_lines.append("  - 🎯 <b>Take Profit:</b> N/A")
+        tp_text = "\n".join(tp_text_lines)
         
-        # Adiciona a linha de Confiança à mensagem, se o dado existir.
         confidence_text = ""
         signal_confidence = signal_data.get('confidence')
         if signal_confidence is not None:
@@ -1603,7 +1610,7 @@ async def _execute_limit_order_for_user(signal_data: dict, user: User, applicati
             f"  - 💎 <b>Moeda:</b> {symbol}\n"
             f"  - 🎯 <b>Preço de Entrada:</b> ${limit_price:,.4f}\n"
             f"  - 🛡️ <b>Stop Loss:</b> ${signal_data.get('stop_loss'):,.4f}\n"
-            f"  - 🎯 <b>Take Profit 1:</b> {tp_text}\n\n"
+            f"{tp_text}\n\n"
             f"👀 Monitorando a execução…"
         )
    
@@ -1631,31 +1638,43 @@ from typing import Set
 logger = logging.getLogger(__name__)
 
 # --- CATEGORIAS DE MOEDAS ---
-# Estas listas podem ser expandidas no futuro. Usamos Sets para performance.
+# Usamos Sets para performance e para evitar duplicatas.
+# As listas foram expandidas para incluir o máximo de ativos relevantes dentro das categorias originais.
 
-# Moedas de grande capitalização e projetos estabelecidos (excluindo BTC e ETH)
-ALTCOINS_L1_L2: Set[str] = {
-    'SOLUSDT', 'XRPUSDT', 'ADAUSDT', 'AVAXUSDT', 'DOTUSDT', 'MATICUSDT',
-    'LINKUSDT', 'TRXUSDT', 'ATOMUSDT', 'NEARUSDT', 'APTUSDT', 'OPUSDT',
-    'ARBUSDT', 'LDOUSDT', 'SUIUSDT'
+# Moedas "blue chips" clássicas, de altíssima capitalização.
+BLUECHIPS: Set[str] = {
+    'BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT'
 }
 
-# Moedas relacionadas a Finanças Descentralizadas
+# Moedas de grande capitalização e projetos estabelecidos (Layer 1 e Layer 2)
+ALTCOINS_L1_L2: Set[str] = {
+    'ADAUSDT', 'ALGOUSDT', 'APTUSDT', 'ARBUSDT', 'ATOMUSDT', 'AVAXUSDT', 'DOTUSDT', 
+    'EGLDUSDT', 'EOSUSDT', 'ETCUSDT', 'FTMUSDT', 'HBARUSDT', 'ICPUSDT', 'IMXUSDT', 
+    'INJUSDT', 'KASUSDT', 'KSMUSDT', 'LTCUSDT', 'MATICUSDT', 'MINAUSDT', 'NEARUSDT', 
+    'OPUSDT', 'SEIUSDT', 'STXUSDT', 'SUIUSDT', 'TIAUSDT', 'TONUSDT', 'TRXUSDT', 
+    'VETUSDT', 'XLMUSDT', 'XMRUSDT', 'XRPUSDT', 'XTZUSDT', 'ZECUSDT', 'ZENUSDT'
+}
+
+# Moedas relacionadas a Finanças Descentralizadas (DeFi)
 DEFI: Set[str] = {
-    'UNIUSDT', 'AAVEUSDT', 'MKRUSDT', 'SNXUSDT', 'COMPUSDT', 'CRVUSDT',
-    'SUSHIUSDT', 'YFIUSDT'
+    '1INCHUSDT', 'AAVEUSDT', 'BALUSDT', 'CAKEUSDT', 'COMPUSDT', 'CRVUSDT', 
+    'CVXUSDT', 'DYDXUSDT', 'GMXUSDT', 'JUPUSDT', 'KNCUSDT', 'LDOUSDT', 'LINKUSDT', 
+    'LRCUSDT', 'MKRUSDT', 'PENDLEUSDT', 'RUNEUSDT', 'SNXUSDT', 'SUSHIUSDT', 
+    'UMAUSDT', 'UNIUSDT', 'WOOUSDT', 'YFIUSDT', 'ZRXUSDT'
 }
 
 # Moedas de "memes" com alta volatilidade
 MEMECOINS: Set[str] = {
-    'DOGEUSDT', 'SHIBUSDT', 'PEPEUSDT', 'WIFUSDT', 'FLOKIUSDT', 'BONKUSDT'
+    'BONKUSDT', 'DOGEUSDT', 'FLOKIUSDT', 'MEMEUSDT', 'ORDIUSDT', 'PEPEUSDT', 
+    'SATSUSDT', 'SHIBUSDT', 'WIFUSDT'
 }
 
-# Moedas "blue chips" clássicas
-BLUECHIPS: Set[str] = {'BTCUSDT', 'ETHUSDT', 'BNBUSDT'}
+# Camada de infraestrutura, oráculos e DePIN (Redes de Infraestrutura Física Descentralizada)
+INFRA: Set[str] = {
+    'ANKRUSDT', 'ARUSDT', 'BTTUSDT', 'FILUSDT', 'GRTUSDT', 'HNTUSDT', 'LINKUSDT', 
+    'OCEANUSDT', 'RNDRUSDT', 'STORJUSDT', 'THETAUSDT'
+}
 
-# Camada de infraestrutura / oráculos
-INFRA: Set[str] = {'LINKUSDT', 'GRTUSDT', 'FILUSDT'}
 
 # Dicionário que mapeia a palavra-chave da categoria para o Set de moedas
 CATEGORIES = {
@@ -1687,7 +1706,7 @@ def is_coin_in_whitelist(symbol: str, user_whitelist_str: str) -> bool:
 
     # 2. Verifica se alguma das categorias da lista do usuário contém o símbolo
     for category_keyword in user_list:
-        if category_keyword in CATEGORIES and symbol in CATEGORIES[category_keyword]:
+        if category_keyword in CATEGORIES and symbol.upper() in CATEGORIES[category_keyword]:
             return True
             
     # Se nenhuma das condições acima for atendida, a moeda não está na whitelist
@@ -2782,97 +2801,14 @@ async def remove_api_action(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     )
     return ConversationHandler.END
 
-def _aggregate_trades_by_symbol_side(active_trades, live_pnl_data):
-    """
-    Agrupa trades por (symbol, side). 
-    - Soma size (preferindo remaining_qty quando houver).
-    - Faz média ponderada do entry_price.
-    - Usa mark do live_pnl_data[symbol] quando disponível.
-    - Calcula P/L e P/L% (fração) do grupo.
-    - Escolhe um 'próximo alvo' simples: o alvo "mais próximo" do sentido (menor p/ LONG, maior p/ SHORT) entre os primeiros alvos de cada trade.
-    - Mantém a lista de trade_ids para montar botões de fechar.
-    """
-    groups = {}  # key: (symbol, side) -> dict
-    for t in active_trades:
-        key = (t.symbol, t.side)
-        g = groups.get(key)
-        if not g:
-            g = {
-                "symbol": t.symbol,
-                "side": t.side,
-                "total_qty": 0.0,
-                "weighted_cost": 0.0,
-                "mark": None,
-                "next_targets": [],
-                "trade_ids": [],
-            }
-            groups[key] = g
-
-        qty = float((t.remaining_qty if t.remaining_qty is not None else t.qty) or 0.0)
-        entry = float(t.entry_price or 0.0)
-        if qty > 0 and entry > 0:
-            g["total_qty"] += qty
-            g["weighted_cost"] += qty * entry
-
-        lp_data = live_pnl_data.get(t.symbol, {})
-        lp_mark = float(lp_data.get("mark") or 0.0)
-        if lp_mark:  # pega qualquer mark válido, vale sobrescrever (mesmo símbolo tem um só mark)
-            g["mark"] = lp_mark
-
-        if t.initial_targets:
-            # Considera apenas o "próximo alvo" daquele trade (primeiro da lista)
-            g["next_targets"].append(float(t.initial_targets[0]))
-
-        g["trade_ids"].append(t.id)
-
-    # Finaliza agregados
-    out = []
-    for (symbol, side), g in groups.items():
-        size = g["total_qty"]
-        entry_avg = (g["weighted_cost"] / size) if size > 0 else 0.0
-        mark = g["mark"] or 0.0
-
-        pnl = 0.0
-        pnl_frac = 0.0
-        if size > 0 and entry_avg > 0 and mark > 0:
-            diff = (mark - entry_avg) if side == "LONG" else (entry_avg - mark)
-            pnl = diff * size
-            pnl_frac = (diff / entry_avg) if entry_avg else 0.0  # fração
-
-        # Próximo alvo "do sentido":
-        next_target = None
-        if g["next_targets"]:
-            if side == "LONG":
-                next_target = min(g["next_targets"])
-            else:
-                next_target = max(g["next_targets"])
-
-        out.append({
-            "symbol": symbol,
-            "side": side,
-            "qty": size,
-            "entry_price": entry_avg,
-            "mark": mark,
-            "pnl": pnl,
-            "pnl_frac": pnl_frac,
-            "next_target": next_target,
-            "trade_ids": g["trade_ids"],
-        })
-
-    # Ordena por símbolo para estabilidade visual
-    out.sort(key=lambda x: (x["symbol"], x["side"]))
-    return out
-
 async def my_positions_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    # protege contra callbacks antigos (igual ao user_dashboard_handler)
     try:
         await query.answer()
     except BadRequest as e:
         logger.warning(f"Não foi possível responder ao callback_query (pode ser antigo): {e}")
         return
 
-    # feedback imediato
     try:
         await query.edit_message_text("Buscando suas posições gerenciadas...")
     except BadRequest as e:
@@ -2890,11 +2826,10 @@ async def my_positions_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         api_key = decrypt_data(user.api_key_encrypted)
         api_secret = decrypt_data(user.api_secret_encrypted)
 
-        # Trades ativos que o bot está gerenciando
         active_trades = db.query(Trade).filter(
             Trade.user_telegram_id == user_id,
             ~Trade.status.like('%CLOSED%')
-        ).all()
+        ).order_by(Trade.created_at.desc()).all()
 
         if not active_trades:
             await query.edit_message_text(
@@ -2906,61 +2841,62 @@ async def my_positions_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             )
             return
 
-        # Posições ao vivo (para pegar mark/last)
-        # ⚠️ CORREÇÃO: chave pelo SÍMBOLO (string), não por tupla (symbol, side),
-        # pois o aggregator usa live_pnl_data.get(t.symbol)
         live_pnl_data = {}
         live_positions_result = await get_open_positions_with_pnl(api_key, api_secret)
         if live_positions_result.get("success"):
             for pos in live_positions_result.get("data", []):
                 live_pnl_data[pos["symbol"]] = pos
 
-        # --- AGRUPAMENTO POR (symbol, side) com dados live por símbolo ---
-        groups = _aggregate_trades_by_symbol_side(active_trades, live_pnl_data)
-        if not groups:
-            await query.edit_message_text(
-                "Nenhuma posição encontrada na Bybit.",
-                parse_mode='HTML',
-                reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data='back_to_main_menu')]]
-                )
-            )
-            return
-
         lines = ["<b>📊 Suas Posições Ativas (Gerenciadas pelo Bot)</b>", ""]
-        keyboard = []
-        for g in groups:
-            arrow = "⬆️" if g["side"] == "LONG" else "⬇️"
-            entry = g["entry_price"] or 0.0
-            mark = g["mark"] or 0.0
-            pnl = g["pnl"]
-            pnl_pct = g["pnl_frac"] * 100.0
+        keyboard_rows = []
+        
+        if not active_trades:
+             lines.append("Nenhuma posição encontrada na Bybit.")
+        else:
+            # COMENTÁRIO: A lógica agora itera por trade individual, sem agregação.
+            for trade in active_trades:
+                arrow = "⬆️" if trade.side == "LONG" else "⬇️"
+                entry = float(trade.entry_price or 0.0)
+                qty = float(trade.remaining_qty if trade.remaining_qty is not None else trade.qty)
+                
+                pnl_info = "  P/L: <i>buscando...</i>\n"
+                pos_data = live_pnl_data.get(trade.symbol)
+                if pos_data:
+                    pnl_val = float(pos_data.get("unrealized_pnl", 0.0))
+                    pnl_frac = float(pos_data.get("unrealized_pnl_frac", 0.0)) * 100.0
+                    pnl_info = f"  P/L: <b>{pnl_val:+.2f} USDT ({pnl_frac:+.2f}%)</b>\n"
+                
+                # COMENTÁRIO: Nova lógica para exibir o progresso dos TPs.
+                total_tps = int(trade.total_initial_targets or 0)
+                remaining_tps = len(trade.initial_targets or [])
+                hit_tps = total_tps - remaining_tps
+                
+                targets_info = ""
+                if total_tps > 0:
+                    targets_info = f"  🎯 TPs: <b>{hit_tps}/{total_tps} atingidos</b>\n"
 
-            pnl_info = (
-                f"  P/L: <b>{pnl:+.2f} USDT ({pnl_pct:+.2f}%)</b>\n"
-                if entry and mark else "  Status: Em aberto\n"
-            )
-            targets_info = (
-                f"  🎯 Próximo Alvo: ${g['next_target']:,.4f}\n"
-                if g["next_target"] is not None else ""
-            )
-
-            lines.append(
-                f"- {arrow} <b>{g['symbol']}</b> ({g['side']})\n"
-                f"  Quantidade: {g['qty']:g}\n"
-                f"  Entrada: ${entry:,.4f}\n"
-                f"{pnl_info}{targets_info}"
-            )
-
-            keyboard.append([
-                InlineKeyboardButton(
-                    f"Fechar {g['symbol']} ({g['side']}) ❌",
-                    callback_data=f"confirm_close_group|{g['symbol']}|{g['side']}"
+                lines.append(
+                    f"- {arrow} <b>{trade.symbol}</b> ({trade.side})\n"
+                    f"  Qtd: {qty:g} | Entrada: ${entry:,.4f}\n"
+                    f"{pnl_info}{targets_info}"
                 )
-            ])
+                
+                # Adiciona um botão de fechar para cada trade individual
+                keyboard_rows.append([
+                    InlineKeyboardButton(
+                        f"Fechar {trade.symbol} #{trade.id} ❌",
+                        callback_data=f"confirm_close_{trade.id}" # Aponta para o ID único do trade
+                    )
+                ])
 
-        keyboard.append([InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data='back_to_main_menu')])
-        await query.edit_message_text("\n".join(lines), parse_mode='HTML', reply_markup=InlineKeyboardMarkup(keyboard))
+        lines.append("<i>P/L é atualizado em tempo real pela corretora.</i>")
+        keyboard_rows.append([InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data='back_to_main_menu')])
+        
+        await query.edit_message_text(
+            "\n".join(lines), 
+            parse_mode='HTML', 
+            reply_markup=InlineKeyboardMarkup(keyboard_rows)
+        )
 
     finally:
         db.close()
@@ -3694,36 +3630,50 @@ async def performance_menu_handler(update: Update, context: ContextTypes.DEFAULT
 # --- FLUXO DE CONFIGURAÇÃO DE WHITELIST ---
 
 async def ask_coin_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Prompt para editar Whitelist com instruções e categorias."""
+    """Prompt para editar Whitelist com instruções, categorias e o valor atual."""
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     query = update.callback_query
     await query.answer()
 
-    text = (
-        "✅ <b>Whitelist de Moedas</b>\n"
-        "Você pode definir exatamente <i>quais moedas</i> o bot poderá operar.\n\n"
-        "🧩 <b>Como usar</b>\n"
-        "• Digite tickers separados por vírgula (ex.: <code>BTCUSDT,ETHUSDT,SOLUSDT</code>)\n"
-        "• Pode misturar <b>tickers</b> com <b>categorias</b>\n"
-        "• Use <code>todas</code> para liberar todos os pares\n\n"
-        "📦 <b>Categorias disponíveis</b>\n"
-        "• <b>bluechips</b> → BTC, ETH, BNB\n"
-        "• <b>altcoins</b> → SOL, XRP, ADA, AVAX, DOT, MATIC, LINK...\n"
-        "• <b>defi</b> → UNI, AAVE, MKR, SNX, COMP, CRV...\n"
-        "• <b>infra</b> → LINK, GRT, FIL\n"
-        "• <b>memecoins</b> → DOGE, SHIB, PEPE, WIF, FLOKI, BONK\n\n"
-        "ℹ️ Exemplos válidos:\n"
-        "• <code>bluechips</code>\n"
-        "• <code>memecoins,altcoins</code>\n"
-        "• <code>BTCUSDT,ETHUSDT,defi</code>\n\n"
-        "⬅️ Clique em <b>Voltar</b> para cancelar sem alterações."
-    )
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.telegram_id == query.from_user.id).first()
+        if not user:
+            await query.edit_message_text("Não encontrei seu usuário. Use /start para registrar.")
+            return ASKING_COIN_WHITELIST # Permanece no estado, mas informa o erro
+            
+        # COMENTÁRIO: Lógica adicionada para buscar a configuração atual do usuário.
+        current_whitelist = getattr(user, 'coin_whitelist', 'todas') or 'todas'
 
-    markup = InlineKeyboardMarkup([
-        [InlineKeyboardButton("⬅️ Voltar", callback_data="back_to_settings_menu")]
-    ])
+        text = (
+            f"✅ <b>Whitelist de Moedas</b>\n\n"
+            f"⚙️ <b>Sua Configuração Atual:</b>\n<code>{current_whitelist}</code>\n\n"
+            "Você pode definir exatamente <i>quais moedas</i> o bot poderá operar.\n\n"
+            "🧩 <b>Como usar</b>\n"
+            "• Digite tickers separados por vírgula (ex.: <code>BTCUSDT,ETHUSDT,SOLUSDT</code>)\n"
+            "• Pode misturar <b>tickers</b> com <b>categorias</b>\n"
+            "• Use <code>todas</code> para liberar todos os pares\n\n"
+            "📦 <b>Categorias disponíveis</b>\n"
+            "• <b>bluechips</b> → BTC, ETH, BNB\n"
+            "• <b>altcoins</b> → SOL, XRP, ADA, AVAX, DOT, MATIC, LINK...\n"
+            "• <b>defi</b> → UNI, AAVE, MKR, SNX, COMP, CRV...\n"
+            "• <b>infra</b> → LINK, GRT, FIL\n"
+            "• <b>memecoins</b> → DOGE, SHIB, PEPE, WIF, FLOKI, BONK\n\n"
+            "ℹ️ Exemplos válidos:\n"
+            "• <code>bluechips</code>\n"
+            "• <code>memecoins,altcoins</code>\n"
+            "• <code>BTCUSDT,ETHUSDT,defi</code>\n\n"
+            "⬅️ Clique em <b>Voltar</b> para cancelar sem alterações."
+        )
 
-    await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ Voltar", callback_data="back_to_settings_menu")]
+        ])
+
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+    finally:
+        db.close()
+        
     return ASKING_COIN_WHITELIST
 
 async def receive_coin_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3855,7 +3805,15 @@ async def prompt_manual_close_handler(update: Update, context: ContextTypes.DEFA
     """Exibe a tela de confirmação para o fechamento manual de uma posição."""
     query = update.callback_query
     await query.answer()
-    trade_id = int(query.data.split('_')[-1])
+    
+    # COMENTÁRIO: O callback agora é `confirm_close_<trade_id>`
+    trade_id_str = query.data.split('_')[-1]
+    if not trade_id_str.isdigit():
+        # Lida com o formato antigo `confirm_close_group|SYMBOL|SIDE` como fallback
+        await query.edit_message_text("Este botão é de uma versão antiga. Por favor, volte e abra o menu de posições novamente.")
+        return
+
+    trade_id = int(trade_id_str)
     
     db = SessionLocal()
     try:
@@ -3866,7 +3824,7 @@ async def prompt_manual_close_handler(update: Update, context: ContextTypes.DEFA
 
         message = (
             f"⚠️ <b>Confirmar Fechamento</b> ⚠️\n\n"
-            f"Você tem certeza que deseja fechar manualmente sua posição em <b>{trade.symbol}</b>?\n\n"
+            f"Você tem certeza que deseja fechar manualmente sua posição em <b>{trade.symbol}</b> (ID: {trade.id})?\n\n"
             f"Esta ação é irreversível."
         )
         await query.edit_message_text(

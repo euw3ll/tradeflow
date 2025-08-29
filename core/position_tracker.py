@@ -569,24 +569,15 @@ async def run_tracker(application: Application):
                     )
                     await application.bot.send_message(chat_id=user.telegram_id, text=msg, parse_mode='HTML')
 
-                # Fechar fantasmas (DB → Bybit)
-                keys_to_close = db_active_keys - bybit_keys
-                for t in db_active_trades:
-                    if (t.symbol, t.side) in keys_to_close:
-                        t.status = 'CLOSED_GHOST'
-                        t.closed_at = func.now()
-                        t.closed_pnl = 0.0
-                        t.remaining_qty = 0.0
-                        try:
-                            if t.notification_message_id:
-                                await application.bot.edit_message_text(
-                                    chat_id=user.telegram_id,
-                                    message_id=t.notification_message_id,
-                                    text=f"ℹ️ Posição em <b>{t.symbol}</b> não foi encontrada na Bybit e foi removida.",
-                                    parse_mode='HTML'
-                                )
-                        except Exception:
-                            pass
+                # [NOVO] Fechar fantasmas com tolerância (aplica janela de 3 ciclos)
+                await apply_missing_cycles_policy(
+                    application=application,
+                    user=user,
+                    db=db,
+                    db_active_trades=db_active_trades,
+                    bybit_keys=bybit_keys,
+                    threshold=3,  # configurável no futuro via env/setting se necessário
+                )
 
             db.commit()
 
@@ -610,6 +601,52 @@ async def run_tracker(application: Application):
         await asyncio.sleep(60)
 
 from telegram.error import BadRequest
+
+# [NOVO] política de tolerância para posições não vistas
+async def apply_missing_cycles_policy(application, user, db, db_active_trades, bybit_keys, threshold: int = 3):
+    """
+    - Zera missing_cycles/atualiza last_seen_at para trades vistas neste ciclo.
+    - Incrementa missing_cycles para as não vistas.
+    - Fecha como CLOSED_GHOST apenas quando missing_cycles >= threshold.
+    """
+    from sqlalchemy.sql import func
+    logger = __import__("logging").getLogger(__name__)
+
+    db_active_keyset = {(t.symbol, t.side) for t in db_active_trades}
+
+    # 1) Trades vistas: resetar contadores
+    for t in db_active_trades:
+        if (t.symbol, t.side) in bybit_keys:
+            if getattr(t, "missing_cycles", 0) != 0:
+                logger.info("[sync] %s/%s visto novamente. Resetando missing_cycles de %d para 0.",
+                            t.symbol, t.side, t.missing_cycles)
+            t.missing_cycles = 0
+            t.last_seen_at = func.now()
+
+    # 2) Trades não vistas: incrementar e só fechar se atingir o limiar
+    keys_absent = db_active_keyset - bybit_keys
+    for t in db_active_trades:
+        if (t.symbol, t.side) in keys_absent:
+            t.missing_cycles = (getattr(t, "missing_cycles", 0) or 0) + 1
+            logger.warning("[sync] %s/%s ausente na corretora (ciclo %d/%d).",
+                           t.symbol, t.side, t.missing_cycles, threshold)
+
+            if t.missing_cycles >= threshold:
+                # Fechamento fantasma confirmado após tolerância
+                t.status = 'CLOSED_GHOST'
+                t.closed_at = func.now()
+                t.closed_pnl = 0.0
+                t.remaining_qty = 0.0
+                try:
+                    if t.notification_message_id:
+                        await application.bot.edit_message_text(
+                            chat_id=user.telegram_id,
+                            message_id=t.notification_message_id,
+                            text=f"ℹ️ Posição em <b>{t.symbol}</b> não foi encontrada na Bybit e foi removida.",
+                            parse_mode='HTML'
+                        )
+                except Exception:
+                    logger.exception("[sync] Falha ao editar mensagem de remoção para %s.", t.symbol)
 
 async def _send_or_edit_trade_message(
     application: Application,
