@@ -1082,36 +1082,50 @@ async def performance_menu_handler(update: Update, context: ContextTypes.DEFAULT
 # --- FLUXO DE CONFIGURAÇÃO DE WHITELIST ---
 
 async def ask_coin_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Prompt para editar Whitelist com instruções e categorias."""
+    """Prompt para editar Whitelist com instruções, categorias e o valor atual."""
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     query = update.callback_query
     await query.answer()
 
-    text = (
-        "✅ <b>Whitelist de Moedas</b>\n"
-        "Você pode definir exatamente <i>quais moedas</i> o bot poderá operar.\n\n"
-        "🧩 <b>Como usar</b>\n"
-        "• Digite tickers separados por vírgula (ex.: <code>BTCUSDT,ETHUSDT,SOLUSDT</code>)\n"
-        "• Pode misturar <b>tickers</b> com <b>categorias</b>\n"
-        "• Use <code>todas</code> para liberar todos os pares\n\n"
-        "📦 <b>Categorias disponíveis</b>\n"
-        "• <b>bluechips</b> → BTC, ETH, BNB\n"
-        "• <b>altcoins</b> → SOL, XRP, ADA, AVAX, DOT, MATIC, LINK...\n"
-        "• <b>defi</b> → UNI, AAVE, MKR, SNX, COMP, CRV...\n"
-        "• <b>infra</b> → LINK, GRT, FIL\n"
-        "• <b>memecoins</b> → DOGE, SHIB, PEPE, WIF, FLOKI, BONK\n\n"
-        "ℹ️ Exemplos válidos:\n"
-        "• <code>bluechips</code>\n"
-        "• <code>memecoins,altcoins</code>\n"
-        "• <code>BTCUSDT,ETHUSDT,defi</code>\n\n"
-        "⬅️ Clique em <b>Voltar</b> para cancelar sem alterações."
-    )
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.telegram_id == query.from_user.id).first()
+        if not user:
+            await query.edit_message_text("Não encontrei seu usuário. Use /start para registrar.")
+            return ASKING_COIN_WHITELIST # Permanece no estado, mas informa o erro
+            
+        # COMENTÁRIO: Lógica adicionada para buscar a configuração atual do usuário.
+        current_whitelist = getattr(user, 'coin_whitelist', 'todas') or 'todas'
 
-    markup = InlineKeyboardMarkup([
-        [InlineKeyboardButton("⬅️ Voltar", callback_data="back_to_settings_menu")]
-    ])
+        text = (
+            f"✅ <b>Whitelist de Moedas</b>\n\n"
+            f"⚙️ <b>Sua Configuração Atual:</b>\n<code>{current_whitelist}</code>\n\n"
+            "Você pode definir exatamente <i>quais moedas</i> o bot poderá operar.\n\n"
+            "🧩 <b>Como usar</b>\n"
+            "• Digite tickers separados por vírgula (ex.: <code>BTCUSDT,ETHUSDT,SOLUSDT</code>)\n"
+            "• Pode misturar <b>tickers</b> com <b>categorias</b>\n"
+            "• Use <code>todas</code> para liberar todos os pares\n\n"
+            "📦 <b>Categorias disponíveis</b>\n"
+            "• <b>bluechips</b> → BTC, ETH, BNB\n"
+            "• <b>altcoins</b> → SOL, XRP, ADA, AVAX, DOT, MATIC, LINK...\n"
+            "• <b>defi</b> → UNI, AAVE, MKR, SNX, COMP, CRV...\n"
+            "• <b>infra</b> → LINK, GRT, FIL\n"
+            "• <b>memecoins</b> → DOGE, SHIB, PEPE, WIF, FLOKI, BONK\n\n"
+            "ℹ️ Exemplos válidos:\n"
+            "• <code>bluechips</code>\n"
+            "• <code>memecoins,altcoins</code>\n"
+            "• <code>BTCUSDT,ETHUSDT,defi</code>\n\n"
+            "⬅️ Clique em <b>Voltar</b> para cancelar sem alterações."
+        )
 
-    await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ Voltar", callback_data="back_to_settings_menu")]
+        ])
+
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+    finally:
+        db.close()
+        
     return ASKING_COIN_WHITELIST
 
 async def receive_coin_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
