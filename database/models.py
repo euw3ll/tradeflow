@@ -73,7 +73,6 @@ class Trade(Base):
     trail_high_water_mark = Column(Float, nullable=True)
     is_stop_gain_active = Column(Boolean, default=False, nullable=False)
     unrealized_pnl_pct = Column(Float, nullable=True)
-    # [NOVO] Controle de tolerância para sumiços momentâneos da API
     missing_cycles = Column(Integer, default=0, nullable=False)
     last_seen_at = Column(DateTime(timezone=True), nullable=True)
 
