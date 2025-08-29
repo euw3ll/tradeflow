@@ -147,15 +147,19 @@ async def _execute_trade(signal_data: dict, user: User, application: Application
         stop_loss = signal_data['stop_loss']
         
         all_targets = signal_data.get('targets') or []
-        take_profit_1 = all_targets[0] if all_targets else "N/A"
         num_targets = len(all_targets)
 
-        tp_text = f"${float(take_profit_1):,.4f}" if isinstance(take_profit_1, (int, float)) else take_profit_1
-        
-        if num_targets > 1:
-            tp_text += f" (de {num_targets} alvos)"
+        # COMENTÁRIO: Lógica de formatação dos TPs foi refatorada para listar todos os alvos.
+        tp_text_lines = []
+        if all_targets:
+            tp_text_lines.append("  - 🎯 <b>Alvos (TPs):</b>")
+            for i, target in enumerate(all_targets, 1):
+                price = float(target)
+                tp_text_lines.append(f"    - T{i}: ${price:,.4f}")
+        else:
+            tp_text_lines.append("  - 🎯 <b>Take Profit:</b> N/A")
+        tp_text = "\n".join(tp_text_lines)
 
-        # Adiciona a linha de Confiança à mensagem, se o dado existir.
         confidence_text = ""
         signal_confidence = signal_data.get('confidence')
         if signal_confidence is not None:
@@ -170,7 +174,7 @@ async def _execute_trade(signal_data: dict, user: User, application: Application
             f"  - 💵 <b>Preço de Entrada:</b> ${entry_price:,.4f}\n"
             f"  - 💰 <b>Margem:</b> ${margin:,.2f}\n"
             f"  - 🛡️ <b>Stop Loss:</b> ${stop_loss:,.4f}\n"
-            f"  - 🎯 <b>Take Profit 1:</b> {tp_text}"
+            f"{tp_text}"
         )
         sent_message = await application.bot.send_message(chat_id=user.telegram_id, text=message, parse_mode='HTML')
 
@@ -390,14 +394,18 @@ async def _execute_limit_order_for_user(signal_data: dict, user: User, applicati
     if limit_order_result.get("success"):
         order_id = limit_order_result["data"]["orderId"]
         
+        # COMENTÁRIO: Lógica de formatação dos TPs foi refatorada para listar todos os alvos.
         all_targets = signal_data.get('targets') or []
-        take_profit_1 = all_targets[0] if all_targets else "N/A"
-        num_targets = len(all_targets)
-        tp_text = f"${float(take_profit_1):,.4f}" if isinstance(take_profit_1, (int, float)) else take_profit_1
-        if num_targets > 1:
-            tp_text += f" (de {num_targets} alvos)"
+        tp_text_lines = []
+        if all_targets:
+            tp_text_lines.append("  - 🎯 <b>Alvos (TPs):</b>")
+            for i, target in enumerate(all_targets, 1):
+                price = float(target)
+                tp_text_lines.append(f"    - T{i}: ${price:,.4f}")
+        else:
+            tp_text_lines.append("  - 🎯 <b>Take Profit:</b> N/A")
+        tp_text = "\n".join(tp_text_lines)
         
-        # Adiciona a linha de Confiança à mensagem, se o dado existir.
         confidence_text = ""
         signal_confidence = signal_data.get('confidence')
         if signal_confidence is not None:
@@ -410,7 +418,7 @@ async def _execute_limit_order_for_user(signal_data: dict, user: User, applicati
             f"  - 💎 <b>Moeda:</b> {symbol}\n"
             f"  - 🎯 <b>Preço de Entrada:</b> ${limit_price:,.4f}\n"
             f"  - 🛡️ <b>Stop Loss:</b> ${signal_data.get('stop_loss'):,.4f}\n"
-            f"  - 🎯 <b>Take Profit 1:</b> {tp_text}\n\n"
+            f"{tp_text}\n\n"
             f"👀 Monitorando a execução…"
         )
    

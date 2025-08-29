@@ -253,97 +253,14 @@ async def remove_api_action(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     )
     return ConversationHandler.END
 
-def _aggregate_trades_by_symbol_side(active_trades, live_pnl_data):
-    """
-    Agrupa trades por (symbol, side). 
-    - Soma size (preferindo remaining_qty quando houver).
-    - Faz média ponderada do entry_price.
-    - Usa mark do live_pnl_data[symbol] quando disponível.
-    - Calcula P/L e P/L% (fração) do grupo.
-    - Escolhe um 'próximo alvo' simples: o alvo "mais próximo" do sentido (menor p/ LONG, maior p/ SHORT) entre os primeiros alvos de cada trade.
-    - Mantém a lista de trade_ids para montar botões de fechar.
-    """
-    groups = {}  # key: (symbol, side) -> dict
-    for t in active_trades:
-        key = (t.symbol, t.side)
-        g = groups.get(key)
-        if not g:
-            g = {
-                "symbol": t.symbol,
-                "side": t.side,
-                "total_qty": 0.0,
-                "weighted_cost": 0.0,
-                "mark": None,
-                "next_targets": [],
-                "trade_ids": [],
-            }
-            groups[key] = g
-
-        qty = float((t.remaining_qty if t.remaining_qty is not None else t.qty) or 0.0)
-        entry = float(t.entry_price or 0.0)
-        if qty > 0 and entry > 0:
-            g["total_qty"] += qty
-            g["weighted_cost"] += qty * entry
-
-        lp_data = live_pnl_data.get(t.symbol, {})
-        lp_mark = float(lp_data.get("mark") or 0.0)
-        if lp_mark:  # pega qualquer mark válido, vale sobrescrever (mesmo símbolo tem um só mark)
-            g["mark"] = lp_mark
-
-        if t.initial_targets:
-            # Considera apenas o "próximo alvo" daquele trade (primeiro da lista)
-            g["next_targets"].append(float(t.initial_targets[0]))
-
-        g["trade_ids"].append(t.id)
-
-    # Finaliza agregados
-    out = []
-    for (symbol, side), g in groups.items():
-        size = g["total_qty"]
-        entry_avg = (g["weighted_cost"] / size) if size > 0 else 0.0
-        mark = g["mark"] or 0.0
-
-        pnl = 0.0
-        pnl_frac = 0.0
-        if size > 0 and entry_avg > 0 and mark > 0:
-            diff = (mark - entry_avg) if side == "LONG" else (entry_avg - mark)
-            pnl = diff * size
-            pnl_frac = (diff / entry_avg) if entry_avg else 0.0  # fração
-
-        # Próximo alvo "do sentido":
-        next_target = None
-        if g["next_targets"]:
-            if side == "LONG":
-                next_target = min(g["next_targets"])
-            else:
-                next_target = max(g["next_targets"])
-
-        out.append({
-            "symbol": symbol,
-            "side": side,
-            "qty": size,
-            "entry_price": entry_avg,
-            "mark": mark,
-            "pnl": pnl,
-            "pnl_frac": pnl_frac,
-            "next_target": next_target,
-            "trade_ids": g["trade_ids"],
-        })
-
-    # Ordena por símbolo para estabilidade visual
-    out.sort(key=lambda x: (x["symbol"], x["side"]))
-    return out
-
 async def my_positions_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    # protege contra callbacks antigos (igual ao user_dashboard_handler)
     try:
         await query.answer()
     except BadRequest as e:
         logger.warning(f"Não foi possível responder ao callback_query (pode ser antigo): {e}")
         return
 
-    # feedback imediato
     try:
         await query.edit_message_text("Buscando suas posições gerenciadas...")
     except BadRequest as e:
@@ -361,11 +278,10 @@ async def my_positions_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         api_key = decrypt_data(user.api_key_encrypted)
         api_secret = decrypt_data(user.api_secret_encrypted)
 
-        # Trades ativos que o bot está gerenciando
         active_trades = db.query(Trade).filter(
             Trade.user_telegram_id == user_id,
             ~Trade.status.like('%CLOSED%')
-        ).all()
+        ).order_by(Trade.created_at.desc()).all()
 
         if not active_trades:
             await query.edit_message_text(
@@ -377,61 +293,62 @@ async def my_positions_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             )
             return
 
-        # Posições ao vivo (para pegar mark/last)
-        # ⚠️ CORREÇÃO: chave pelo SÍMBOLO (string), não por tupla (symbol, side),
-        # pois o aggregator usa live_pnl_data.get(t.symbol)
         live_pnl_data = {}
         live_positions_result = await get_open_positions_with_pnl(api_key, api_secret)
         if live_positions_result.get("success"):
             for pos in live_positions_result.get("data", []):
                 live_pnl_data[pos["symbol"]] = pos
 
-        # --- AGRUPAMENTO POR (symbol, side) com dados live por símbolo ---
-        groups = _aggregate_trades_by_symbol_side(active_trades, live_pnl_data)
-        if not groups:
-            await query.edit_message_text(
-                "Nenhuma posição encontrada na Bybit.",
-                parse_mode='HTML',
-                reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data='back_to_main_menu')]]
-                )
-            )
-            return
-
         lines = ["<b>📊 Suas Posições Ativas (Gerenciadas pelo Bot)</b>", ""]
-        keyboard = []
-        for g in groups:
-            arrow = "⬆️" if g["side"] == "LONG" else "⬇️"
-            entry = g["entry_price"] or 0.0
-            mark = g["mark"] or 0.0
-            pnl = g["pnl"]
-            pnl_pct = g["pnl_frac"] * 100.0
+        keyboard_rows = []
+        
+        if not active_trades:
+             lines.append("Nenhuma posição encontrada na Bybit.")
+        else:
+            # COMENTÁRIO: A lógica agora itera por trade individual, sem agregação.
+            for trade in active_trades:
+                arrow = "⬆️" if trade.side == "LONG" else "⬇️"
+                entry = float(trade.entry_price or 0.0)
+                qty = float(trade.remaining_qty if trade.remaining_qty is not None else trade.qty)
+                
+                pnl_info = "  P/L: <i>buscando...</i>\n"
+                pos_data = live_pnl_data.get(trade.symbol)
+                if pos_data:
+                    pnl_val = float(pos_data.get("unrealized_pnl", 0.0))
+                    pnl_frac = float(pos_data.get("unrealized_pnl_frac", 0.0)) * 100.0
+                    pnl_info = f"  P/L: <b>{pnl_val:+.2f} USDT ({pnl_frac:+.2f}%)</b>\n"
+                
+                # COMENTÁRIO: Nova lógica para exibir o progresso dos TPs.
+                total_tps = int(trade.total_initial_targets or 0)
+                remaining_tps = len(trade.initial_targets or [])
+                hit_tps = total_tps - remaining_tps
+                
+                targets_info = ""
+                if total_tps > 0:
+                    targets_info = f"  🎯 TPs: <b>{hit_tps}/{total_tps} atingidos</b>\n"
 
-            pnl_info = (
-                f"  P/L: <b>{pnl:+.2f} USDT ({pnl_pct:+.2f}%)</b>\n"
-                if entry and mark else "  Status: Em aberto\n"
-            )
-            targets_info = (
-                f"  🎯 Próximo Alvo: ${g['next_target']:,.4f}\n"
-                if g["next_target"] is not None else ""
-            )
-
-            lines.append(
-                f"- {arrow} <b>{g['symbol']}</b> ({g['side']})\n"
-                f"  Quantidade: {g['qty']:g}\n"
-                f"  Entrada: ${entry:,.4f}\n"
-                f"{pnl_info}{targets_info}"
-            )
-
-            keyboard.append([
-                InlineKeyboardButton(
-                    f"Fechar {g['symbol']} ({g['side']}) ❌",
-                    callback_data=f"confirm_close_group|{g['symbol']}|{g['side']}"
+                lines.append(
+                    f"- {arrow} <b>{trade.symbol}</b> ({trade.side})\n"
+                    f"  Qtd: {qty:g} | Entrada: ${entry:,.4f}\n"
+                    f"{pnl_info}{targets_info}"
                 )
-            ])
+                
+                # Adiciona um botão de fechar para cada trade individual
+                keyboard_rows.append([
+                    InlineKeyboardButton(
+                        f"Fechar {trade.symbol} #{trade.id} ❌",
+                        callback_data=f"confirm_close_{trade.id}" # Aponta para o ID único do trade
+                    )
+                ])
 
-        keyboard.append([InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data='back_to_main_menu')])
-        await query.edit_message_text("\n".join(lines), parse_mode='HTML', reply_markup=InlineKeyboardMarkup(keyboard))
+        lines.append("<i>P/L é atualizado em tempo real pela corretora.</i>")
+        keyboard_rows.append([InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data='back_to_main_menu')])
+        
+        await query.edit_message_text(
+            "\n".join(lines), 
+            parse_mode='HTML', 
+            reply_markup=InlineKeyboardMarkup(keyboard_rows)
+        )
 
     finally:
         db.close()
@@ -1326,7 +1243,15 @@ async def prompt_manual_close_handler(update: Update, context: ContextTypes.DEFA
     """Exibe a tela de confirmação para o fechamento manual de uma posição."""
     query = update.callback_query
     await query.answer()
-    trade_id = int(query.data.split('_')[-1])
+    
+    # COMENTÁRIO: O callback agora é `confirm_close_<trade_id>`
+    trade_id_str = query.data.split('_')[-1]
+    if not trade_id_str.isdigit():
+        # Lida com o formato antigo `confirm_close_group|SYMBOL|SIDE` como fallback
+        await query.edit_message_text("Este botão é de uma versão antiga. Por favor, volte e abra o menu de posições novamente.")
+        return
+
+    trade_id = int(trade_id_str)
     
     db = SessionLocal()
     try:
@@ -1337,7 +1262,7 @@ async def prompt_manual_close_handler(update: Update, context: ContextTypes.DEFA
 
         message = (
             f"⚠️ <b>Confirmar Fechamento</b> ⚠️\n\n"
-            f"Você tem certeza que deseja fechar manualmente sua posição em <b>{trade.symbol}</b>?\n\n"
+            f"Você tem certeza que deseja fechar manualmente sua posição em <b>{trade.symbol}</b> (ID: {trade.id})?\n\n"
             f"Esta ação é irreversível."
         )
         await query.edit_message_text(
