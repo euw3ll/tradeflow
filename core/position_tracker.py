@@ -16,8 +16,13 @@ from services.notification_service import send_notification
 from utils.security import decrypt_data
 from sqlalchemy.sql import func
 from telegram.error import BadRequest
+from typing import Optional, Callable, Awaitable, Dict, Any, Set, Tuple, List
 
 logger = logging.getLogger(__name__)
+
+# cache em memória para evitar reedições repetidas
+# chave: trade.id, valor: {"sync_notified": bool}
+_SYNC_CACHE = {}
 
 def _generate_trade_status_message(trade: Trade, status_title: str, pnl_data: dict = None, current_price: float = None) -> str:
     """Dashboard compacto e rico para a mensagem de status do trade (HTML)."""
@@ -433,60 +438,6 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                 msg_text = _generate_trade_status_message(trade, status_title_update, pnl_data_for_msg, current_price)
                 await _send_or_edit_trade_message(application, user, trade, db, msg_text)
 
-        else:
-            # --- DETETIVE DE FECHAMENTO COM RETENTATIVAS ---
-            # COMENTÁRIO: Lógica de fechamento refatorada para ser mais resiliente e precisa.
-            logger.info(f"[tracker] Posição para {trade.symbol} não encontrada. Ativando detetive paciente...")
-            
-            closed_info_result = {"success": False}  # Começa como falha
-            final_message = ""
-
-            # Tenta buscar os detalhes do fechamento por até 3 vezes, com pausas
-            for attempt in range(3):
-                logger.info(f"[detetive] Tentativa {attempt + 1}/3 para obter detalhes de fechamento de {trade.symbol}...")
-                result = await get_last_closed_trade_info(api_key, api_secret, trade.symbol)
-                
-                if result.get("success"):
-                    closed_info_result = result
-                    logger.info(f"[detetive] Sucesso na tentativa {attempt + 1}. Detalhes obtidos.")
-                    break  # Se obteve sucesso, sai do loop
-                
-                if attempt < 2: # Se não for a última tentativa
-                    logger.info("[detetive] Falha na tentativa. Aguardando 20 segundos antes de tentar novamente...")
-                    await asyncio.sleep(20)
-            
-            # Prossegue com a lógica, usando o resultado final das tentativas
-            if closed_info_result.get("success"):
-                closed_data = closed_info_result["data"]
-                pnl = float(closed_data.get("closedPnl", 0.0))
-                closing_reason = closed_data.get("exitType", "Unknown")
-                trade.closed_at = func.now()
-                trade.closed_pnl = pnl
-                trade.remaining_qty = 0.0
-
-                if closing_reason == "TakeProfit":
-                    trade.status = 'CLOSED_PROFIT'
-                    final_message = f"🏆 <b>Posição Fechada (LUCRO)</b> 🏆\n<b>Moeda:</b> {trade.symbol}\n<b>Resultado Final:</b> ${pnl:,.2f}"
-                elif closing_reason == "StopLoss":
-                    trade.status = 'CLOSED_LOSS' if pnl < 0 else 'CLOSED_STOP_GAIN'
-                    emoji = "🛑" if pnl < 0 else "✅"
-                    final_message = f"{emoji} <b>Posição Fechada (STOP)</b>\n<b>Moeda:</b> {trade.symbol}\n<b>Resultado Final:</b> ${pnl:,.2f}"
-                else: # Manual, Liquidação, etc.
-                    trade.status = 'CLOSED_GHOST' # Mantém GHOST mas com PNL
-                    resultado_str = "LUCRO" if pnl >= 0 else "PREJUÍZO"
-                    emoji = "✅" if pnl >= 0 else "🔻"
-                    final_message = f"{emoji} <b>Posição Fechada ({resultado_str})</b>\n<b>Moeda:</b> {trade.symbol}\n<b>Resultado:</b> ${pnl:,.2f}"
-            else:
-                # Se mesmo após as tentativas falhar, mantém o comportamento original de fallback.
-                logger.error(f"[detetive] Falha ao obter detalhes de fechamento para {trade.symbol} após 3 tentativas.")
-                trade.status = 'CLOSED_GHOST'
-                trade.closed_at = func.now()
-                trade.closed_pnl = 0.0
-                trade.remaining_qty = 0.0
-                final_message = f"ℹ️ Posição em <b>{trade.symbol}</b> foi fechada na corretora. Detalhes de P/L não puderam ser obtidos via API."
-
-            await _send_or_edit_trade_message(application, user, trade, db, final_message)
-
 async def run_tracker(application: Application):
     """Função principal que roda o verificador em loop para TODOS os usuários."""
     logger.info("Iniciando Rastreador de Posições e Ordens (Modo Multiusuário)...")
@@ -498,6 +449,20 @@ async def run_tracker(application: Application):
             for user in all_api_users_for_sync:
                 sync_api_key = decrypt_data(user.api_key_encrypted)
                 sync_api_secret = decrypt_data(user.api_secret_encrypted)
+
+                # Wrapper para o detetive: usa suas credenciais e adapta o formato
+                async def _fetch_closed_info(symbol: str) -> Optional[Dict[str, Any]]:
+                    res = await get_last_closed_trade_info(sync_api_key, sync_api_secret, symbol)
+                    if not res or not res.get("success"):
+                        return None
+                    d = res.get("data") or {}
+                    # padroniza campos esperados pelo detetive
+                    return {
+                        "pnl": float(d.get("closedPnl", 0.0)) if d.get("closedPnl") is not None else None,
+                        "exit_type": d.get("exitType"),
+                        "exit_price": d.get("exitPrice"),
+                        "closed_at": d.get("closedAt"),
+                    }
 
                 bybit_positions_result = await get_open_positions_with_pnl(sync_api_key, sync_api_secret)
                 if not bybit_positions_result.get("success"):
@@ -577,6 +542,7 @@ async def run_tracker(application: Application):
                     db_active_trades=db_active_trades,
                     bybit_keys=bybit_keys,
                     threshold=3,  # configurável no futuro via env/setting se necessário
+                    get_last_closed_trade_info=_fetch_closed_info,
                 )
 
             db.commit()
@@ -600,53 +566,164 @@ async def run_tracker(application: Application):
 
         await asyncio.sleep(60)
 
-from telegram.error import BadRequest
-
-# [NOVO] política de tolerância para posições não vistas
-async def apply_missing_cycles_policy(application, user, db, db_active_trades, bybit_keys, threshold: int = 3):
+async def notify_sync_status(application, user, trade, text: Optional[str] = None) -> None:
     """
-    - Zera missing_cycles/atualiza last_seen_at para trades vistas neste ciclo.
-    - Incrementa missing_cycles para as não vistas.
-    - Fecha como CLOSED_GHOST apenas quando missing_cycles >= threshold.
+    Edita o card para estado 'sincronizando' no 2º ciclo ausente.
+    Evita repetir a mesma edição em ciclos seguintes.
     """
-    from sqlalchemy.sql import func
-    logger = __import__("logging").getLogger(__name__)
+    if trade is None or not getattr(trade, "notification_message_id", None):
+        return
 
+    cache = _SYNC_CACHE.setdefault(trade.id, {"sync_notified": False})
+    if cache["sync_notified"]:
+        return  # já notificou este estado; não spammar
+
+    sync_text = text or (
+        "⏳ <b>Sincronizando com a corretora…</b>\n"
+        "Confirmando o status desta posição. Seu card será atualizado automaticamente."
+    )
+    try:
+        await application.bot.edit_message_text(
+            chat_id=user.telegram_id,
+            message_id=trade.notification_message_id,
+            text=sync_text,
+            parse_mode="HTML",
+        )
+        cache["sync_notified"] = True
+        logger.info("[sync] %s/%s marcado como 'sincronizando' (2º ciclo ausente).",
+                    trade.symbol, trade.side)
+    except Exception:
+        logger.exception("[sync] Falha ao editar mensagem para estado 'sincronizando' (%s).", trade.symbol)
+
+def clear_sync_flag(trade_id: int) -> None:
+    """Reseta a flag de sync para quando a posição reaparece ou fecha definitivamente."""
+    state = _SYNC_CACHE.get(trade_id)
+    if state:
+        state["sync_notified"] = False
+
+async def confirm_and_close_trade(
+    *,
+    application,
+    user,
+    trade,
+    get_last_closed_trade_info: Optional[Callable[[str], Awaitable[Optional[Dict[str, Any]]]]] = None,
+    attempts: int = 3,
+    delay_seconds: float = 6.0,
+    fallback_text: Optional[str] = None,
+) -> None:
+    """
+    Antes de marcar CLOSED_GHOST, tenta confirmar fechamento real.
+    Se encontrar dados, edita o card com resumo e fecha; senão, usa fallback simples.
+    """
+    info = None
+    if get_last_closed_trade_info:
+        for i in range(1, attempts + 1):
+            try:
+                info = await get_last_closed_trade_info(trade.symbol)
+                if info:
+                    break
+            except Exception:
+                logger.exception("[close-confirm] tentativa %d falhou para %s", i, trade.symbol)
+            await asyncio.sleep(delay_seconds)
+
+    # Monta texto final
+    if info:
+        # Esperado em 'info': pnl, exit_type (TP/SL/Manual), exit_price, closed_at
+        pnl = info.get("pnl")
+        exit_type = info.get("exit_type") or "Fechamento"
+        exit_price = info.get("exit_price")
+        closed_at = info.get("closed_at")
+
+        lines = [
+            f"✅ <b>{exit_type} confirmado</b> para <b>{trade.symbol}</b>",
+        ]
+        if exit_price is not None:
+            lines.append(f"• Preço de saída: <b>{exit_price}</b>")
+        if pnl is not None:
+            lines.append(f"• PnL: <b>{pnl}</b>")
+        if closed_at is not None:
+            lines.append(f"• Horário: <b>{closed_at}</b>")
+        final_text = "\n".join(lines)
+    else:
+        final_text = fallback_text or (
+            "ℹ️ Não foi possível confirmar os detalhes do fechamento via API no momento.\n"
+            f"A posição <b>{trade.symbol}</b> foi sinalizada como encerrada. O resumo de PnL pode aparecer nas próximas sincronizações."
+        )
+
+    try:
+        if getattr(trade, "notification_message_id", None):
+            await application.bot.edit_message_text(
+                chat_id=user.telegram_id,
+                message_id=trade.notification_message_id,
+                text=final_text,
+                parse_mode="HTML",
+            )
+    except Exception:
+        logger.exception("[close-confirm] Falha ao editar mensagem final para %s.", trade.symbol)
+
+# [ATUALIZAÇÃO] política de tolerância + UX etapa 2
+async def apply_missing_cycles_policy(
+    application,
+    user,
+    db,
+    db_active_trades,
+    bybit_keys,
+    threshold: int = 3,
+    get_last_closed_trade_info: Optional[Callable[[str], Awaitable[Optional[Dict[str, Any]]]]] = None,
+):
+    """
+    - Vistas neste ciclo: zera missing_cycles, atualiza last_seen_at e limpa flag de sync.
+    - Ausentes: incrementa missing_cycles.
+      * 2º ciclo: edita mensagem para '⏳ Sincronizando...'
+      * >=3º ciclo: roda detetive; se confirmar, edita resumo; senão, fallback; então fecha.
+    """
     db_active_keyset = {(t.symbol, t.side) for t in db_active_trades}
 
-    # 1) Trades vistas: resetar contadores
+    # 1) Trades vistas: reset + limpar flag de sync
     for t in db_active_trades:
         if (t.symbol, t.side) in bybit_keys:
             if getattr(t, "missing_cycles", 0) != 0:
-                logger.info("[sync] %s/%s visto novamente. Resetando missing_cycles de %d para 0.",
-                            t.symbol, t.side, t.missing_cycles)
+                logger.info("[sync] %s/%s visto novamente. Reset %d→0.", t.symbol, t.side, t.missing_cycles)
             t.missing_cycles = 0
             t.last_seen_at = func.now()
+            if getattr(t, "id", None) is not None:
+                clear_sync_flag(t.id)
 
-    # 2) Trades não vistas: incrementar e só fechar se atingir o limiar
+    # 2) Trades ausentes
     keys_absent = db_active_keyset - bybit_keys
     for t in db_active_trades:
-        if (t.symbol, t.side) in keys_absent:
-            t.missing_cycles = (getattr(t, "missing_cycles", 0) or 0) + 1
-            logger.warning("[sync] %s/%s ausente na corretora (ciclo %d/%d).",
-                           t.symbol, t.side, t.missing_cycles, threshold)
+        if (t.symbol, t.side) not in keys_absent:
+            continue
 
-            if t.missing_cycles >= threshold:
-                # Fechamento fantasma confirmado após tolerância
-                t.status = 'CLOSED_GHOST'
-                t.closed_at = func.now()
-                t.closed_pnl = 0.0
-                t.remaining_qty = 0.0
-                try:
-                    if t.notification_message_id:
-                        await application.bot.edit_message_text(
-                            chat_id=user.telegram_id,
-                            message_id=t.notification_message_id,
-                            text=f"ℹ️ Posição em <b>{t.symbol}</b> não foi encontrada na Bybit e foi removida.",
-                            parse_mode='HTML'
-                        )
-                except Exception:
-                    logger.exception("[sync] Falha ao editar mensagem de remoção para %s.", t.symbol)
+        prev = int(getattr(t, "missing_cycles", 0) or 0)
+        t.missing_cycles = prev + 1
+        logger.warning("[sync] %s/%s ausente (ciclo %d/%d).", t.symbol, t.side, t.missing_cycles, threshold)
+
+        # 2º ciclo → mensagem neutra
+        if t.missing_cycles == 2:
+            await notify_sync_status(application, user, t)
+
+            logger.info("[sync] %s/%s entrou em estado 'sincronizando' (ciclo 2/%d).", t.symbol, t.side, threshold)
+
+        # 3º ciclo+ → detetive e fechamento
+        if t.missing_cycles >= threshold:
+
+            logger.info("[sync] %s/%s atingiu limiar de fechamento (ciclo %d/%d). Iniciando detetive…",
+            t.symbol, t.side, t.missing_cycles, threshold)
+
+            await confirm_and_close_trade(
+                application=application,
+                user=user,
+                trade=t,
+                get_last_closed_trade_info=get_last_closed_trade_info,
+            )
+            # marca fechado (mantém status por compatibilidade)
+            t.status = "CLOSED_GHOST"
+            t.closed_at = func.now()
+            t.closed_pnl = t.closed_pnl or 0.0
+            t.remaining_qty = 0.0
+            if getattr(t, "id", None) is not None:
+                clear_sync_flag(t.id)
 
 async def _send_or_edit_trade_message(
     application: Application,
