@@ -473,6 +473,21 @@ async def run_tracker(application: Application):
                 bybit_keys = {(p["symbol"], p["side"]) for p in bybit_list}
                 bybit_map = {(p["symbol"], p["side"]): p for p in bybit_list}
 
+                # [NOVO] conjunto só por símbolo (ignora side)
+                bybit_symbols = {p["symbol"] for p in bybit_list}
+
+                # [NOVO] mapa por símbolo -> se tiver mais de uma entrada do mesmo símbolo,
+                # fica com a de maior tamanho absoluto (mais relevante)
+                bybit_map_by_symbol: Dict[str, Dict[str, Any]] = {}
+                for p in bybit_list:
+                    sym = p["symbol"]
+                    if sym not in bybit_map_by_symbol:
+                        bybit_map_by_symbol[sym] = p
+                    else:
+                        prev = bybit_map_by_symbol[sym]
+                        if abs(float(p.get("size") or 0)) > abs(float(prev.get("size") or 0)):
+                            bybit_map_by_symbol[sym] = p
+
                 db_active_trades = db.query(Trade).filter(
                     Trade.user_telegram_id == user.telegram_id,
                     ~Trade.status.like('%CLOSED%')
@@ -484,11 +499,17 @@ async def run_tracker(application: Application):
                 ).all()
                 db_pending_symbols = {s.symbol for s in db_pending_signals}
 
-                # Adotar órfãs (Bybit → DB)
-                keys_to_adopt = bybit_keys - db_active_keys - {(sym, "LONG") for sym in db_pending_symbols} - {(sym, "SHORT") for sym in db_pending_symbols}
-                for key in keys_to_adopt:
-                    symbol, side = key
-                    pos = bybit_map[key]
+                # [NOVO] Adotar órfãs por SÍMBOLO (ignora side)
+                db_active_symbols = {t.symbol for t in db_active_trades}
+                # db_pending_symbols você JÁ construiu acima e é um set de strings: {s.symbol for s in db_pending_signals}
+
+                symbols_to_adopt = bybit_symbols - db_active_symbols - db_pending_symbols
+                for symbol in symbols_to_adopt:
+                    pos = bybit_map_by_symbol.get(symbol)
+                    if not pos:
+                        continue  # segurança
+
+                    side = pos.get("side")
                     entry = float(pos.get("entry", 0) or 0)
                     size = float(pos.get("size", 0) or 0)
                     curr_sl = pos.get("stop_loss") or None
@@ -678,10 +699,11 @@ async def apply_missing_cycles_policy(
       * >=3º ciclo: roda detetive; se confirmar, edita resumo; senão, fallback; então fecha.
     """
     db_active_keyset = {(t.symbol, t.side) for t in db_active_trades}
+    bybit_symbols = {k[0] for k in bybit_keys}  # extrai só o símbolo do par (symbol, side)
 
     # 1) Trades vistas: reset + limpar flag de sync
     for t in db_active_trades:
-        if (t.symbol, t.side) in bybit_keys:
+        if t.symbol in bybit_symbols:
             if getattr(t, "missing_cycles", 0) != 0:
                 logger.info("[sync] %s/%s visto novamente. Reset %d→0.", t.symbol, t.side, t.missing_cycles)
             t.missing_cycles = 0
@@ -690,11 +712,11 @@ async def apply_missing_cycles_policy(
                 clear_sync_flag(t.id)
 
     # 2) Trades ausentes
-    keys_absent = db_active_keyset - bybit_keys
+    # ignoramos side: ausente se o símbolo não está vindo da Bybit
     for t in db_active_trades:
-        if (t.symbol, t.side) not in keys_absent:
+        if t.symbol in bybit_symbols:
             continue
-
+        
         prev = int(getattr(t, "missing_cycles", 0) or 0)
         t.missing_cycles = prev + 1
         logger.warning("[sync] %s/%s ausente (ciclo %d/%d).", t.symbol, t.side, t.missing_cycles, threshold)
