@@ -205,6 +205,10 @@ async def check_pending_orders_for_user(application: Application, user: User, db
                 status='ACTIVE', remaining_qty=qty
             )
             db.add(new_trade)
+            logger.info("[order->trade] %s %s qty=%.6f entry=%.6f msg_id=%s",
+                new_trade.symbol, new_trade.side, new_trade.qty, new_trade.entry_price,
+                str(getattr(new_trade, "notification_message_id", None)))
+
             db.delete(order)
 
 
@@ -442,11 +446,16 @@ async def run_tracker(application: Application):
     """Função principal que roda o verificador em loop para TODOS os usuários."""
     logger.info("Iniciando Rastreador de Posições e Ordens (Modo Multiusuário)...")
     while True:
+        cycle_started = time.perf_counter()
+        total_users = 0
+        adopted_count = 0
+
         db = SessionLocal()
         try:
             # --- LÓGICA DE SINCRONIZAÇÃO APRIMORADA ---
             all_api_users_for_sync = db.query(User).filter(User.api_key_encrypted.isnot(None)).all()
             for user in all_api_users_for_sync:
+                total_users += 1
                 sync_api_key = decrypt_data(user.api_key_encrypted)
                 sync_api_secret = decrypt_data(user.api_secret_encrypted)
 
@@ -492,8 +501,7 @@ async def run_tracker(application: Application):
                     Trade.user_telegram_id == user.telegram_id,
                     ~Trade.status.like('%CLOSED%')
                 ).all()
-                db_active_keys = {(t.symbol, t.side) for t in db_active_trades}
-
+            
                 db_pending_signals = db.query(PendingSignal).filter(
                     PendingSignal.user_telegram_id == user.telegram_id
                 ).all()
@@ -505,6 +513,7 @@ async def run_tracker(application: Application):
 
                 symbols_to_adopt = bybit_symbols - db_active_symbols - db_pending_symbols
                 for symbol in symbols_to_adopt:
+                    adopted_count += 1
                     pos = bybit_map_by_symbol.get(symbol)
                     if not pos:
                         continue  # segurança
@@ -565,6 +574,10 @@ async def run_tracker(application: Application):
                     threshold=3,  # configurável no futuro via env/setting se necessário
                     get_last_closed_trade_info=_fetch_closed_info,
                 )
+
+            duration = time.perf_counter() - cycle_started
+            logger.info("[cycle] resumo: usuarios=%d, adotadas=%d, duracao=%.2fs",
+            total_users, adopted_count, duration)
 
             db.commit()
 
@@ -698,7 +711,6 @@ async def apply_missing_cycles_policy(
       * 2º ciclo: edita mensagem para '⏳ Sincronizando...'
       * >=3º ciclo: roda detetive; se confirmar, edita resumo; senão, fallback; então fecha.
     """
-    db_active_keyset = {(t.symbol, t.side) for t in db_active_trades}
     bybit_symbols = {k[0] for k in bybit_keys}  # extrai só o símbolo do par (symbol, side)
 
     # 1) Trades vistas: reset + limpar flag de sync
@@ -716,7 +728,7 @@ async def apply_missing_cycles_policy(
     for t in db_active_trades:
         if t.symbol in bybit_symbols:
             continue
-        
+
         prev = int(getattr(t, "missing_cycles", 0) or 0)
         t.missing_cycles = prev + 1
         logger.warning("[sync] %s/%s ausente (ciclo %d/%d).", t.symbol, t.side, t.missing_cycles, threshold)
@@ -784,6 +796,8 @@ async def _send_or_edit_trade_message(
         parse_mode="HTML",
     )
     trade.notification_message_id = new_msg.message_id
+    logger.info("[msg:new] %s/%s nova_msg_id=%s",
+            trade.symbol, trade.side, str(trade.notification_message_id))
 
     # 3) Persiste o novo ID no banco
     try:
