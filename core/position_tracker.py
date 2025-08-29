@@ -614,7 +614,7 @@ async def notify_sync_status(application, user, trade, text: Optional[str] = Non
 
     sync_text = text or (
         "⏳ <b>Sincronizando com a corretora…</b>\n"
-        "Confirmando o status desta posição. Seu card será atualizado automaticamente."
+        "Estamos confirmando o status desta posição. O card será atualizado automaticamente."
     )
     try:
         await application.bot.edit_message_text(
@@ -660,29 +660,57 @@ async def confirm_and_close_trade(
                 logger.exception("[close-confirm] tentativa %d falhou para %s", i, trade.symbol)
             await asyncio.sleep(delay_seconds)
 
-    # Monta texto final
+        # Monta texto final (UX padronizada)
+    def _fmt_money(v):
+        try:
+            return f"${float(v):,.2f}"
+        except Exception:
+            return str(v)
+
+    side = getattr(trade, "side", "") or ""
+    qty  = getattr(trade, "qty", None)
+    entry = getattr(trade, "entry_price", None)
+
     if info:
-        # Esperado em 'info': pnl, exit_type (TP/SL/Manual), exit_price, closed_at
         pnl = info.get("pnl")
-        exit_type = info.get("exit_type") or "Fechamento"
+        exit_type = (info.get("exit_type") or "Fechamento").strip()
         exit_price = info.get("exit_price")
         closed_at = info.get("closed_at")
 
-        lines = [
-            f"✅ <b>{exit_type} confirmado</b> para <b>{trade.symbol}</b>",
-        ]
+        # Título amigável por tipo
+        if str(exit_type).lower().startswith("take"):
+            title = "🏆 Posição Fechada (Take Profit)"
+        elif str(exit_type).lower().startswith("stop"):
+            title = "🛡️ Posição Fechada (Stop)"
+        else:
+            title = "✅ Posição Fechada"
+
+        lines = [f"<b>{title}</b> — <b>{trade.symbol}</b> {side}"]
+        if qty is not None:
+            lines.append(f"• Quantidade: <b>{qty:g}</b>")
+        if entry is not None:
+            lines.append(f"• Entrada: <b>{_fmt_money(entry)}</b>")
         if exit_price is not None:
-            lines.append(f"• Preço de saída: <b>{exit_price}</b>")
+            lines.append(f"• Saída: <b>{_fmt_money(exit_price)}</b>")
         if pnl is not None:
-            lines.append(f"• PnL: <b>{pnl}</b>")
-        if closed_at is not None:
+            pnl_prefix = "Lucro" if float(pnl) >= 0 else "Prejuízo"
+            lines.append(f"• {pnl_prefix}: <b>{_fmt_money(pnl)}</b>")
+        if closed_at:
             lines.append(f"• Horário: <b>{closed_at}</b>")
+
         final_text = "\n".join(lines)
     else:
-        final_text = fallback_text or (
-            "ℹ️ Não foi possível confirmar os detalhes do fechamento via API no momento.\n"
-            f"A posição <b>{trade.symbol}</b> foi sinalizada como encerrada. O resumo de PnL pode aparecer nas próximas sincronizações."
-        )
+        # Fallback neutro e informativo
+        lines = [
+            f"ℹ️ <b>Posição Encerrada</b> — <b>{trade.symbol}</b> {side}",
+        ]
+        if qty is not None:
+            lines.append(f"• Quantidade: <b>{qty:g}</b>")
+        if entry is not None:
+            lines.append(f"• Entrada: <b>{_fmt_money(entry)}</b>")
+        lines.append("• Detalhes de saída/PnL não disponíveis no momento.")
+        lines.append("• O resumo pode aparecer nas próximas sincronizações.")
+        final_text = "\n".join(lines)
 
     try:
         if getattr(trade, "notification_message_id", None):
