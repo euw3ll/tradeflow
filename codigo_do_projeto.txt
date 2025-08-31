@@ -310,6 +310,37 @@ python main.py
 
 
 ========================================
+# Arquivo: database/bootstrap_schema.py
+========================================
+
+# database/bootstrap_schema.py
+from sqlalchemy import text
+from .session import SessionLocal
+
+def ensure_trades_columns():
+    s = SessionLocal()
+    try:
+        conn = s.connection()
+        cols = [row[1] for row in conn.execute(text("PRAGMA table_info(trades)")).fetchall()]
+
+        if "missing_cycles" not in cols:
+            conn.execute(text(
+                "ALTER TABLE trades ADD COLUMN missing_cycles INTEGER NOT NULL DEFAULT 0"
+            ))
+
+        if "last_seen_at" not in cols:
+            conn.execute(text(
+                "ALTER TABLE trades ADD COLUMN last_seen_at DATETIME"
+            ))
+
+        s.commit()
+    except Exception:
+        s.rollback()
+        raise
+    finally:
+        s.close()
+
+========================================
 # Arquivo: database/crud.py
 ========================================
 
@@ -404,6 +435,8 @@ class Trade(Base):
     trail_high_water_mark = Column(Float, nullable=True)
     is_stop_gain_active = Column(Boolean, default=False, nullable=False)
     unrealized_pnl_pct = Column(Float, nullable=True)
+    missing_cycles = Column(Integer, default=0, nullable=False)
+    last_seen_at = Column(DateTime(timezone=True), nullable=True)
 
 class PendingSignal(Base):
     __tablename__ = 'pending_signals'
@@ -429,24 +462,47 @@ class SignalForApproval(Base):
 # Arquivo: database/session.py
 ========================================
 
-import os # Importa a biblioteca 'os'
-from sqlalchemy import create_engine
+# database/session.py
+import os
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 from .models import Base
 
-# --- LÓGICA DE CAMINHO DINÂMICO ---
-if os.path.isdir('/data'):
-    # Caminho para o banco de dados no servidor Fly.io
-    DATABASE_URL = "sqlite:////data/tradeflow.db"
+# --- Caminho dinâmico (Docker vs local) ---
+# Docker: a imagem monta o DB em /app/data/tradeflow.db
+# Local: usa ./tradeflow.db
+if os.path.isdir("/app/data"):
+    DATABASE_URL = "sqlite:////app/data/tradeflow.db"
 else:
-    # Caminho para o banco de dados local (no seu Mac)
     DATABASE_URL = "sqlite:///./tradeflow.db"
 
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+engine = create_engine(
+    DATABASE_URL,
+    connect_args={"check_same_thread": False}
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 def init_db():
+    """Cria tabelas conhecidas e garante colunas novas no 'trades'."""
+    # 1) Cria tabelas definidas nos models (se não existirem)
     Base.metadata.create_all(bind=engine)
+
+    # 2) Bootstrap de schema para colunas novas (idempotente)
+    with engine.begin() as conn:
+        # lista colunas atuais da tabela trades
+        cols = [row[1] for row in conn.execute(text("PRAGMA table_info(trades)")).fetchall()]
+
+        # missing_cycles
+        if "missing_cycles" not in cols:
+            conn.execute(text(
+                "ALTER TABLE trades ADD COLUMN missing_cycles INTEGER NOT NULL DEFAULT 0"
+            ))
+
+        # last_seen_at
+        if "last_seen_at" not in cols:
+            conn.execute(text(
+                "ALTER TABLE trades ADD COLUMN last_seen_at DATETIME"
+            ))
 
 ========================================
 # Arquivo: core/__init__.py
@@ -545,8 +601,13 @@ from services.notification_service import send_notification
 from utils.security import decrypt_data
 from sqlalchemy.sql import func
 from telegram.error import BadRequest
+from typing import Optional, Callable, Awaitable, Dict, Any, Set, Tuple, List
 
 logger = logging.getLogger(__name__)
+
+# cache em memória para evitar reedições repetidas
+# chave: trade.id, valor: {"sync_notified": bool}
+_SYNC_CACHE = {}
 
 def _generate_trade_status_message(trade: Trade, status_title: str, pnl_data: dict = None, current_price: float = None) -> str:
     """Dashboard compacto e rico para a mensagem de status do trade (HTML)."""
@@ -729,6 +790,10 @@ async def check_pending_orders_for_user(application: Application, user: User, db
                 status='ACTIVE', remaining_qty=qty
             )
             db.add(new_trade)
+            logger.info("[order->trade] %s %s qty=%.6f entry=%.6f msg_id=%s",
+                new_trade.symbol, new_trade.side, new_trade.qty, new_trade.entry_price,
+                str(getattr(new_trade, "notification_message_id", None)))
+
             db.delete(order)
 
 
@@ -962,71 +1027,36 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                 msg_text = _generate_trade_status_message(trade, status_title_update, pnl_data_for_msg, current_price)
                 await _send_or_edit_trade_message(application, user, trade, db, msg_text)
 
-        else:
-            # --- DETETIVE DE FECHAMENTO COM RETENTATIVAS ---
-            # COMENTÁRIO: Lógica de fechamento refatorada para ser mais resiliente e precisa.
-            logger.info(f"[tracker] Posição para {trade.symbol} não encontrada. Ativando detetive paciente...")
-            
-            closed_info_result = {"success": False}  # Começa como falha
-            final_message = ""
-
-            # Tenta buscar os detalhes do fechamento por até 3 vezes, com pausas
-            for attempt in range(3):
-                logger.info(f"[detetive] Tentativa {attempt + 1}/3 para obter detalhes de fechamento de {trade.symbol}...")
-                result = await get_last_closed_trade_info(api_key, api_secret, trade.symbol)
-                
-                if result.get("success"):
-                    closed_info_result = result
-                    logger.info(f"[detetive] Sucesso na tentativa {attempt + 1}. Detalhes obtidos.")
-                    break  # Se obteve sucesso, sai do loop
-                
-                if attempt < 2: # Se não for a última tentativa
-                    logger.info("[detetive] Falha na tentativa. Aguardando 20 segundos antes de tentar novamente...")
-                    await asyncio.sleep(20)
-            
-            # Prossegue com a lógica, usando o resultado final das tentativas
-            if closed_info_result.get("success"):
-                closed_data = closed_info_result["data"]
-                pnl = float(closed_data.get("closedPnl", 0.0))
-                closing_reason = closed_data.get("exitType", "Unknown")
-                trade.closed_at = func.now()
-                trade.closed_pnl = pnl
-                trade.remaining_qty = 0.0
-
-                if closing_reason == "TakeProfit":
-                    trade.status = 'CLOSED_PROFIT'
-                    final_message = f"🏆 <b>Posição Fechada (LUCRO)</b> 🏆\n<b>Moeda:</b> {trade.symbol}\n<b>Resultado Final:</b> ${pnl:,.2f}"
-                elif closing_reason == "StopLoss":
-                    trade.status = 'CLOSED_LOSS' if pnl < 0 else 'CLOSED_STOP_GAIN'
-                    emoji = "🛑" if pnl < 0 else "✅"
-                    final_message = f"{emoji} <b>Posição Fechada (STOP)</b>\n<b>Moeda:</b> {trade.symbol}\n<b>Resultado Final:</b> ${pnl:,.2f}"
-                else: # Manual, Liquidação, etc.
-                    trade.status = 'CLOSED_GHOST' # Mantém GHOST mas com PNL
-                    resultado_str = "LUCRO" if pnl >= 0 else "PREJUÍZO"
-                    emoji = "✅" if pnl >= 0 else "🔻"
-                    final_message = f"{emoji} <b>Posição Fechada ({resultado_str})</b>\n<b>Moeda:</b> {trade.symbol}\n<b>Resultado:</b> ${pnl:,.2f}"
-            else:
-                # Se mesmo após as tentativas falhar, mantém o comportamento original de fallback.
-                logger.error(f"[detetive] Falha ao obter detalhes de fechamento para {trade.symbol} após 3 tentativas.")
-                trade.status = 'CLOSED_GHOST'
-                trade.closed_at = func.now()
-                trade.closed_pnl = 0.0
-                trade.remaining_qty = 0.0
-                final_message = f"ℹ️ Posição em <b>{trade.symbol}</b> foi fechada na corretora. Detalhes de P/L não puderam ser obtidos via API."
-
-            await _send_or_edit_trade_message(application, user, trade, db, final_message)
-
 async def run_tracker(application: Application):
     """Função principal que roda o verificador em loop para TODOS os usuários."""
     logger.info("Iniciando Rastreador de Posições e Ordens (Modo Multiusuário)...")
     while True:
+        cycle_started = time.perf_counter()
+        total_users = 0
+        adopted_count = 0
+
         db = SessionLocal()
         try:
             # --- LÓGICA DE SINCRONIZAÇÃO APRIMORADA ---
             all_api_users_for_sync = db.query(User).filter(User.api_key_encrypted.isnot(None)).all()
             for user in all_api_users_for_sync:
+                total_users += 1
                 sync_api_key = decrypt_data(user.api_key_encrypted)
                 sync_api_secret = decrypt_data(user.api_secret_encrypted)
+
+                # Wrapper para o detetive: usa suas credenciais e adapta o formato
+                async def _fetch_closed_info(symbol: str) -> Optional[Dict[str, Any]]:
+                    res = await get_last_closed_trade_info(sync_api_key, sync_api_secret, symbol)
+                    if not res or not res.get("success"):
+                        return None
+                    d = res.get("data") or {}
+                    # padroniza campos esperados pelo detetive
+                    return {
+                        "pnl": float(d.get("closedPnl", 0.0)) if d.get("closedPnl") is not None else None,
+                        "exit_type": d.get("exitType"),
+                        "exit_price": d.get("exitPrice"),
+                        "closed_at": d.get("closedAt"),
+                    }
 
                 bybit_positions_result = await get_open_positions_with_pnl(sync_api_key, sync_api_secret)
                 if not bybit_positions_result.get("success"):
@@ -1037,22 +1067,43 @@ async def run_tracker(application: Application):
                 bybit_keys = {(p["symbol"], p["side"]) for p in bybit_list}
                 bybit_map = {(p["symbol"], p["side"]): p for p in bybit_list}
 
+                # [NOVO] conjunto só por símbolo (ignora side)
+                bybit_symbols = {p["symbol"] for p in bybit_list}
+
+                # [NOVO] mapa por símbolo -> se tiver mais de uma entrada do mesmo símbolo,
+                # fica com a de maior tamanho absoluto (mais relevante)
+                bybit_map_by_symbol: Dict[str, Dict[str, Any]] = {}
+                for p in bybit_list:
+                    sym = p["symbol"]
+                    if sym not in bybit_map_by_symbol:
+                        bybit_map_by_symbol[sym] = p
+                    else:
+                        prev = bybit_map_by_symbol[sym]
+                        if abs(float(p.get("size") or 0)) > abs(float(prev.get("size") or 0)):
+                            bybit_map_by_symbol[sym] = p
+
                 db_active_trades = db.query(Trade).filter(
                     Trade.user_telegram_id == user.telegram_id,
                     ~Trade.status.like('%CLOSED%')
                 ).all()
-                db_active_keys = {(t.symbol, t.side) for t in db_active_trades}
-
+            
                 db_pending_signals = db.query(PendingSignal).filter(
                     PendingSignal.user_telegram_id == user.telegram_id
                 ).all()
                 db_pending_symbols = {s.symbol for s in db_pending_signals}
 
-                # Adotar órfãs (Bybit → DB)
-                keys_to_adopt = bybit_keys - db_active_keys - {(sym, "LONG") for sym in db_pending_symbols} - {(sym, "SHORT") for sym in db_pending_symbols}
-                for key in keys_to_adopt:
-                    symbol, side = key
-                    pos = bybit_map[key]
+                # [NOVO] Adotar órfãs por SÍMBOLO (ignora side)
+                db_active_symbols = {t.symbol for t in db_active_trades}
+                # db_pending_symbols você JÁ construiu acima e é um set de strings: {s.symbol for s in db_pending_signals}
+
+                symbols_to_adopt = bybit_symbols - db_active_symbols - db_pending_symbols
+                for symbol in symbols_to_adopt:
+                    adopted_count += 1
+                    pos = bybit_map_by_symbol.get(symbol)
+                    if not pos:
+                        continue  # segurança
+
+                    side = pos.get("side")
                     entry = float(pos.get("entry", 0) or 0)
                     size = float(pos.get("size", 0) or 0)
                     curr_sl = pos.get("stop_loss") or None
@@ -1098,24 +1149,20 @@ async def run_tracker(application: Application):
                     )
                     await application.bot.send_message(chat_id=user.telegram_id, text=msg, parse_mode='HTML')
 
-                # Fechar fantasmas (DB → Bybit)
-                keys_to_close = db_active_keys - bybit_keys
-                for t in db_active_trades:
-                    if (t.symbol, t.side) in keys_to_close:
-                        t.status = 'CLOSED_GHOST'
-                        t.closed_at = func.now()
-                        t.closed_pnl = 0.0
-                        t.remaining_qty = 0.0
-                        try:
-                            if t.notification_message_id:
-                                await application.bot.edit_message_text(
-                                    chat_id=user.telegram_id,
-                                    message_id=t.notification_message_id,
-                                    text=f"ℹ️ Posição em <b>{t.symbol}</b> não foi encontrada na Bybit e foi removida.",
-                                    parse_mode='HTML'
-                                )
-                        except Exception:
-                            pass
+                # [NOVO] Fechar fantasmas com tolerância (aplica janela de 3 ciclos)
+                await apply_missing_cycles_policy(
+                    application=application,
+                    user=user,
+                    db=db,
+                    db_active_trades=db_active_trades,
+                    bybit_keys=bybit_keys,
+                    threshold=3,  # configurável no futuro via env/setting se necessário
+                    get_last_closed_trade_info=_fetch_closed_info,
+                )
+
+            duration = time.perf_counter() - cycle_started
+            logger.info("[cycle] resumo: usuarios=%d, adotadas=%d, duracao=%.2fs",
+            total_users, adopted_count, duration)
 
             db.commit()
 
@@ -1138,7 +1185,192 @@ async def run_tracker(application: Application):
 
         await asyncio.sleep(60)
 
-from telegram.error import BadRequest
+async def notify_sync_status(application, user, trade, text: Optional[str] = None) -> None:
+    """
+    Edita o card para estado 'sincronizando' no 2º ciclo ausente.
+    Evita repetir a mesma edição em ciclos seguintes.
+    """
+    if trade is None or not getattr(trade, "notification_message_id", None):
+        return
+
+    cache = _SYNC_CACHE.setdefault(trade.id, {"sync_notified": False})
+    if cache["sync_notified"]:
+        return  # já notificou este estado; não spammar
+
+    sync_text = text or (
+        "⏳ <b>Sincronizando com a corretora…</b>\n"
+        "Estamos confirmando o status desta posição. O card será atualizado automaticamente."
+    )
+    try:
+        await application.bot.edit_message_text(
+            chat_id=user.telegram_id,
+            message_id=trade.notification_message_id,
+            text=sync_text,
+            parse_mode="HTML",
+        )
+        cache["sync_notified"] = True
+        logger.info("[sync] %s/%s marcado como 'sincronizando' (2º ciclo ausente).",
+                    trade.symbol, trade.side)
+    except Exception:
+        logger.exception("[sync] Falha ao editar mensagem para estado 'sincronizando' (%s).", trade.symbol)
+
+def clear_sync_flag(trade_id: int) -> None:
+    """Reseta a flag de sync para quando a posição reaparece ou fecha definitivamente."""
+    state = _SYNC_CACHE.get(trade_id)
+    if state:
+        state["sync_notified"] = False
+
+async def confirm_and_close_trade(
+    *,
+    application,
+    user,
+    trade,
+    get_last_closed_trade_info: Optional[Callable[[str], Awaitable[Optional[Dict[str, Any]]]]] = None,
+    attempts: int = 3,
+    delay_seconds: float = 6.0,
+    fallback_text: Optional[str] = None,
+) -> None:
+    """
+    Antes de marcar CLOSED_GHOST, tenta confirmar fechamento real.
+    Se encontrar dados, edita o card com resumo e fecha; senão, usa fallback simples.
+    """
+    info = None
+    if get_last_closed_trade_info:
+        for i in range(1, attempts + 1):
+            try:
+                info = await get_last_closed_trade_info(trade.symbol)
+                if info:
+                    break
+            except Exception:
+                logger.exception("[close-confirm] tentativa %d falhou para %s", i, trade.symbol)
+            await asyncio.sleep(delay_seconds)
+
+        # Monta texto final (UX padronizada)
+    def _fmt_money(v):
+        try:
+            return f"${float(v):,.2f}"
+        except Exception:
+            return str(v)
+
+    side = getattr(trade, "side", "") or ""
+    qty  = getattr(trade, "qty", None)
+    entry = getattr(trade, "entry_price", None)
+
+    if info:
+        pnl = info.get("pnl")
+        exit_type = (info.get("exit_type") or "Fechamento").strip()
+        exit_price = info.get("exit_price")
+        closed_at = info.get("closed_at")
+
+        # Título amigável por tipo
+        if str(exit_type).lower().startswith("take"):
+            title = "🏆 Posição Fechada (Take Profit)"
+        elif str(exit_type).lower().startswith("stop"):
+            title = "🛡️ Posição Fechada (Stop)"
+        else:
+            title = "✅ Posição Fechada"
+
+        lines = [f"<b>{title}</b> — <b>{trade.symbol}</b> {side}"]
+        if qty is not None:
+            lines.append(f"• Quantidade: <b>{qty:g}</b>")
+        if entry is not None:
+            lines.append(f"• Entrada: <b>{_fmt_money(entry)}</b>")
+        if exit_price is not None:
+            lines.append(f"• Saída: <b>{_fmt_money(exit_price)}</b>")
+        if pnl is not None:
+            pnl_prefix = "Lucro" if float(pnl) >= 0 else "Prejuízo"
+            lines.append(f"• {pnl_prefix}: <b>{_fmt_money(pnl)}</b>")
+        if closed_at:
+            lines.append(f"• Horário: <b>{closed_at}</b>")
+
+        final_text = "\n".join(lines)
+    else:
+        # Fallback neutro e informativo
+        lines = [
+            f"ℹ️ <b>Posição Encerrada</b> — <b>{trade.symbol}</b> {side}",
+        ]
+        if qty is not None:
+            lines.append(f"• Quantidade: <b>{qty:g}</b>")
+        if entry is not None:
+            lines.append(f"• Entrada: <b>{_fmt_money(entry)}</b>")
+        lines.append("• Detalhes de saída/PnL não disponíveis no momento.")
+        lines.append("• O resumo pode aparecer nas próximas sincronizações.")
+        final_text = "\n".join(lines)
+
+    try:
+        if getattr(trade, "notification_message_id", None):
+            await application.bot.edit_message_text(
+                chat_id=user.telegram_id,
+                message_id=trade.notification_message_id,
+                text=final_text,
+                parse_mode="HTML",
+            )
+    except Exception:
+        logger.exception("[close-confirm] Falha ao editar mensagem final para %s.", trade.symbol)
+
+# [ATUALIZAÇÃO] política de tolerância + UX etapa 2
+async def apply_missing_cycles_policy(
+    application,
+    user,
+    db,
+    db_active_trades,
+    bybit_keys,
+    threshold: int = 3,
+    get_last_closed_trade_info: Optional[Callable[[str], Awaitable[Optional[Dict[str, Any]]]]] = None,
+):
+    """
+    - Vistas neste ciclo: zera missing_cycles, atualiza last_seen_at e limpa flag de sync.
+    - Ausentes: incrementa missing_cycles.
+      * 2º ciclo: edita mensagem para '⏳ Sincronizando...'
+      * >=3º ciclo: roda detetive; se confirmar, edita resumo; senão, fallback; então fecha.
+    """
+    bybit_symbols = {k[0] for k in bybit_keys}  # extrai só o símbolo do par (symbol, side)
+
+    # 1) Trades vistas: reset + limpar flag de sync
+    for t in db_active_trades:
+        if t.symbol in bybit_symbols:
+            if getattr(t, "missing_cycles", 0) != 0:
+                logger.info("[sync] %s/%s visto novamente. Reset %d→0.", t.symbol, t.side, t.missing_cycles)
+            t.missing_cycles = 0
+            t.last_seen_at = func.now()
+            if getattr(t, "id", None) is not None:
+                clear_sync_flag(t.id)
+
+    # 2) Trades ausentes
+    # ignoramos side: ausente se o símbolo não está vindo da Bybit
+    for t in db_active_trades:
+        if t.symbol in bybit_symbols:
+            continue
+
+        prev = int(getattr(t, "missing_cycles", 0) or 0)
+        t.missing_cycles = prev + 1
+        logger.warning("[sync] %s/%s ausente (ciclo %d/%d).", t.symbol, t.side, t.missing_cycles, threshold)
+
+        # 2º ciclo → mensagem neutra
+        if t.missing_cycles == 2:
+            await notify_sync_status(application, user, t)
+
+            logger.info("[sync] %s/%s entrou em estado 'sincronizando' (ciclo 2/%d).", t.symbol, t.side, threshold)
+
+        # 3º ciclo+ → detetive e fechamento
+        if t.missing_cycles >= threshold:
+
+            logger.info("[sync] %s/%s atingiu limiar de fechamento (ciclo %d/%d). Iniciando detetive…",
+            t.symbol, t.side, t.missing_cycles, threshold)
+
+            await confirm_and_close_trade(
+                application=application,
+                user=user,
+                trade=t,
+                get_last_closed_trade_info=get_last_closed_trade_info,
+            )
+            # marca fechado (mantém status por compatibilidade)
+            t.status = "CLOSED_GHOST"
+            t.closed_at = func.now()
+            t.closed_pnl = t.closed_pnl or 0.0
+            t.remaining_qty = 0.0
+            if getattr(t, "id", None) is not None:
+                clear_sync_flag(t.id)
 
 async def _send_or_edit_trade_message(
     application: Application,
@@ -1177,6 +1409,8 @@ async def _send_or_edit_trade_message(
         parse_mode="HTML",
     )
     trade.notification_message_id = new_msg.message_id
+    logger.info("[msg:new] %s/%s nova_msg_id=%s",
+            trade.symbol, trade.side, str(trade.notification_message_id))
 
     # 3) Persiste o novo ID no banco
     try:
@@ -1717,6 +1951,72 @@ def is_coin_in_whitelist(symbol: str, user_whitelist_str: str) -> bool:
 ========================================
 
 
+
+========================================
+# Arquivo: tests/test_missing_cycles_policy.py
+========================================
+
+import asyncio
+import types
+
+class FakeBot:
+    def __init__(self): self.edits = []
+    async def edit_message_text(self, chat_id, message_id, text, parse_mode=None):
+        self.edits.append((chat_id, message_id, text))
+
+class FakeApp:
+    def __init__(self): self.bot = FakeBot()
+
+class T:
+    # Mock minimal de Trade
+    def __init__(self, symbol, side, missing_cycles=0, notification_message_id=123):
+        self.symbol = symbol; self.side = side
+        self.status = "ACTIVE"; self.closed_pnl = None
+        self.remaining_qty = 1.0; self.notification_message_id = notification_message_id
+        self.missing_cycles = missing_cycles
+        self.last_seen_at = None
+
+async def _run(policy, bybit_keys, trades, threshold=3):
+    app = FakeApp()
+    user = types.SimpleNamespace(telegram_id=111)
+    db = object()
+    await policy(app, user, db, trades, bybit_keys, threshold)
+    return app.bot.edits
+
+def test_nao_fecha_em_1_ou_2_ciclos(event_loop=None):
+    from main import apply_missing_cycles_policy  # ajuste o import conforme onde você adicionou a função
+
+    trades = [T("TIAUSDT", "LONG")]
+    # 1º ciclo ausente
+    edits = asyncio.get_event_loop().run_until_complete(_run(apply_missing_cycles_policy, set(), trades))
+    assert trades[0].missing_cycles == 1
+    assert trades[0].status == "ACTIVE"
+    assert edits == []
+
+    # 2º ciclo ausente
+    edits = asyncio.get_event_loop().run_until_complete(_run(apply_missing_cycles_policy, set(), trades))
+    assert trades[0].missing_cycles == 2
+    assert trades[0].status == "ACTIVE"
+    assert edits == []
+
+def test_fecha_no_3o_ciclo(event_loop=None):
+    from main import apply_missing_cycles_policy
+
+    trades = [T("TIAUSDT", "LONG", missing_cycles=2)]
+    edits = asyncio.get_event_loop().run_until_complete(_run(apply_missing_cycles_policy, set(), trades))
+    assert trades[0].missing_cycles == 3
+    assert trades[0].status == "CLOSED_GHOST"
+    assert trades[0].remaining_qty == 0.0
+    assert len(edits) == 1  # mensagem de remoção enviada
+
+def test_reset_quando_volta_a_aparecer(event_loop=None):
+    from main import apply_missing_cycles_policy
+
+    trades = [T("TIAUSDT", "LONG", missing_cycles=2)]
+    edits = asyncio.get_event_loop().run_until_complete(_run(apply_missing_cycles_policy, {("TIAUSDT","LONG")}, trades))
+    assert trades[0].missing_cycles == 0
+    assert trades[0].status == "ACTIVE"
+    assert len(edits) == 0
 
 ========================================
 # Arquivo: tests/test_signal_cyber_e2e.py
@@ -2503,6 +2803,88 @@ def decrypt_data(encrypted_data: str) -> str:
         return None
     decrypted_bytes = cipher_suite.decrypt(encrypted_data.encode())
     return decrypted_bytes.decode()
+
+========================================
+# Arquivo: scripts/cleanup_trades.py
+========================================
+
+import sys
+import os
+import argparse
+from sqlalchemy.orm import Session
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+# Adiciona o diretório raiz ao path para permitir a importação de módulos do projeto
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+from database.models import Base, Trade
+from database.session import DATABASE_URL  # Importa a URL do banco de dados
+
+def cleanup_trades(db: Session, status: str, user_id: int = None, dry_run: bool = True):
+    """
+    Busca e, opcionalmente, exclui trades com base em seu status e ID de usuário.
+    """
+    query = db.query(Trade).filter(Trade.status == status)
+    
+    if user_id:
+        query = query.filter(Trade.user_telegram_id == user_id)
+        
+    trades_to_delete = query.all()
+    count = len(trades_to_delete)
+    
+    user_filter_str = f" para o usuário com ID {user_id}" if user_id else ""
+    
+    if count == 0:
+        print(f"Nenhum trade com o status '{status}' encontrado{user_filter_str}.")
+        return
+
+    print(f"Encontrados {count} trades com o status '{status}'{user_filter_str}.")
+
+    if dry_run:
+        print("\n--- MODO DE SIMULAÇÃO (DRY-RUN) ---")
+        print("Os seguintes trades seriam excluídos:")
+        for trade in trades_to_delete:
+            print(f"  - ID: {trade.id}, Símbolo: {trade.symbol}, Usuário: {trade.user_telegram_id}, Data: {trade.closed_at}")
+        print("\nNenhuma alteração foi feita no banco de dados.")
+    else:
+        # Confirmação final antes de excluir
+        confirm = input(f"\n!!! ATENÇÃO !!! Você tem certeza que deseja excluir permanentemente estes {count} trades? (s/N): ")
+        if confirm.lower() == 's':
+            try:
+                # Usa delete() em vez de um loop para mais performance
+                query.delete(synchronize_session=False)
+                db.commit()
+                print(f"\n✅ Sucesso! {count} trades foram excluídos permanentemente.")
+            except Exception as e:
+                db.rollback()
+                print(f"\n❌ Erro ao excluir trades: {e}")
+        else:
+            print("\nOperação cancelada pelo usuário.")
+
+def main():
+    """
+    Função principal para executar o script via linha de comando.
+    """
+    parser = argparse.ArgumentParser(description="Script de limpeza para trades no banco de dados.")
+    parser.add_argument("--status", type=str, required=True, help="O status dos trades a serem excluídos (ex: CLOSED_GHOST).")
+    parser.add_argument("--user-id", type=int, help="(Opcional) ID de usuário do Telegram para filtrar a exclusão.")
+    parser.add_argument("--dry-run", action="store_true", help="Apenas simula a exclusão, sem fazer alterações no banco.")
+    
+    args = parser.parse_args()
+
+    # Configuração da sessão do banco de dados
+    engine = create_engine(DATABASE_URL)
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    db = SessionLocal()
+    
+    try:
+        cleanup_trades(db, status=args.status, user_id=args.user_id, dry_run=args.dry_run)
+    finally:
+        db.close()
+
+if __name__ == "__main__":
+    main()
 
 ========================================
 # Arquivo: scripts/create_invite.py
@@ -4721,6 +5103,64 @@ def downgrade() -> None:
 
 
 ========================================
+# Arquivo: alembic/versions/b2a5a70c97b3_add_missing_cycles_and_last_seen_at_to_.py
+========================================
+
+"""add missing_cycles and last_seen_at to trades
+
+Revision ID: b2a5a70c97b3
+Revises: 657fc8fb3f24
+Create Date: 2025-08-29 10:39:42.185181
+
+"""
+from typing import Sequence, Union
+
+from alembic import op
+import sqlalchemy as sa
+
+
+# revision identifiers, used by Alembic.
+revision: str = 'b2a5a70c97b3'
+down_revision: Union[str, Sequence[str], None] = '657fc8fb3f24'
+branch_labels: Union[str, Sequence[str], None] = None
+depends_on: Union[str, Sequence[str], None] = None
+
+
+
+def upgrade() -> None:
+    bind = op.get_bind()
+    insp = sa.inspect(bind)
+    cols = {c["name"] for c in insp.get_columns("trades")}
+    dialect = bind.dialect.name  # "sqlite", "postgresql", etc.
+
+    # missing_cycles
+    if "missing_cycles" not in cols:
+        op.add_column(
+            "trades",
+            sa.Column("missing_cycles", sa.Integer(), nullable=False, server_default="0"),
+        )
+        # Remover default apenas em Postgres; SQLite não suporta DROP DEFAULT
+        if dialect == "postgresql":
+            op.execute("ALTER TABLE trades ALTER COLUMN missing_cycles DROP DEFAULT")
+
+    # last_seen_at
+    if "last_seen_at" not in cols:
+        op.add_column(
+            "trades",
+            sa.Column("last_seen_at", sa.DateTime(timezone=True), nullable=True),
+        )
+
+def downgrade() -> None:
+    bind = op.get_bind()
+    insp = sa.inspect(bind)
+    cols = {c["name"] for c in insp.get_columns("trades")}
+
+    if "last_seen_at" in cols:
+        op.drop_column("trades", "last_seen_at")
+    if "missing_cycles" in cols:
+        op.drop_column("trades", "missing_cycles")
+
+========================================
 # Arquivo: alembic/versions/c19acb6f35e0_versao_inicial_do_projeto.py
 ========================================
 
@@ -4853,6 +5293,44 @@ def downgrade() -> None:
     op.drop_table('pending_signals')
     op.drop_table('monitored_targets')
     op.drop_table('invite_codes')
+    # ### end Alembic commands ###
+
+
+========================================
+# Arquivo: alembic/versions/ea992c8d7b70_add_trades_missing_cycles_and_last_seen_.py
+========================================
+
+"""add trades.missing_cycles and last_seen_at
+
+Revision ID: ea992c8d7b70
+Revises: b2a5a70c97b3
+Create Date: 2025-08-29 12:39:12.562656
+
+"""
+from typing import Sequence, Union
+
+from alembic import op
+import sqlalchemy as sa
+
+
+# revision identifiers, used by Alembic.
+revision: str = 'ea992c8d7b70'
+down_revision: Union[str, Sequence[str], None] = 'b2a5a70c97b3'
+branch_labels: Union[str, Sequence[str], None] = None
+depends_on: Union[str, Sequence[str], None] = None
+
+
+def upgrade() -> None:
+    """Upgrade schema."""
+    # ### commands auto generated by Alembic - please adjust! ###
+    pass
+    # ### end Alembic commands ###
+
+
+def downgrade() -> None:
+    """Downgrade schema."""
+    # ### commands auto generated by Alembic - please adjust! ###
+    pass
     # ### end Alembic commands ###
 
 

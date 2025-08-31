@@ -640,14 +640,16 @@ async def confirm_and_close_trade(
     application,
     user,
     trade,
+    db,  # sessão do banco
     get_last_closed_trade_info: Optional[Callable[[str], Awaitable[Optional[Dict[str, Any]]]]] = None,
     attempts: int = 3,
     delay_seconds: float = 6.0,
     fallback_text: Optional[str] = None,
-) -> None:
+) -> bool:
     """
     Antes de marcar CLOSED_GHOST, tenta confirmar fechamento real.
-    Se encontrar dados, edita o card com resumo e fecha; senão, usa fallback simples.
+    Se encontrar dados, edita o card com resumo e FECHA/PERSISTE no DB.
+    Retorna True se persistiu fechamento com dados; False caso contrário.
     """
     info = None
     if get_last_closed_trade_info:
@@ -655,12 +657,13 @@ async def confirm_and_close_trade(
             try:
                 info = await get_last_closed_trade_info(trade.symbol)
                 if info:
+                    logger.debug("[close-confirm] info obtida para %s na tentativa %d: %s", trade.symbol, i, str(info))
                     break
+                logger.debug("[close-confirm] sem info para %s na tentativa %d.", trade.symbol, i)
             except Exception:
                 logger.exception("[close-confirm] tentativa %d falhou para %s", i, trade.symbol)
             await asyncio.sleep(delay_seconds)
 
-        # Monta texto final (UX padronizada)
     def _fmt_money(v):
         try:
             return f"${float(v):,.2f}"
@@ -671,13 +674,13 @@ async def confirm_and_close_trade(
     qty  = getattr(trade, "qty", None)
     entry = getattr(trade, "entry_price", None)
 
+    # Monta texto final (mesmo corpo da Etapa 1)
     if info:
         pnl = info.get("pnl")
         exit_type = (info.get("exit_type") or "Fechamento").strip()
         exit_price = info.get("exit_price")
-        closed_at = info.get("closed_at")
+        closed_at_val = info.get("closed_at")
 
-        # Título amigável por tipo
         if str(exit_type).lower().startswith("take"):
             title = "🏆 Posição Fechada (Take Profit)"
         elif str(exit_type).lower().startswith("stop"):
@@ -695,12 +698,10 @@ async def confirm_and_close_trade(
         if pnl is not None:
             pnl_prefix = "Lucro" if float(pnl) >= 0 else "Prejuízo"
             lines.append(f"• {pnl_prefix}: <b>{_fmt_money(pnl)}</b>")
-        if closed_at:
-            lines.append(f"• Horário: <b>{closed_at}</b>")
-
+        if closed_at_val:
+            lines.append(f"• Horário: <b>{closed_at_val}</b>")
         final_text = "\n".join(lines)
     else:
-        # Fallback neutro e informativo
         lines = [
             f"ℹ️ <b>Posição Encerrada</b> — <b>{trade.symbol}</b> {side}",
         ]
@@ -712,6 +713,7 @@ async def confirm_and_close_trade(
         lines.append("• O resumo pode aparecer nas próximas sincronizações.")
         final_text = "\n".join(lines)
 
+    # Edita a mensagem no Telegram
     try:
         if getattr(trade, "notification_message_id", None):
             await application.bot.edit_message_text(
@@ -723,6 +725,62 @@ async def confirm_and_close_trade(
     except Exception:
         logger.exception("[close-confirm] Falha ao editar mensagem final para %s.", trade.symbol)
 
+    # --- Persistência no DB quando houver info confirmada ---
+    if info:
+        try:
+            pnl = info.get("pnl")
+            exit_type = (info.get("exit_type") or "").lower()
+            status = (
+                "CLOSED_PROFIT" if exit_type.startswith("take")
+                else "CLOSED_LOSS" if exit_type.startswith("stop")
+                else ("CLOSED_PROFIT" if (pnl is not None and float(pnl) >= 0) else "CLOSED_LOSS" if pnl is not None else "CLOSED")
+            )
+
+            trade.status = status
+            if pnl is not None:
+                try:
+                    trade.closed_pnl = float(pnl)
+                except Exception:
+                    logger.warning("[close-confirm] PnL inválido para %s: %s", trade.symbol, pnl)
+
+            closed_at_val = info.get("closed_at")
+            if closed_at_val:
+                try:
+                    from datetime import datetime
+                    if isinstance(closed_at_val, (int, float)):
+                        ts = float(closed_at_val)
+                        if ts > 10_000_000_000:
+                            ts = ts / 1000.0
+                        trade.closed_at = datetime.utcfromtimestamp(ts)
+                    elif isinstance(closed_at_val, str):
+                        trade.closed_at = datetime.fromisoformat(closed_at_val.replace("Z", "+00:00"))
+                    else:
+                        trade.closed_at = func.now()
+                except Exception:
+                    logger.debug("[close-confirm] Falha ao parsear closed_at (%s) para %s; usando now().",
+                                 str(closed_at_val), trade.symbol, exc_info=True)
+                    trade.closed_at = func.now()
+            else:
+                trade.closed_at = func.now()
+
+            trade.remaining_qty = 0.0
+            db.commit()
+
+            logger.info(
+                "[close-confirm] fechamento_real_persistido symbol=%s side=%s status=%s pnl=%s exit_type=%s exit_price=%s closed_at=%s",
+                trade.symbol, side, trade.status, str(getattr(trade, "closed_pnl", None)),
+                info.get("exit_type"), str(info.get("exit_price")), str(getattr(trade, "closed_at", None))
+            )
+            return True
+        except Exception:
+            db.rollback()
+            logger.exception("[close-confirm] Falha ao persistir fechamento real para %s.", trade.symbol)
+            return False
+
+    # Sem info confirmada
+    logger.info("[close-confirm] sem_dados_confirmados symbol=%s side=%s -> manter fallback", trade.symbol, side)
+    return False
+
 # [ATUALIZAÇÃO] política de tolerância + UX etapa 2
 async def apply_missing_cycles_policy(
     application,
@@ -733,57 +791,64 @@ async def apply_missing_cycles_policy(
     threshold: int = 3,
     get_last_closed_trade_info: Optional[Callable[[str], Awaitable[Optional[Dict[str, Any]]]]] = None,
 ):
-    """
-    - Vistas neste ciclo: zera missing_cycles, atualiza last_seen_at e limpa flag de sync.
-    - Ausentes: incrementa missing_cycles.
-      * 2º ciclo: edita mensagem para '⏳ Sincronizando...'
-      * >=3º ciclo: roda detetive; se confirmar, edita resumo; senão, fallback; então fecha.
-    """
-    bybit_symbols = {k[0] for k in bybit_keys}  # extrai só o símbolo do par (symbol, side)
+    bybit_symbols = {k[0] for k in bybit_keys}
 
-    # 1) Trades vistas: reset + limpar flag de sync
     for t in db_active_trades:
         if t.symbol in bybit_symbols:
             if getattr(t, "missing_cycles", 0) != 0:
-                logger.info("[sync] %s/%s visto novamente. Reset %d→0.", t.symbol, t.side, t.missing_cycles)
+                logger.info("[sync] visto_novamente symbol=%s side=%s reset_missing=%d->0", t.symbol, t.side, t.missing_cycles)
             t.missing_cycles = 0
             t.last_seen_at = func.now()
             if getattr(t, "id", None) is not None:
                 clear_sync_flag(t.id)
 
-    # 2) Trades ausentes
-    # ignoramos side: ausente se o símbolo não está vindo da Bybit
     for t in db_active_trades:
         if t.symbol in bybit_symbols:
             continue
 
         prev = int(getattr(t, "missing_cycles", 0) or 0)
         t.missing_cycles = prev + 1
-        logger.warning("[sync] %s/%s ausente (ciclo %d/%d).", t.symbol, t.side, t.missing_cycles, threshold)
+        logger.warning("[sync] ausente symbol=%s side=%s ciclo=%d/%d", t.symbol, t.side, t.missing_cycles, threshold)
 
-        # 2º ciclo → mensagem neutra
         if t.missing_cycles == 2:
             await notify_sync_status(application, user, t)
+            logger.info("[sync] estado_sincronizando symbol=%s side=%s ciclo=2/%d", t.symbol, t.side, threshold)
 
-            logger.info("[sync] %s/%s entrou em estado 'sincronizando' (ciclo 2/%d).", t.symbol, t.side, threshold)
-
-        # 3º ciclo+ → detetive e fechamento
         if t.missing_cycles >= threshold:
+            logger.info("[sync] limiar_fechamento symbol=%s side=%s ciclo=%d/%d iniciando_detetive",
+                        t.symbol, t.side, t.missing_cycles, threshold)
 
-            logger.info("[sync] %s/%s atingiu limiar de fechamento (ciclo %d/%d). Iniciando detetive…",
-            t.symbol, t.side, t.missing_cycles, threshold)
-
-            await confirm_and_close_trade(
+            persisted = await confirm_and_close_trade(
                 application=application,
                 user=user,
                 trade=t,
+                db=db,
                 get_last_closed_trade_info=get_last_closed_trade_info,
             )
-            # marca fechado (mantém status por compatibilidade)
+
+            if persisted:
+                try:
+                    if not getattr(t, "status", None) or not str(t.status).startswith("CLOSED"):
+                        t.status = "CLOSED"
+                    if getattr(t, "remaining_qty", None) is None:
+                        t.remaining_qty = 0.0
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                    logger.exception("[sync] Falha ao consolidar fechamento real de %s.", t.symbol)
+
+                logger.info("[sync] fechamento_real_consolidado symbol=%s side=%s status=%s pnl=%s",
+                            t.symbol, t.side, t.status, str(getattr(t, "closed_pnl", None)))
+                if getattr(t, "id", None) is not None:
+                    clear_sync_flag(t.id)
+                continue
+
+            # Fallback -> CLOSED_GHOST
             t.status = "CLOSED_GHOST"
             t.closed_at = func.now()
             t.closed_pnl = t.closed_pnl or 0.0
             t.remaining_qty = 0.0
+            logger.info("[sync] fallback_ghost symbol=%s side=%s motivo=no-info", t.symbol, t.side)
             if getattr(t, "id", None) is not None:
                 clear_sync_flag(t.id)
 

@@ -1196,20 +1196,24 @@ async def receive_coin_whitelist(update: Update, context: ContextTypes.DEFAULT_T
     return ConversationHandler.END
 
 async def list_closed_trades_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Busca no DB e lista os últimos trades fechados do usuário."""
+    """Busca no DB e lista os últimos trades fechados do usuário.
+    Ajustado para priorizar PnL quando existir e registrar telemetria de render por item.
+    """
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
-    
+
+    logger.debug("[histórico] start user_id=%s", user_id)
     await query.edit_message_text("Buscando seu histórico de trades...")
 
     db = SessionLocal()
     try:
-        # Busca os últimos 15 trades fechados, ordenados do mais recente para o mais antigo
         closed_trades = db.query(Trade).filter(
             Trade.user_telegram_id == user_id,
             Trade.status.like('%CLOSED%')
         ).order_by(Trade.closed_at.desc()).limit(15).all()
+
+        logger.info("[histórico] encontrados=%d user_id=%s", len(closed_trades), user_id)
 
         message = "<b>📜 Seus Últimos Trades Fechados</b>\n\n"
 
@@ -1217,31 +1221,53 @@ async def list_closed_trades_handler(update: Update, context: ContextTypes.DEFAU
             message += "Nenhum trade fechado encontrado no seu histórico."
         else:
             for trade in closed_trades:
-                # Define o emoji e o texto do resultado com base no status e no P/L
-                pnl = trade.closed_pnl if trade.closed_pnl is not None else 0.0
-                resultado_str = f"<b>Resultado: ${pnl:,.2f}</b>"
-                
-                emoji = "❔"
-                if trade.status == 'CLOSED_PROFIT':
-                    emoji = "🏆"
-                elif trade.status == 'CLOSED_LOSS':
-                    emoji = "🛑"
-                elif trade.status == 'CLOSED_MANUAL':
-                    emoji = "✅" if pnl >= 0 else "🔻"
-                elif trade.status == 'CLOSED_GHOST':
-                    emoji = "ℹ️"
-                    resultado_str = "<i>Fechado externamente</i>"
-
-                # Formata a data de fechamento
                 data_fechamento = trade.closed_at.strftime('%d/%m %H:%M') if trade.closed_at else 'N/A'
+
+                render_mode = "fallback_externo"
+                if trade.closed_pnl is not None:
+                    try:
+                        pnl_val = float(trade.closed_pnl)
+                        emoji = "🏆" if pnl_val >= 0 else "🛑"
+                        resultado_str = f"{emoji} <b>{'Lucro' if pnl_val >= 0 else 'Prejuízo'}: ${pnl_val:,.2f}</b>"
+                        render_mode = "via_pnl"
+                    except Exception:
+                        status_upper = (trade.status or "").upper()
+                        if "PROFIT" in status_upper:
+                            emoji, resultado_str = "🏆", "<b>Resultado:</b> lucro"
+                            render_mode = "via_status"
+                        elif "LOSS" in status_upper or "STOP" in status_upper:
+                            emoji, resultado_str = "🛑", "<b>Resultado:</b> prejuízo"
+                            render_mode = "via_status"
+                        elif "MANUAL" in status_upper:
+                            emoji, resultado_str = "✅", "<i>Fechado manualmente</i>"
+                            render_mode = "via_status"
+                        else:
+                            emoji, resultado_str = "ℹ️", "<i>Fechado externamente</i>"
+                else:
+                    status_upper = (trade.status or "").upper()
+                    if "PROFIT" in status_upper:
+                        emoji, resultado_str = "🏆", "<b>Resultado:</b> lucro"
+                        render_mode = "via_status"
+                    elif "LOSS" in status_upper or "STOP" in status_upper:
+                        emoji, resultado_str = "🛑", "<b>Resultado:</b> prejuízo"
+                        render_mode = "via_status"
+                    elif "MANUAL" in status_upper:
+                        emoji, resultado_str = "✅", "<i>Fechado manualmente</i>"
+                        render_mode = "via_status"
+                    else:
+                        emoji, resultado_str = "ℹ️", "<i>Fechado externamente</i>"
+
+                logger.debug(
+                    "[histórico:item] user_id=%s trade_id=%s symbol=%s status=%s closed_pnl=%s modo=%s",
+                    user_id, getattr(trade, "id", None), trade.symbol, trade.status, str(trade.closed_pnl), render_mode
+                )
 
                 message += (
                     f"{emoji} <b>{trade.symbol}</b> ({trade.side})\n"
                     f"  - Fechado em: {data_fechamento}\n"
                     f"  - {resultado_str}\n\n"
                 )
-        
-        # Cria um teclado com o botão para voltar ao menu de desempenho
+
         keyboard = [[InlineKeyboardButton("⬅️ Voltar ao Desempenho", callback_data='perf_today')]]
         
         await query.edit_message_text(
@@ -1249,6 +1275,8 @@ async def list_closed_trades_handler(update: Update, context: ContextTypes.DEFAU
             parse_mode='HTML',
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
+
+        logger.debug("[histórico] end user_id=%s", user_id)
 
     finally:
         db.close()
