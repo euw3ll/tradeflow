@@ -79,7 +79,10 @@ def settings_menu_keyboard(user) -> InlineKeyboardMarkup:
             InlineKeyboardButton("🚫 Disjuntor", callback_data="settings_circuit"),
             InlineKeyboardButton("✅ Whitelist", callback_data="set_coin_whitelist"),
         ],
-        [InlineKeyboardButton("🔬 Filtros de Sinais", callback_data="signal_filters_menu")],
+        [
+            InlineKeyboardButton("🔬 Filtros de Sinais", callback_data="signal_filters_menu"),
+            InlineKeyboardButton("🎯 Estratégia de TP", callback_data="show_tp_strategy"),
+        ],
         [InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data="back_to_main_menu")],
     ]
     return InlineKeyboardMarkup(kb)
@@ -244,3 +247,18 @@ def ma_timeframe_keyboard(user_settings):
     keyboard = [keyboard_buttons[i:i + 2] for i in range(0, len(keyboard_buttons), 2)]
     keyboard.append([InlineKeyboardButton("⬅️ Voltar para Filtros", callback_data='signal_filters_menu')])
     return InlineKeyboardMarkup(keyboard)
+
+def tp_strategy_menu_keyboard(user) -> InlineKeyboardMarkup:
+    """Retorna o teclado para o menu de estratégia de Take Profit."""
+    current_strategy = getattr(user, 'tp_distribution', 'EQUAL')
+    if current_strategy == 'EQUAL':
+        strategy_text = "Divisão Igual"
+    else:
+        strategy_text = f"Personalizado ({current_strategy}%)"
+
+    kb = [
+        [InlineKeyboardButton(f"Estratégia Atual: {strategy_text}", callback_data="noop")], # Botão apenas visual
+        [InlineKeyboardButton("✏️ Alterar Estratégia", callback_data="ask_tp_distribution")],
+        [InlineKeyboardButton("⬅️ Voltar para Configurações", callback_data="back_to_settings_menu")],
+    ]
+    return InlineKeyboardMarkup(kb)

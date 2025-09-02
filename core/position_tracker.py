@@ -215,14 +215,6 @@ async def check_pending_orders_for_user(application: Application, user: User, db
 async def check_active_trades_for_user(application: Application, user: User, db: Session):
     """
     Verifica e gerencia os trades ativos, com edição de mensagem para atualizações.
-    Regras:
-    - TP só é considerado 'executado' após sucesso na redução (retCode == 0).
-    - BREAK_EVEN/TRAILING_STOP podem ser ativados de duas formas:
-        (A) Padrão: após o 1º TP.
-        (B) Opcional por PnL: se user.be_trigger_pct / user.ts_trigger_pct > 0 (sem depender do 1º TP).
-    Esses campos são opcionais no modelo; se não existirem ou forem 0/None, ignora-se o gatilho por PnL.
-    - Semântica do OFF (user.is_active == False): não abre novas posições nem deixa ordens pendentes,
-      mas ESTE gerenciador continua atuando normalmente nas posições abertas.
     """
     active_trades = db.query(Trade).filter(
         Trade.user_telegram_id == user.telegram_id,
@@ -234,7 +226,6 @@ async def check_active_trades_for_user(application: Application, user: User, db:
     api_key = decrypt_data(user.api_key_encrypted)
     api_secret = decrypt_data(user.api_secret_encrypted)
 
-    # Posições ao vivo + PnL
     live_pnl_result = await get_open_positions_with_pnl(api_key, api_secret)
     if not live_pnl_result.get("success"):
         logger.warning(f"[tracker] Falha temporária ao buscar P/L para {user.telegram_id}. Ignorando ciclo.")
@@ -242,9 +233,8 @@ async def check_active_trades_for_user(application: Application, user: User, db:
 
     live_pnl_map = {p['symbol']: p for p in (live_pnl_result.get('data') or [])}
 
-    # Gatilhos opcionais por PnL (se o modelo não tiver os campos, getattr devolve 0)
-    be_trigger_pct = float(getattr(user, "be_trigger_pct", 0) or 0.0)      # ativa BE quando PnL% >= X
-    ts_trigger_pct = float(getattr(user, "ts_trigger_pct", 0) or 0.0)      # inicia TS quando PnL% >= Y
+    be_trigger_pct = float(getattr(user, "be_trigger_pct", 0) or 0.0)
+    ts_trigger_pct = float(getattr(user, "ts_trigger_pct", 0) or 0.0)
 
     for trade in active_trades:
         position_data = live_pnl_map.get(trade.symbol)
@@ -254,23 +244,20 @@ async def check_active_trades_for_user(application: Application, user: User, db:
         status_title_update = ""
         current_price = 0.0
 
-        # Cache de P/L no DB (fração, ex.: 0.015 = 1.5%)
         if position_data:
             trade.unrealized_pnl_pct = position_data.get("unrealized_pnl_frac", 0.0)
 
         if live_position_size > 0:
-            # Preço de mercado
             price_result = await get_market_price(trade.symbol)
             if not price_result.get("success"):
                 continue
             current_price = price_result["price"]
 
-            # Dados de PnL atuais (fração → % só para comparação/exibição)
             pnl_data = live_pnl_map.get(trade.symbol) or {}
             pnl_frac = float(pnl_data.get("unrealized_pnl_frac") or 0.0)
             pnl_pct = pnl_frac * 100.0
 
-            # --- STOP-GAIN por gatilho (independente de BE/TS) ---
+            # --- Lógica de STOP-GAIN (sem alterações) ---
             if (user.stop_gain_trigger_pct or 0) > 0 and not trade.is_stop_gain_active and not trade.is_breakeven:
                 if pnl_pct >= float(user.stop_gain_trigger_pct):
                     log_prefix = f"[Stop-Gain {trade.symbol}]"
@@ -283,7 +270,7 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                                      (trade.side == 'SHORT' and new_sl < (trade.current_stop_loss or float('inf')))
                     is_valid_to_set = (trade.side == 'LONG' and new_sl < current_price) or \
                                       (trade.side == 'SHORT' and new_sl > current_price)
-
+                    
                     if is_improvement and is_valid_to_set:
                         sl_result = await modify_position_stop_loss(api_key, api_secret, trade.symbol, new_sl, reason="lock")
                         if sl_result.get("success"):
@@ -295,7 +282,7 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                         else:
                             logger.error(f"{log_prefix} Falha ao mover SL (lock): {sl_result.get('error', 'desconhecido')}")
 
-            # --- TAKE PROFIT (confirmação só após redução bem-sucedida) ---
+            # --- TAKE PROFIT (com a nova lógica de distribuição) ---
             targets_executados_este_ciclo = []
             if trade.initial_targets:
                 for target_price in list(trade.initial_targets):
@@ -308,24 +295,44 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                         logger.warning(f"{trade.symbol}: total_initial_targets inválido ({trade.total_initial_targets}).")
                         continue
 
-                    qty_to_close = trade.qty / trade.total_initial_targets
-                    position_idx_to_close = 1 if trade.side == 'LONG' else 2  # em one-way a Bybit ignora
+                    # --- INÍCIO DA MODIFICAÇÃO: Lógica de Cálculo de Quantidade de TP ---
+                    qty_to_close = 0.0
+                    strategy = getattr(user, 'tp_distribution', 'EQUAL')
+                    use_equal_distribution = True
 
-                    logger.info("[tp:crossed] %s %s TP=%.4f last=%.4f -> tentando reduzir",
-                                trade.symbol, trade.side, float(target_price), float(current_price))
+                    if strategy != 'EQUAL':
+                        try:
+                            percentages = [float(p) for p in strategy.split(',')]
+                            if len(percentages) == trade.total_initial_targets:
+                                # Calcula o índice do alvo atual (0 para o primeiro, 1 para o segundo, etc.)
+                                target_index = trade.total_initial_targets - len(trade.initial_targets)
+                                current_tp_percent = percentages[target_index]
+                                # A quantidade a fechar é baseada na QUANTIDADE INICIAL TOTAL do trade
+                                qty_to_close = trade.qty * (current_tp_percent / 100.0)
+                                use_equal_distribution = False # Sucesso ao usar estratégia customizada
+                                logger.info(f"[TP Custom] {trade.symbol}: Usando {current_tp_percent}% (alvo #{target_index + 1}). Qtd: {qty_to_close}")
+                            else:
+                                logger.warning(f"[TP Custom] {trade.symbol}: Fallback para 'EQUAL'. Número de TPs do sinal ({trade.total_initial_targets}) é diferente do número de porcentagens ({len(percentages)}).")
+                        except (ValueError, IndexError) as e:
+                            logger.error(f"[TP Custom] {trade.symbol}: Fallback para 'EQUAL'. Erro ao parsear a estratégia '{strategy}': {e}")
+                    
+                    if use_equal_distribution:
+                        # Lógica original como fallback
+                        qty_to_close = trade.qty / trade.total_initial_targets
+                    # --- FIM DA MODIFICAÇÃO ---
+                    
+                    position_idx_to_close = 1 if trade.side == 'LONG' else 2
+
+                    logger.info("[tp:crossed] %s %s TP=%.4f last=%.4f -> tentando reduzir %.6f",
+                                trade.symbol, trade.side, float(target_price), float(current_price), qty_to_close)
 
                     close_result = await close_partial_position(
                         api_key, api_secret, trade.symbol, qty_to_close, trade.side, position_idx_to_close
                     )
+                    
                     if close_result.get("success"):
                         targets_executados_este_ciclo.append(target_price)
-                        try:
-                            trade.remaining_qty = (trade.remaining_qty or trade.qty) - qty_to_close
-                            if trade.remaining_qty < 0:
-                                trade.remaining_qty = 0.0
-                        except Exception:
-                            trade.remaining_qty = max(0.0, (trade.remaining_qty or 0.0) - qty_to_close)
-
+                        trade.remaining_qty = max(0.0, (trade.remaining_qty or trade.qty) - qty_to_close)
                         message_was_edited = True
                         status_title_update = "🎯 Take Profit EXECUTADO!"
                         logger.info("[tp:executed] %s %s TP=%.4f closed=%.6f remaining=%.6f",

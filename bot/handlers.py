@@ -3,7 +3,7 @@ import asyncio
 import pytz
 from database.models import PendingSignal
 from services.signal_parser import SignalType
-from services.bybit_service import place_limit_order, get_account_info, cancel_order 
+from services.bybit_service import get_account_info, cancel_order 
 from datetime import datetime, time, timedelta 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes, ConversationHandler
@@ -15,11 +15,10 @@ from .keyboards import (
     dashboard_menu_keyboard, settings_menu_keyboard, view_targets_keyboard, 
     bot_config_keyboard, performance_menu_keyboard, confirm_manual_close_keyboard,
     signal_filters_keyboard, ma_timeframe_keyboard, risk_menu_keyboard,
-    stopgain_menu_keyboard, circuit_menu_keyboard,
-    )
+    stopgain_menu_keyboard, circuit_menu_keyboard, tp_strategy_menu_keyboard
+)
 from utils.security import encrypt_data, decrypt_data
 from services.bybit_service import (
-    get_open_positions, 
     get_account_info, 
     close_partial_position, 
     get_open_positions_with_pnl,
@@ -31,7 +30,6 @@ from core.trade_manager import _execute_trade, _execute_limit_order_for_user
 from core.performance_service import generate_performance_report
 from services.currency_service import get_usd_to_brl_rate
 from sqlalchemy.sql import func
-from core.whitelist_service import CATEGORIES
 
 # Estados para as conversas
 (WAITING_CODE, WAITING_API_KEY, WAITING_API_SECRET, CONFIRM_REMOVE_API) = range(4)
@@ -40,10 +38,8 @@ from core.whitelist_service import CATEGORIES
 ASKING_STOP_GAIN_TRIGGER, ASKING_STOP_GAIN_LOCK = range(16, 18)
 ASKING_CIRCUIT_THRESHOLD, ASKING_CIRCUIT_PAUSE = range(18, 20)
 ASKING_COIN_WHITELIST = 15
-(
-    ASKING_MA_PERIOD, ASKING_MA_TIMEFRAME,
-    ASKING_RSI_OVERSOLD, ASKING_RSI_OVERBOUGHT
-) = range(20, 24)
+(ASKING_MA_PERIOD, ASKING_MA_TIMEFRAME, ASKING_RSI_OVERSOLD, ASKING_RSI_OVERBOUGHT) = range(20, 24)
+ASKING_TP_DISTRIBUTION = 25
 
 logger = logging.getLogger(__name__)
 
@@ -1799,4 +1795,106 @@ async def back_from_whitelist_handler(update: Update, context: ContextTypes.DEFA
     """Sai do estado de edição da Whitelist e volta ao menu de Configurações."""
     # reaproveita o handler existente para renderizar o menu
     await back_to_settings_menu_handler(update, context)
+    return ConversationHandler.END
+
+async def show_tp_strategy_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Exibe o menu de configuração da estratégia de TP."""
+    query = update.callback_query
+    await query.answer()
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.telegram_id == query.from_user.id).first()
+        if not user:
+            await query.edit_message_text("Não encontrei seu usuário.")
+            return
+
+        header = (
+            "🎯 **Estratégia de Take Profit**\n\n"
+            "Defina como o bot deve distribuir o fechamento da sua posição entre os alvos de um sinal."
+        )
+        await query.edit_message_text(
+            text=header,
+            reply_markup=tp_strategy_menu_keyboard(user),
+            parse_mode="Markdown",
+        )
+    finally:
+        db.close()
+
+async def ask_tp_distribution(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Pergunta ao usuário a nova distribuição de TP."""
+    query = update.callback_query
+    await query.answer()
+    
+    context.user_data['settings_message_id'] = query.message.message_id
+    
+    text = (
+        "**Como você quer distribuir seus Take Profits?**\n\n"
+        "1. **Divisão Igual (Padrão)**\n"
+        "   - O bot divide o volume total igualmente por todos os alvos.\n"
+        "   - Para usar, digite: `igual`\n\n"
+        "2. **Distribuição Personalizada**\n"
+        "   - Você define a porcentagem a ser fechada em cada alvo.\n"
+        "   - A soma deve ser 100%.\n"
+        "   - Exemplo para um sinal com 3 alvos: `50, 30, 20`\n\n"
+        "Envie sua nova estratégia."
+    )
+    await query.edit_message_text(text, parse_mode="Markdown")
+    return ASKING_TP_DISTRIBUTION
+
+async def receive_tp_distribution(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Recebe, valida e salva a nova estratégia de TP."""
+    user_id = update.effective_user.id
+    message_id_to_edit = context.user_data.get('settings_message_id')
+    user_input = (update.message.text or "").strip()
+
+    await update.message.delete()
+    
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter_by(telegram_id=user_id).first()
+        if not user:
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text="Usuário não encontrado.")
+            return ConversationHandler.END
+
+        if user_input.lower() == 'igual':
+            user.tp_distribution = 'EQUAL'
+            db.commit()
+            feedback_text = "✅ Estratégia de TP atualizada para **Divisão Igual**."
+        else:
+            try:
+                percentages = [float(p.strip()) for p in user_input.replace('%', '').split(',')]
+                if not all(p > 0 for p in percentages):
+                    raise ValueError("Porcentagens devem ser positivas.")
+                if sum(percentages) != 100:
+                    raise ValueError(f"A soma das porcentagens deve ser 100, mas foi {sum(percentages)}.")
+                
+                # Salva a string limpa no banco
+                distribution_str = ",".join(map(str, percentages))
+                user.tp_distribution = distribution_str
+                db.commit()
+                feedback_text = f"✅ Estratégia de TP salva: **{distribution_str}%**."
+            except (ValueError, TypeError) as e:
+                await context.bot.edit_message_text(
+                    chat_id=update.effective_chat.id,
+                    message_id=message_id_to_edit,
+                    text=f"❌ **Entrada inválida:** {e}\n\nPor favor, tente novamente. Ex: `50,30,20` ou `igual`",
+                    parse_mode="Markdown"
+                )
+                return ASKING_TP_DISTRIBUTION # Mantém o usuário na conversa para tentar de novo
+
+        # Se chegou aqui, a entrada foi válida e salva.
+        header = (
+            "🎯 **Estratégia de Take Profit**\n\n"
+            f"{feedback_text}"
+        )
+        await context.bot.edit_message_text(
+            chat_id=update.effective_chat.id,
+            message_id=message_id_to_edit,
+            text=header,
+            reply_markup=tp_strategy_menu_keyboard(user),
+            parse_mode="Markdown"
+        )
+    finally:
+        db.close()
+        
     return ConversationHandler.END

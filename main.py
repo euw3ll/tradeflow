@@ -36,7 +36,8 @@ from bot.handlers import (
     ask_rsi_oversold, receive_rsi_oversold, ASKING_RSI_OVERSOLD,
     ask_rsi_overbought, receive_rsi_overbought, ASKING_RSI_OVERBOUGHT,
     show_risk_menu_handler, show_stopgain_menu_handler, show_circuit_menu_handler,
-    back_to_settings_menu_handler, back_from_whitelist_handler
+    back_to_settings_menu_handler, back_from_whitelist_handler,
+    show_tp_strategy_menu_handler, ask_tp_distribution, receive_tp_distribution, ASKING_TP_DISTRIBUTION
 )
 from services.telethon_service import start_signal_monitor
 from core.position_tracker import run_tracker
@@ -147,7 +148,7 @@ async def main():
     },
     fallbacks=[CommandHandler("cancel", cancel)],
     per_message=False, per_user=True,
-)
+    )
     stop_gain_trigger_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(ask_stop_gain_trigger, pattern='^set_stop_gain_trigger$')],
         states={ ASKING_STOP_GAIN_TRIGGER: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_stop_gain_trigger)] },
@@ -182,6 +183,14 @@ async def main():
         entry_points=[CallbackQueryHandler(ask_rsi_overbought, pattern='^set_rsi_overbought$')],
         states={ ASKING_RSI_OVERBOUGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_rsi_overbought)] },
         fallbacks=[CommandHandler("cancel", cancel)], per_message=False, per_user=True,
+    )
+    tp_distribution_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(ask_tp_distribution, pattern='^ask_tp_distribution$')],
+        states={
+            ASKING_TP_DISTRIBUTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_tp_distribution)]
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        per_message=False, per_user=True,
     )
 
     # Adicionando todos os handlers
@@ -238,11 +247,13 @@ async def main():
     application.add_handler(CallbackQueryHandler(set_ma_timeframe, pattern='^set_ma_timeframe_'))
     application.add_handler(rsi_oversold_conv)
     application.add_handler(rsi_overbought_conv)
+    application.add_handler(tp_distribution_conv)
 
     application.add_handler(CallbackQueryHandler(show_risk_menu_handler, pattern='^settings_risk$'))
     application.add_handler(CallbackQueryHandler(show_stopgain_menu_handler, pattern='^settings_stopgain$'))
     application.add_handler(CallbackQueryHandler(show_circuit_menu_handler, pattern='^settings_circuit$'))
     application.add_handler(CallbackQueryHandler(back_to_settings_menu_handler, pattern='^back_to_settings_menu$'))
+    application.add_handler(CallbackQueryHandler(show_tp_strategy_menu_handler, pattern='^show_tp_strategy$'))
 
     application.add_error_handler(on_error)
 
