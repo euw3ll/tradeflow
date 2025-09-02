@@ -15,10 +15,6 @@ __pycache__/
 *.db
 *.db-journal*
 
-# Arquivo de Sessão do Telethon
-*.session
-*.session-journal
-
 # Arquivos do VSCode
 .vscode/tradeflow.db
 *.db-journal
