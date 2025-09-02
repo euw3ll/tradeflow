@@ -605,7 +605,7 @@ async def run_tracker(application: Application):
         finally:
             db.close()
 
-        await asyncio.sleep(60)
+        await asyncio.sleep(15)
 
 async def notify_sync_status(application, user, trade, text: Optional[str] = None) -> None:
     """
