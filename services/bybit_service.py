@@ -247,14 +247,11 @@ async def place_order(api_key: str, api_secret: str, signal_data: dict, user_set
     """Abre uma nova posição a mercado (Market) com validação completa, incluindo verificação de SL contra o preço atual."""
     symbol = signal_data['coin']
     
-    # --- NOVA VERIFICAÇÃO DE PRÉ-VOO ---
-    # Buscamos o preço de mercado ANTES de qualquer outra coisa
     price_check = await get_market_price(symbol)
     if not price_check.get("success"):
         return {"success": False, "error": f"Não foi possível obter o preço de mercado atual para {symbol}."}
     current_market_price = Decimal(str(price_check["price"]))
     
-    # Validamos o Stop Loss do sinal contra o preço atual
     side = "Buy" if (signal_data.get('order_type') or '').upper() == 'LONG' else "Sell"
     stop_loss_price = Decimal(str(signal_data.get('stop_loss')))
 
@@ -263,7 +260,6 @@ async def place_order(api_key: str, api_secret: str, signal_data: dict, user_set
     if side == 'Sell' and stop_loss_price <= current_market_price:
         return {"success": False, "error": f"Stop Loss ({stop_loss_price}) inválido para SHORT. Deve ser maior que o preço atual ({current_market_price})."}
     
-    # Se a validação passou, continuamos para a lógica de execução síncrona
     async def pre_flight_checks():
         if symbol not in INSTRUMENT_INFO_CACHE: await get_instrument_info(symbol)
         return INSTRUMENT_INFO_CACHE.get(symbol)
@@ -275,8 +271,6 @@ async def place_order(api_key: str, api_secret: str, signal_data: dict, user_set
 
             session = get_session(api_key, api_secret)
             leverage = Decimal(str(user_settings.max_leverage))
-            
-            # Usamos o preço de mercado que acabamos de buscar para o cálculo
             entry_price = current_market_price
             
             margin_in_dollars = Decimal(str(balance)) * (Decimal(str(user_settings.entry_size_percent)) / Decimal("100"))
@@ -292,10 +286,20 @@ async def place_order(api_key: str, api_secret: str, signal_data: dict, user_set
             if final_notional_value < instrument_rules["minNotionalValue"]:
                 return {"success": False, "error": f"Valor total da ordem (${final_notional_value:.2f}) é menor que o mínimo permitido de ${instrument_rules['minNotionalValue']:.2f}."}
             
+            # --- INÍCIO DA MODIFICAÇÃO: Lógica de Take Profit Condicional ---
+            all_targets = signal_data.get('targets') or []
+            
             payload = {
                 "category": "linear", "symbol": symbol, "side": side, "orderType": "Market", "qty": str(qty_adj),
-                "takeProfit": str((signal_data.get('targets') or [None])[0]), "stopLoss": str(stop_loss_price),
+                "stopLoss": str(stop_loss_price),
             }
+
+            # Só enviamos o takeProfit para a Bybit se houver EXATAMENTE UM alvo.
+            # Se houver múltiplos (ou nenhum), o bot irá gerenciá-los via position_tracker.
+            if len(all_targets) == 1:
+                payload["takeProfit"] = str(all_targets[0])
+            # --- FIM DA MODIFICAÇÃO ---
+
             try:
                 session.set_leverage(category="linear", symbol=symbol, buyLeverage=str(leverage), sellLeverage=str(leverage))
             except InvalidRequestError as e:
@@ -306,7 +310,6 @@ async def place_order(api_key: str, api_secret: str, signal_data: dict, user_set
             response = session.place_order(**{k: v for k, v in payload.items() if v is not None})
             if response.get('retCode') == 0: return {"success": True, "data": response['result']}
             return {"success": False, "error": response.get('retMsg')}
-      
         except Exception as e:
             logger.error(f"Exceção ao abrir ordem (Market): {e}", exc_info=True)
             return {"success": False, "error": str(e)}
@@ -317,7 +320,6 @@ async def place_order(api_key: str, api_secret: str, signal_data: dict, user_set
     except Exception as e:
         logger.error(f"Exceção em place_order (async): {e}", exc_info=True)
         return {"success": False, "error": str(e)}
-
 
 async def get_market_price(symbol: str) -> dict:
     """Busca o preço de mercado atual de forma assíncrona."""
@@ -736,25 +738,30 @@ async def place_limit_order(api_key: str, api_secret: str, signal_data: dict, us
             if final_notional_value < instrument_rules["minNotionalValue"]:
                 return {"success": False, "error": f"Valor total da ordem (${final_notional_value:.2f}) é menor que o mínimo permitido de ${instrument_rules['minNotionalValue']:.2f}."}
 
-            # --- Ajuste de TP/SL ao tick do instrumento ---
-            tp_raw = (signal_data.get('targets') or [None])[0]
+            # --- INÍCIO DA MODIFICAÇÃO: Lógica de Take Profit e Stop Loss Condicional ---
+            all_targets = signal_data.get('targets') or []
             sl_raw = signal_data.get('stop_loss')
-
-            take_profit_adj = None
-            if tp_raw is not None:
-                take_profit_adj = _round_down_to_tick(Decimal(str(tp_raw)), tick)
-
-            stop_loss_adj = None
-            if sl_raw is not None:
-                stop_loss_adj = _round_down_to_tick(Decimal(str(sl_raw)), tick)
 
             payload = {
                 "category": "linear", "symbol": symbol, "side": side,
                 "orderType": "Limit", "qty": str(qty_adj), "price": str(price_adj),
-                "takeProfit": str(take_profit_adj) if take_profit_adj is not None else None,
-                "stopLoss": str(stop_loss_adj) if stop_loss_adj is not None else None,
             }
 
+            # Adiciona TP apenas se houver EXATAMENTE UM alvo.
+            if len(all_targets) == 1:
+                tp_adj = _round_down_to_tick(Decimal(str(all_targets[0])), tick)
+                payload["takeProfit"] = str(tp_adj)
+
+            # Adiciona SL se existir no sinal, com arredondamento correto por lado.
+            if sl_raw is not None:
+                sl_decimal = Decimal(str(sl_raw))
+                if side == "Buy":  # LONG, SL é mais baixo
+                    sl_adj = _round_down_to_tick(sl_decimal, tick)
+                else:  # SHORT, SL é mais alto
+                    sl_adj = _round_up_to_tick(sl_decimal, tick)
+                payload["stopLoss"] = str(sl_adj)
+            # --- FIM DA MODIFICAÇÃO ---
+            
             try:
                 session.set_leverage(category="linear", symbol=symbol, buyLeverage=str(leverage), sellLeverage=str(leverage))
             except InvalidRequestError as e:

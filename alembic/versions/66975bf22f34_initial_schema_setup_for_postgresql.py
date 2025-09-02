@@ -1,8 +1,8 @@
-"""versao_inicial_do_projeto
+"""initial schema setup for postgresql
 
-Revision ID: c19acb6f35e0
+Revision ID: 66975bf22f34
 Revises: 
-Create Date: 2025-08-26 17:47:42.959909
+Create Date: 2025-09-02 02:47:32.789919
 
 """
 from typing import Sequence, Union
@@ -12,7 +12,7 @@ import sqlalchemy as sa
 
 
 # revision identifiers, used by Alembic.
-revision: str = 'c19acb6f35e0'
+revision: str = '66975bf22f34'
 down_revision: Union[str, Sequence[str], None] = None
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
@@ -57,7 +57,7 @@ def upgrade() -> None:
     sa.Column('source_name', sa.String(), nullable=True),
     sa.Column('signal_data', sa.JSON(), nullable=False),
     sa.Column('approval_message_id', sa.BigInteger(), nullable=True),
-    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('(CURRENT_TIMESTAMP)'), nullable=True),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=True),
     sa.PrimaryKeyConstraint('id')
     )
     op.create_index(op.f('ix_signals_for_approval_user_telegram_id'), 'signals_for_approval', ['user_telegram_id'], unique=False)
@@ -76,13 +76,15 @@ def upgrade() -> None:
     sa.Column('total_initial_targets', sa.Integer(), nullable=True),
     sa.Column('status', sa.String(), nullable=True),
     sa.Column('remaining_qty', sa.Float(), nullable=True),
-    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('(CURRENT_TIMESTAMP)'), nullable=True),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=True),
     sa.Column('closed_at', sa.DateTime(timezone=True), nullable=True),
     sa.Column('closed_pnl', sa.Float(), nullable=True),
     sa.Column('is_breakeven', sa.Boolean(), nullable=False),
     sa.Column('trail_high_water_mark', sa.Float(), nullable=True),
     sa.Column('is_stop_gain_active', sa.Boolean(), nullable=False),
     sa.Column('unrealized_pnl_pct', sa.Float(), nullable=True),
+    sa.Column('missing_cycles', sa.Integer(), nullable=False),
+    sa.Column('last_seen_at', sa.DateTime(timezone=True), nullable=True),
     sa.PrimaryKeyConstraint('id'),
     sa.UniqueConstraint('order_id')
     )
@@ -108,6 +110,13 @@ def upgrade() -> None:
     sa.Column('long_trades_paused_until', sa.DateTime(timezone=True), nullable=True),
     sa.Column('short_trades_paused_until', sa.DateTime(timezone=True), nullable=True),
     sa.Column('is_sleep_mode_enabled', sa.Boolean(), nullable=False),
+    sa.Column('is_ma_filter_enabled', sa.Boolean(), nullable=False),
+    sa.Column('ma_period', sa.Integer(), nullable=False),
+    sa.Column('ma_timeframe', sa.String(length=10), nullable=False),
+    sa.Column('is_rsi_filter_enabled', sa.Boolean(), nullable=False),
+    sa.Column('rsi_timeframe', sa.String(length=10), nullable=False),
+    sa.Column('rsi_oversold_threshold', sa.Integer(), nullable=False),
+    sa.Column('rsi_overbought_threshold', sa.Integer(), nullable=False),
     sa.PrimaryKeyConstraint('id')
     )
     op.create_index(op.f('ix_users_telegram_id'), 'users', ['telegram_id'], unique=True)

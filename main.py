@@ -38,7 +38,6 @@ from bot.handlers import (
     show_risk_menu_handler, show_stopgain_menu_handler, show_circuit_menu_handler,
     back_to_settings_menu_handler, back_from_whitelist_handler
 )
-from database.session import init_db
 from services.telethon_service import start_signal_monitor
 from core.position_tracker import run_tracker
 
@@ -81,7 +80,6 @@ async def on_error(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def main():
     """Configura os handlers e inicia o PTB e o Telethon em paralelo."""
-    init_db()
     comm_queue = asyncio.Queue()
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     await comm_queue.put(application)
