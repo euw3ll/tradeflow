@@ -770,15 +770,23 @@ async def execute_manual_close_handler(update: Update, context: ContextTypes.DEF
         price_result = await get_market_price(trade_to_close.symbol)
         current_price = price_result["price"] if price_result.get("success") else trade_to_close.entry_price
 
+        # Quantidade a fechar: usa restante se existir; caso contrário, a total
+        qty_to_close = trade_to_close.remaining_qty if trade_to_close.remaining_qty is not None else trade_to_close.qty
+        # Define o índice da posição conforme o lado (1 = LONG/Buy, 2 = SHORT/Sell)
+        position_idx_to_close = 1 if (trade_to_close.side or "").upper() == 'LONG' else 2
+
         close_result = await close_partial_position(
-            api_key, api_secret, 
-            trade_to_close.symbol, 
-            trade_to_close.remaining_qty, 
-            trade_to_close.side
+            api_key,
+            api_secret,
+            trade_to_close.symbol,
+            qty_to_close,
+            trade_to_close.side,
+            position_idx_to_close,
         )
 
         if close_result.get("success"):
-            pnl = (current_price - trade_to_close.entry_price) * trade_to_close.remaining_qty if trade_to_close.side == 'LONG' else (trade_to_close.entry_price - current_price) * trade_to_close.remaining_qty
+            pnl_qty = qty_to_close
+            pnl = (current_price - trade_to_close.entry_price) * pnl_qty if trade_to_close.side == 'LONG' else (trade_to_close.entry_price - current_price) * pnl_qty
 
             trade_to_close.status = 'CLOSED_MANUAL'
             trade_to_close.closed_at = func.now()
