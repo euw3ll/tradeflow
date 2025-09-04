@@ -28,6 +28,7 @@ from bot.handlers import (
     ask_coin_whitelist, receive_coin_whitelist, ASKING_COIN_WHITELIST,
     performance_menu_handler, list_closed_trades_handler,
     prompt_manual_close_handler, execute_manual_close_handler,
+    open_settings_root_handler, notifications_settings_handler, refresh_active_messages_handler, open_information_handler,
     toggle_bot_status_handler,
     ask_stop_gain_trigger, receive_stop_gain_trigger, ASKING_STOP_GAIN_TRIGGER,
     ask_stop_gain_lock, receive_stop_gain_lock, ASKING_STOP_GAIN_LOCK,
@@ -230,6 +231,9 @@ async def main():
     application.add_handler(CallbackQueryHandler(back_to_admin_menu_handler, pattern='^back_to_admin_menu$'))
 
     application.add_handler(CommandHandler("start", start))
+    # Menus principais do /start consolidado
+    application.add_handler(CallbackQueryHandler(open_settings_root_handler, pattern='^open_settings_root$'))
+    application.add_handler(CallbackQueryHandler(open_information_handler, pattern='^open_info$'))
     # Fluxo para usuários sem convite
     application.add_handler(CallbackQueryHandler(show_no_invite_info_handler, pattern='^no_invite_info$'))
     application.add_handler(CallbackQueryHandler(back_to_invite_welcome_handler, pattern='^back_to_invite_welcome$'))
@@ -250,6 +254,9 @@ async def main():
 
     application.add_handler(CallbackQueryHandler(bot_config_handler, pattern='^bot_config$'))
     application.add_handler(CallbackQueryHandler(toggle_approval_mode_handler, pattern='^toggle_approval_mode$'))
+    # Notificações
+    application.add_handler(CallbackQueryHandler(notifications_settings_handler, pattern='^notifications_settings$'))
+    application.add_handler(CallbackQueryHandler(refresh_active_messages_handler, pattern='^refresh_active_messages$'))
 
     application.add_handler(CallbackQueryHandler(handle_signal_approval, pattern=r'^(approve_signal_|reject_signal_)'))
 

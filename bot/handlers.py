@@ -6,6 +6,7 @@ from services.signal_parser import SignalType
 from services.bybit_service import get_account_info, cancel_order 
 from datetime import datetime, time, timedelta 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+import subprocess
 from telegram.ext import ContextTypes, ConversationHandler
 from telegram.error import BadRequest
 from database.session import SessionLocal
@@ -18,6 +19,7 @@ from .keyboards import (
     stopgain_menu_keyboard, circuit_menu_keyboard, tp_strategy_menu_keyboard,
     invite_welcome_keyboard, invite_info_keyboard,
     onboarding_risk_keyboard, onboarding_terms_keyboard,
+    settings_root_keyboard, notifications_menu_keyboard, info_menu_keyboard,
 )
 from utils.security import encrypt_data, decrypt_data
 from services.bybit_service import (
@@ -160,6 +162,121 @@ async def back_to_main_menu_handler(update: Update, context: ContextTypes.DEFAUL
         "Menu Principal:",
         reply_markup=main_menu_keyboard(telegram_id=update.effective_user.id)
     )
+
+async def open_settings_root_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Abre o menu raiz de Configurações consolidado."""
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        text="⚙️ Configurações",
+        reply_markup=settings_root_keyboard()
+    )
+
+async def notifications_settings_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Abre a seção de Configurações de Notificações."""
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        text=(
+            "🔔 <b>Configurações de Notificações</b>\n\n"
+            "Se você apagou o chat com o bot e perdeu as mensagens ativas, use a opção abaixo para recriá-las."
+        ),
+        parse_mode='HTML',
+        reply_markup=notifications_menu_keyboard()
+    )
+
+async def refresh_active_messages_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Apaga (se existir) e recria as mensagens ativas de trades para este usuário."""
+    query = update.callback_query
+    await query.answer("Recriando mensagens...")
+    user_id = update.effective_user.id
+    db = SessionLocal()
+    recreated = 0
+    try:
+        active_trades = db.query(Trade).filter(
+            Trade.user_telegram_id == user_id,
+            ~Trade.status.like('%CLOSED%')
+        ).all()
+
+        for t in active_trades:
+            # Tenta apagar a mensagem antiga, se houver
+            if t.notification_message_id:
+                try:
+                    await context.bot.delete_message(chat_id=user_id, message_id=t.notification_message_id)
+                except BadRequest:
+                    pass
+                except Exception:
+                    pass
+
+            # Envia uma nova mensagem "viva" para ser atualizada pelo tracker
+            base_lines = [
+                f"🚀 <b>{t.symbol}</b> ({t.side})",
+                f"Entrada: ${float(t.entry_price or 0):,.4f}",
+                "Atualizações do trade serão exibidas aqui.",
+            ]
+            sent = await context.bot.send_message(chat_id=user_id, text="\n".join(base_lines), parse_mode='HTML')
+            t.notification_message_id = sent.message_id
+            db.commit()
+            recreated += 1
+
+        await query.edit_message_text(
+            text=(f"✅ Mensagens ativas recriadas: {recreated}." if recreated > 0 else
+                  "ℹ️ Não há trades ativos para recriar mensagens."),
+            reply_markup=notifications_menu_keyboard()
+        )
+    except Exception as e:
+        logger.error(f"Erro ao recriar mensagens ativas: {e}", exc_info=True)
+        await query.edit_message_text("❌ Ocorreu um erro ao recriar as mensagens.", reply_markup=notifications_menu_keyboard())
+    finally:
+        db.close()
+
+async def open_information_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Mostra a seção 'Informações' com última atualização e explicações."""
+    query = update.callback_query
+    await query.answer()
+
+    async def _fetch_git_info():
+        try:
+            def _run():
+                msg = subprocess.check_output(["git", "log", "-1", "--pretty=%B"], text=True).strip()
+                date = subprocess.check_output(["git", "log", "-1", "--date=iso-local", "--pretty=%cd"], text=True).strip()
+                short = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], text=True).strip()
+                return msg, date, short
+            return await asyncio.to_thread(_run)
+        except Exception:
+            return None
+
+    git_info = await _fetch_git_info()
+    commit_subject = "Não disponível"
+    commit_body = ""
+    commit_date = "—"
+    commit_hash = "—"
+    if git_info:
+        full_msg, commit_date, commit_hash = git_info
+        lines = (full_msg or "").splitlines()
+        commit_subject = lines[0] if lines else "(sem mensagem)"
+        commit_body = "\n".join(lines[1:]).strip()
+
+    info_text = (
+        "<b>ℹ️ Informações</b>\n\n"
+        "<b>Última atualização</b>\n"
+        f"• Data: {commit_date}\n"
+        f"• Commit: {commit_subject} ({commit_hash})\n"
+        + (f"• Descrição:\n<code>{commit_body}</code>\n\n" if commit_body else "\n") +
+        "<b>Como funciona o bot</b>\n\n"
+        "1) <b>Coleta de sinais</b>: monitoramos canais selecionados e padronizamos os sinais.\n"
+        "2) <b>Filtros</b>: MA/RSI, whitelist de moedas e confiança mínima.\n"
+        "3) <b>Risco</b>: tamanho de entrada (%), alavancagem máxima, metas diárias.\n"
+        "4) <b>Execução</b>: ordens a mercado ou limite, SL validado e TPs gerenciados.\n"
+        "5) <b>Gestão</b>: Stop‑Gain (Breakeven/Trailing), disjuntor e pausas.\n"
+        "6) <b>Fechamento</b>: por alvo, stop, manual ou externo — tudo logado.\n\n"
+        "<b>Glossário rápido</b>\n"
+        "• <b>Stop Loss</b>: preço que encerra a posição para limitar perdas.\n"
+        "• <b>Take Profit</b>: preço(s) de realização parcial/total de lucro.\n"
+        "• <b>Status</b>: ACTIVE, CLOSED_PROFIT, CLOSED_LOSS, CLOSED_MANUAL, CLOSED_EXTERNALLY.\n"
+    )
+
+    await query.edit_message_text(info_text, parse_mode='HTML', reply_markup=info_menu_keyboard())
 
 # --- FLUXO DE CONFIGURAÇÃO DE API ---
 async def config_api(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -562,7 +679,7 @@ async def user_dashboard_handler(update: Update, context: ContextTypes.DEFAULT_T
         brl_rate_task = get_usd_to_brl_rate()
         account_info, brl_rate = await asyncio.gather(account_info_task, brl_rate_task)
 
-        message = "<b>Meu Painel Financeiro</b> 📊\n\n"
+        message = "💼 <b>Meu Painel Financeiro</b>\n\n"
         
         if account_info.get("success"):
             balance_data = account_info.get("data", {})

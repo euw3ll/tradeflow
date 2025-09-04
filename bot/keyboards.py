@@ -2,26 +2,12 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from database.crud import get_user_by_id
 
 def main_menu_keyboard(telegram_id: int):
-    """
-    Retorna o teclado do menu principal de forma inteligente,
-    verificando o status do usuário diretamente no banco de dados.
-    """
-    user = get_user_by_id(telegram_id)
-    has_api_keys = user and user.api_key_encrypted is not None
-
-    keyboard = []
-    if has_api_keys:
-        keyboard.append([InlineKeyboardButton("ℹ️ Meu Painel", callback_data='user_dashboard')])
-        keyboard.append([InlineKeyboardButton("📊 Minhas Posições", callback_data='user_positions')])
-        
-        # --- BOTÃO ADICIONADO AQUI ---
-        keyboard.append([InlineKeyboardButton("📈 Desempenho", callback_data='perf_today')])
-        
-        keyboard.append([InlineKeyboardButton("⚙️ Configurações de Trade", callback_data='user_settings')])
-        keyboard.append([InlineKeyboardButton("🤖 Configuração do Bot", callback_data='bot_config')])
-    else:
-        keyboard.append([InlineKeyboardButton("⚙️ Configurar API Bybit", callback_data='config_api')])
-
+    """Menu inicial simplificado: Configurações e Informações."""
+    # Independente do status de API, exibimos o menu consolidado de início
+    keyboard = [
+        [InlineKeyboardButton("⚙️ Configurações", callback_data='open_settings_root')],
+        [InlineKeyboardButton("ℹ️ Informações", callback_data='open_info')],
+    ]
     return InlineKeyboardMarkup(keyboard)
 
 def invite_welcome_keyboard():
@@ -298,5 +284,30 @@ def onboarding_terms_keyboard():
     kb = [
         [InlineKeyboardButton("✅ Li e concordo", callback_data='onboard_accept_terms')],
         [InlineKeyboardButton("❌ Cancelar", callback_data='onboard_decline_terms')],
+    ]
+    return InlineKeyboardMarkup(kb)
+
+def settings_root_keyboard() -> InlineKeyboardMarkup:
+    """Menu raiz de Configurações agrupando seções."""
+    kb = [
+        [InlineKeyboardButton("⚙️ Configurações de Trade", callback_data='user_settings')],
+        [InlineKeyboardButton("🤖 Configuração do Bot", callback_data='bot_config')],
+        [InlineKeyboardButton("🔔 Configurações de Notificações", callback_data='notifications_settings')],
+        [InlineKeyboardButton("⬅️ Voltar", callback_data='back_to_main_menu')],
+    ]
+    return InlineKeyboardMarkup(kb)
+
+def notifications_menu_keyboard() -> InlineKeyboardMarkup:
+    """Menu de Configurações de Notificações."""
+    kb = [
+        [InlineKeyboardButton("♻️ Recriar mensagens ativas", callback_data='refresh_active_messages')],
+        [InlineKeyboardButton("⬅️ Voltar", callback_data='open_settings_root')],
+    ]
+    return InlineKeyboardMarkup(kb)
+
+def info_menu_keyboard() -> InlineKeyboardMarkup:
+    """Menu para a seção Informações (apenas voltar)."""
+    kb = [
+        [InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data='back_to_main_menu')],
     ]
     return InlineKeyboardMarkup(kb)
