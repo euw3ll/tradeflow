@@ -251,10 +251,17 @@ async def open_information_handler(update: Update, context: ContextTypes.DEFAULT
     if git_info:
         full_msg, commit_date, commit_hash = git_info
     else:
-        # Fallback 1: variáveis de ambiente
-        full_msg = os.getenv("BUILD_MESSAGE", "")
-        commit_date = os.getenv("BUILD_DATE", "")
-        commit_hash = os.getenv("BUILD_COMMIT", "")
+        # Fallback 1: variáveis de ambiente (suporte amplo a nomes comuns em CI)
+        def first_env(*keys, default=""):
+            for k in keys:
+                v = os.getenv(k)
+                if v:
+                    return v
+            return default
+
+        full_msg = first_env("BUILD_MESSAGE", "GIT_COMMIT_MSG", "VERCEL_GIT_COMMIT_MESSAGE", default="")
+        commit_date = first_env("BUILD_DATE", "GIT_COMMIT_DATE", "VERCEL_GIT_COMMIT_DATE", default="")
+        commit_hash = first_env("BUILD_COMMIT", "GIT_COMMIT", "GIT_SHA", "GIT_COMMIT_SHA", "GITHUB_SHA", "VERCEL_GIT_COMMIT_SHA", default="")
         # Fallback 2: arquivo COMMIT_INFO (opcional, 3 linhas: hash, date, message...)
         if not any([full_msg, commit_date, commit_hash]):
             try:
@@ -285,18 +292,40 @@ async def open_information_handler(update: Update, context: ContextTypes.DEFAULT
         bot_state = "Ativo" if user.is_active else "Pausado"
         sleep = " (Modo Dormir)" if (user.is_active and user.is_sleep_mode_enabled) else ""
         approval = "Manual 👋" if str(user.approval_mode).upper() == 'MANUAL' else "Automático ⚡"
-        risk = f"{float(user.entry_size_percent or 0):.1f}% @ {int(user.max_leverage or 0)}x"
-        stopgain = f"gatilho {float(user.stop_gain_trigger_pct or 0):.2f}% / trava {float(user.stop_gain_lock_pct or 0):.2f}%"
+        risk = f"{float(user.entry_size_percent or 0):.1f}% @ {int(user.max_leverage or 0)}x (conf. mín. {float(user.min_confidence or 0):.0f}%)"
+        stop_strategy = (getattr(user, 'stop_strategy', '') or '').upper()
+        stop_strategy_label = "Breakeven" if stop_strategy.startswith('BREAKEVEN') or stop_strategy.startswith('BREAK') else "Trailing"
+        stopgain = f"{stop_strategy_label} • gatilho {float(user.stop_gain_trigger_pct or 0):.2f}% / trava {float(user.stop_gain_lock_pct or 0):.2f}%"
         filters = []
         if getattr(user, 'is_ma_filter_enabled', False): filters.append("MA")
         if getattr(user, 'is_rsi_filter_enabled', False): filters.append("RSI")
         filters_text = ", ".join(filters) if filters else "Nenhum"
+        whitelist = getattr(user, 'coin_whitelist', '') or 'todas'
+        tp_distribution = getattr(user, 'tp_distribution', 'EQUAL')
+        be_trg = float(getattr(user, 'be_trigger_pct', 0) or 0)
+        ts_trg = float(getattr(user, 'ts_trigger_pct', 0) or 0)
+        ma_period = int(getattr(user, 'ma_period', 0) or 0)
+        ma_timeframe = str(getattr(user, 'ma_timeframe', '60') or '60')
+        rsi_overbought = int(getattr(user, 'rsi_overbought_threshold', 0) or 0)
+        rsi_oversold = int(getattr(user, 'rsi_oversold_threshold', 0) or 0)
+        daily_p = float(getattr(user, 'daily_profit_target', 0) or 0)
+        daily_l = float(getattr(user, 'daily_loss_limit', 0) or 0)
+        circuit_th = int(getattr(user, 'circuit_breaker_threshold', 0) or 0)
+        circuit_pause = int(getattr(user, 'circuit_breaker_pause_minutes', 0) or 0)
+        bybit_link = "Conectado ✅" if getattr(user, 'api_key_encrypted', None) else "Não conectado ❌"
+
         status_lines += [
             f"• 🤖 Bot: <b>{bot_state}{sleep}</b>",
             f"• 🧭 Aprovação: <b>{approval}</b>",
+            f"• 🔗 Bybit: <b>{bybit_link}</b>",
             f"• 🧮 Risco: <b>{risk}</b>",
             f"• 🛡️ Stop‑Gain: <b>{stopgain}</b>",
-            f"• 🔬 Filtros: <b>{filters_text}</b>",
+            f"• 🎯 Gatilhos BE/TS: <b>{be_trg:.2f}% / {ts_trg:.2f}%</b>",
+            f"• 🎯 TP: <b>{tp_distribution}</b>",
+            f"• 📅 Metas do dia: lucro <b>${daily_p:,.2f}</b> / perda <b>${daily_l:,.2f}</b>",
+            f"• 🔌 Filtros: <b>{filters_text}</b> (MA {ma_period}/{ma_timeframe}, RSI {rsi_oversold}/{rsi_overbought})",
+            f"• ✅ Whitelist: <code>{whitelist}</code>",
+            f"• 🚫 Disjuntor: limite <b>{circuit_th}</b> / pausa <b>{circuit_pause} min</b>",
         ]
     status_lines += [
         "",
@@ -310,71 +339,90 @@ async def open_information_handler(update: Update, context: ContextTypes.DEFAULT
 
 LEARN_PAGES = [
     (
-        "<b>📖 Como funciona — Página 1/4</b>\n\n"
+        "<b>📖 Guia — Introdução</b>\n\n"
+        "Bem‑vindo! Aqui você aprende o fluxo completo do TradeFlow.\n\n"
         "🔎 <b>Coleta de sinais</b>\n"
-        "• Monitoramos fontes selecionadas e padronizamos as entradas.\n\n"
-        "🧪 <b>Filtros</b>\n"
-        "• Média Móvel (MA), RSI, whitelist de moedas e confiança mínima para reduzir ruído.\n"
+        "• Monitoramos fontes selecionadas e padronizamos mensagens em um formato único.\n"
+        "• Filtramos ruídos e extraímos símbolo, lado (LONG/SHORT), SL e TPs.\n\n"
+        "🧪 <b>Pré‑filtros</b>\n"
+        "• Média Móvel (MA), RSI, whitelist e confiança mínima — você decide o quanto filtrar.\n"
     ),
     (
-        "<b>📖 Como funciona — Página 2/4</b>\n\n"
-        "🎛️ <b>Risco & Tamanho</b>\n"
-        "• Tamanho de entrada (%) e alavancagem máxima definem seu risco por trade.\n"
-        "• Metas diárias (lucro/perda) ajudam a impor disciplina.\n\n"
-        "🧾 <b>Execução</b>\n"
-        "• Ordens a mercado/limite com SL validado e TPs gerenciados.\n"
+        "<b>📖 Guia — Risco & Tamanho</b>\n\n"
+        "🎛️ <b>Tamanho de entrada</b>\n"
+        "• Percentual do seu saldo disponível usado em cada trade.\n\n"
+        "⚙️ <b>Alavancagem Máxima</b>\n"
+        "• Limite superior de alavancagem para controlar exposição.\n\n"
+        "🎯 <b>Confiança mínima</b>\n"
+        "• Bloqueia sinais abaixo do nível escolhido.\n\n"
+        "📅 <b>Metas do dia</b>\n"
+        "• Lucro/Perda diária para manter disciplina e evitar overtrading.\n"
     ),
     (
-        "<b>📖 Como funciona — Página 3/4</b>\n\n"
-        "🛡️ <b>Stop‑Gain</b>\n"
-        "• <b>Gatilho</b>: ativa a proteção a partir de certo ganho.\n"
-        "• <b>Breakeven</b>: SL vai ao preço de entrada.\n"
-        "• <b>Trailing</b>: SL acompanha o preço.\n"
-        "• <b>Trava</b>: fixa parte do ganho após o gatilho.\n"
+        "<b>📖 Guia — Execução</b>\n\n"
+        "🧾 <b>Ordens</b>\n"
+        "• Mercado: entra imediatamente; Limite: posiciona no preço desejado.\n"
+        "• Validamos o SL contra o preço atual e as regras do instrumento (tick/step).\n\n"
+        "🎯 <b>Take Profits</b>\n"
+        "• Único TP pode ser enviado à corretora; múltiplos TPs são gerenciados pelo bot.\n"
     ),
     (
-        "<b>📖 Como funciona — Página 4/4</b>\n\n"
+        "<b>📖 Guia — Stop‑Gain</b>\n\n"
+        "🛡️ <b>Proteção de ganhos</b>\n"
+        "• <b>Gatilho</b>: ativa a proteção a partir de certo ganho (%).\n"
+        "• <b>Breakeven</b>: SL no preço de entrada para tirar risco.\n"
+        "• <b>Trailing</b>: SL ‘persegue’ o preço, preservando parte do lucro.\n"
+        "• <b>Trava</b>: percentual que congela parte do ganho ao acionar.\n"
+    ),
+    (
+        "<b>📖 Guia — Fechamentos & Status</b>\n\n"
         "✅ <b>Fechamento</b>\n"
-        "• Por alvo (TP), por Stop, manual ou externo.\n"
-        "• Status exibidos: Em andamento, Lucro, Prejuízo/Stop, Manual, Externo.\n"
-        "• Histórico e desempenho ajudam a revisar sua estratégia.\n"
+        "• Por alvo (TP), Stop, manual ou externo.\n\n"
+        "🏷️ <b>Status</b>\n"
+        "• ⏳ Em andamento: posição aberta (P/L ao vivo).\n"
+        "• 🏆 Lucro: terminou positivo.\n"
+        "• 🛑 Prejuízo/Stop: terminou no SL ou negativo.\n"
+        "• ✅ Manual: você encerrou.\n"
+        "• ℹ️ Externo: encerrou fora do bot.\n"
+    ),
+    (
+        "<b>📖 Guia — Dúvidas frequentes</b>\n\n"
+        "• <b>Por que o preço de entrada foi diferente do canal?</b> Slippage, latência e liquidez podem variar.\n"
+        "• <b>Por que fechou antes do TP?</b> Stop‑Gain/Trailing pode ter protegido ganhos.\n"
+        "• <b>O que é whitelist?</b> Lista de pares permitidos; use categorias (bluechips, altcoins).\n"
     ),
 ]
 
-def _learn_nav_keyboard(page: int) -> InlineKeyboardMarkup:
+def _learn_nav_keyboard(idx: int) -> InlineKeyboardMarkup:
     total = len(LEARN_PAGES)
-    buttons = []
-    row = []
-    if page > 0:
-        row.append(InlineKeyboardButton("⬅️ Anterior", callback_data=f'info_learn_page_{page}') )
-    if page < total - 1:
-        if row:
-            buttons.append(row)
-            row = []
-        row.append(InlineKeyboardButton("Próxima ➡️", callback_data=f'info_learn_page_{page+2}'))
-    if row:
-        buttons.append(row)
-    buttons.append([InlineKeyboardButton("⬅️ Voltar", callback_data='open_info')])
-    return InlineKeyboardMarkup(buttons)
+    prev_idx = (idx - 1) % total
+    next_idx = (idx + 1) % total
+    row = [
+        InlineKeyboardButton("⬅️ Anterior", callback_data=f'info_learn_nav_prev_{idx}'),
+        InlineKeyboardButton("Próxima ➡️", callback_data=f'info_learn_nav_next_{idx}')
+    ]
+    return InlineKeyboardMarkup([row, [InlineKeyboardButton("⬅️ Voltar", callback_data='open_info')]])
 
 async def info_learn_start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     await query.edit_message_text(LEARN_PAGES[0], parse_mode='HTML', reply_markup=_learn_nav_keyboard(0))
 
-async def info_learn_page_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def info_learn_nav_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    # callback format: info_learn_page_<n>, where n is 1-based
-    parts = (query.data or '').rsplit('_', 1)
-    page = 1
+    # format: info_learn_nav_<dir>_<idx>
     try:
-        page = max(1, int(parts[-1]))
+        _, _, direction, idx_str = (query.data or '').split('_', 3)
+        idx = int(idx_str)
     except Exception:
-        page = 1
-    idx = page - 1
-    idx = min(max(idx, 0), len(LEARN_PAGES)-1)
-    await query.edit_message_text(LEARN_PAGES[idx], parse_mode='HTML', reply_markup=_learn_nav_keyboard(idx))
+        direction, idx = 'next', 0
+    total = len(LEARN_PAGES)
+    if direction == 'prev':
+        new_idx = (idx - 1) % total
+    else:
+        new_idx = (idx + 1) % total
+    await query.edit_message_text(LEARN_PAGES[new_idx], parse_mode='HTML', reply_markup=_learn_nav_keyboard(new_idx))
 
 # --- FLUXO DE CONFIGURAÇÃO DE API ---
 async def config_api(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:

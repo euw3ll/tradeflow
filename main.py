@@ -43,7 +43,7 @@ from bot.handlers import (
     back_to_settings_menu_handler, back_from_whitelist_handler,
     show_tp_strategy_menu_handler, ask_tp_distribution, receive_tp_distribution, ASKING_TP_DISTRIBUTION,
     onboard_select_preset_handler, onboard_accept_terms_handler, onboard_decline_terms_handler,
-    info_learn_start_handler, info_learn_page_handler,
+    info_learn_start_handler, info_learn_nav_handler,
 )
 from services.telethon_service import start_signal_monitor
 from core.position_tracker import run_tracker
@@ -236,7 +236,7 @@ async def main():
     application.add_handler(CallbackQueryHandler(open_settings_root_handler, pattern='^open_settings_root$'))
     application.add_handler(CallbackQueryHandler(open_information_handler, pattern='^open_info$'))
     application.add_handler(CallbackQueryHandler(info_learn_start_handler, pattern='^info_learn_start$'))
-    application.add_handler(CallbackQueryHandler(info_learn_page_handler, pattern='^info_learn_page_'))
+    application.add_handler(CallbackQueryHandler(info_learn_nav_handler, pattern='^info_learn_nav_'))
     # Fluxo para usuários sem convite
     application.add_handler(CallbackQueryHandler(show_no_invite_info_handler, pattern='^no_invite_info$'))
     application.add_handler(CallbackQueryHandler(back_to_invite_welcome_handler, pattern='^back_to_invite_welcome$'))
