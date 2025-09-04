@@ -2,12 +2,23 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from database.crud import get_user_by_id
 
 def main_menu_keyboard(telegram_id: int):
-    """Menu inicial simplificado: Configurações e Informações."""
-    # Independente do status de API, exibimos o menu consolidado de início
-    keyboard = [
-        [InlineKeyboardButton("⚙️ Configurações", callback_data='open_settings_root')],
-        [InlineKeyboardButton("ℹ️ Informações", callback_data='open_info')],
-    ]
+    """
+    Menu principal com ações do dia a dia e uma entrada única para Configurações.
+    """
+    user = get_user_by_id(telegram_id)
+    has_api_keys = user and user.api_key_encrypted is not None
+
+    keyboard = []
+    if has_api_keys:
+        keyboard.append([InlineKeyboardButton("💼 Meu Painel", callback_data='user_dashboard')])
+        keyboard.append([InlineKeyboardButton("📊 Minhas Posições", callback_data='user_positions')])
+        keyboard.append([InlineKeyboardButton("📈 Desempenho", callback_data='perf_today')])
+        keyboard.append([InlineKeyboardButton("⚙️ Configurações", callback_data='open_settings_root')])
+        keyboard.append([InlineKeyboardButton("ℹ️ Informações", callback_data='open_info')])
+    else:
+        keyboard.append([InlineKeyboardButton("⚙️ Configurar API Bybit", callback_data='config_api')])
+        keyboard.append([InlineKeyboardButton("ℹ️ Informações", callback_data='open_info')])
+
     return InlineKeyboardMarkup(keyboard)
 
 def invite_welcome_keyboard():
