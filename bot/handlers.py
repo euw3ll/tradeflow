@@ -231,7 +231,7 @@ async def refresh_active_messages_handler(update: Update, context: ContextTypes.
         db.close()
 
 async def open_information_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Mostra a seção 'Informações' com última atualização e guia detalhado."""
+    """Mostra a seção 'Informações' com status do bot e última atualização."""
     query = update.callback_query
     await query.answer()
 
@@ -270,46 +270,111 @@ async def open_information_handler(update: Update, context: ContextTypes.DEFAULT
         commit_date = commit_date or "—"
         commit_hash = commit_hash or "—"
 
+    # Monta status do bot para o usuário
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.telegram_id == query.from_user.id).first()
+    finally:
+        db.close()
+
     lines = (full_msg or "").splitlines()
     commit_subject = lines[0] if lines else "Não disponível"
-    commit_body = "\n".join(lines[1:]).strip()
 
-    info_text = (
-        "<b>ℹ️ Informações</b>\n\n"
-        "🛠️ <b>Última atualização</b>\n"
-        f"• 🗓️ Data: {commit_date}\n"
-        f"• 🔖 Commit: <code>{commit_hash}</code>\n"
-        f"• 📝 Mensagem: {commit_subject}\n"
-        + (f"• 📄 Descrição:\n<code>{commit_body}</code>\n\n" if commit_body else "\n") +
-        "📚 <b>Como funciona o bot</b>\n\n"
-        "1) 🔎 <b>Coleta de sinais</b>\n"
-        "   • Monitoramos fontes selecionadas e padronizamos as entradas.\n\n"
-        "2) 🧪 <b>Filtros</b>\n"
-        "   • Média Móvel (MA), RSI, whitelist de moedas e confiança mínima.\n\n"
-        "3) 🎛️ <b>Risco & Tamanho</b>\n"
-        "   • Tamanho de entrada (%), alavancagem máxima, metas diárias de lucro/perda.\n\n"
-        "4) 🧾 <b>Execução</b>\n"
-        "   • Ordens a mercado ou limite, SL validado e TPs gerenciados.\n\n"
-        "5) 🛡️ <b>Gestão de posição (Stop‑Gain)</b>\n"
-        "   • <b>Breakeven</b>: ao atingir o gatilho, o SL sobe para o preço de entrada (protegendo capital).\n"
-        "   • <b>Trailing</b>: o SL acompanha a evolução do preço após o gatilho.\n"
-        "   • <b>Trava</b>: porcentagem fixa acima do gatilho para consolidar parte do ganho.\n\n"
-        "6) ✅ <b>Fechamento</b>\n"
-        "   • Por alvo (TP), por <b>Stop Loss</b>, manual ou externo — sempre registrado.\n\n"
-        "🏷️ <b>Status que você verá</b>\n"
-        "• ⏳ <b>Em andamento</b>: posição aberta sendo gerenciada; P/L e TPs atualizam em tempo real.\n"
-        "• 🏆 <b>Lucro</b>: posição encerrada com resultado positivo (atingiu TP ou fechamento manual positivo).\n"
-        "• 🛑 <b>Prejuízo / Stop</b>: posição encerrada no SL ou com resultado negativo.\n"
-        "• ✅ <b>Fechado manualmente</b>: você encerrou a posição pelo botão.\n"
-        "• ℹ️ <b>Fechado externamente</b>: posição encerrada fora do bot (app/corretora).\n"
-        "• 👋 <b>Aprovação</b>: quando o modo Manual está ativo, você recebe botões para aprovar/rejeitar entradas.\n\n"
-        "❓ <b>Glossário rápido</b>\n"
-        "• <b>Stop Loss</b>: preço que encerra a posição para limitar perdas.\n"
-        "• <b>Take Profit</b>: um ou mais preços de realização de lucro.\n"
-        "• <b>Stop‑Gain</b>: estratégia para <i>proteger ganhos</i> (Breakeven/Trailing com gatilho e trava).\n"
-    )
+    status_lines = ["<b>ℹ️ Informações</b>", ""]
+    if user:
+        bot_state = "Ativo" if user.is_active else "Pausado"
+        sleep = " (Modo Dormir)" if (user.is_active and user.is_sleep_mode_enabled) else ""
+        approval = "Manual 👋" if str(user.approval_mode).upper() == 'MANUAL' else "Automático ⚡"
+        risk = f"{float(user.entry_size_percent or 0):.1f}% @ {int(user.max_leverage or 0)}x"
+        stopgain = f"gatilho {float(user.stop_gain_trigger_pct or 0):.2f}% / trava {float(user.stop_gain_lock_pct or 0):.2f}%"
+        filters = []
+        if getattr(user, 'is_ma_filter_enabled', False): filters.append("MA")
+        if getattr(user, 'is_rsi_filter_enabled', False): filters.append("RSI")
+        filters_text = ", ".join(filters) if filters else "Nenhum"
+        status_lines += [
+            f"• 🤖 Bot: <b>{bot_state}{sleep}</b>",
+            f"• 🧭 Aprovação: <b>{approval}</b>",
+            f"• 🧮 Risco: <b>{risk}</b>",
+            f"• 🛡️ Stop‑Gain: <b>{stopgain}</b>",
+            f"• 🔬 Filtros: <b>{filters_text}</b>",
+        ]
+    status_lines += [
+        "",
+        "🛠️ <b>Última atualização</b>",
+        f"• 🗓️ Data: {commit_date}",
+        f"• 🔖 Commit: <code>{commit_hash}</code>",
+        f"• 📝 Mensagem: {commit_subject}",
+    ]
 
-    await query.edit_message_text(info_text, parse_mode='HTML', reply_markup=info_menu_keyboard())
+    await query.edit_message_text("\n".join(status_lines), parse_mode='HTML', reply_markup=info_menu_keyboard())
+
+LEARN_PAGES = [
+    (
+        "<b>📖 Como funciona — Página 1/4</b>\n\n"
+        "🔎 <b>Coleta de sinais</b>\n"
+        "• Monitoramos fontes selecionadas e padronizamos as entradas.\n\n"
+        "🧪 <b>Filtros</b>\n"
+        "• Média Móvel (MA), RSI, whitelist de moedas e confiança mínima para reduzir ruído.\n"
+    ),
+    (
+        "<b>📖 Como funciona — Página 2/4</b>\n\n"
+        "🎛️ <b>Risco & Tamanho</b>\n"
+        "• Tamanho de entrada (%) e alavancagem máxima definem seu risco por trade.\n"
+        "• Metas diárias (lucro/perda) ajudam a impor disciplina.\n\n"
+        "🧾 <b>Execução</b>\n"
+        "• Ordens a mercado/limite com SL validado e TPs gerenciados.\n"
+    ),
+    (
+        "<b>📖 Como funciona — Página 3/4</b>\n\n"
+        "🛡️ <b>Stop‑Gain</b>\n"
+        "• <b>Gatilho</b>: ativa a proteção a partir de certo ganho.\n"
+        "• <b>Breakeven</b>: SL vai ao preço de entrada.\n"
+        "• <b>Trailing</b>: SL acompanha o preço.\n"
+        "• <b>Trava</b>: fixa parte do ganho após o gatilho.\n"
+    ),
+    (
+        "<b>📖 Como funciona — Página 4/4</b>\n\n"
+        "✅ <b>Fechamento</b>\n"
+        "• Por alvo (TP), por Stop, manual ou externo.\n"
+        "• Status exibidos: Em andamento, Lucro, Prejuízo/Stop, Manual, Externo.\n"
+        "• Histórico e desempenho ajudam a revisar sua estratégia.\n"
+    ),
+]
+
+def _learn_nav_keyboard(page: int) -> InlineKeyboardMarkup:
+    total = len(LEARN_PAGES)
+    buttons = []
+    row = []
+    if page > 0:
+        row.append(InlineKeyboardButton("⬅️ Anterior", callback_data=f'info_learn_page_{page}') )
+    if page < total - 1:
+        if row:
+            buttons.append(row)
+            row = []
+        row.append(InlineKeyboardButton("Próxima ➡️", callback_data=f'info_learn_page_{page+2}'))
+    if row:
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton("⬅️ Voltar", callback_data='open_info')])
+    return InlineKeyboardMarkup(buttons)
+
+async def info_learn_start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(LEARN_PAGES[0], parse_mode='HTML', reply_markup=_learn_nav_keyboard(0))
+
+async def info_learn_page_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    # callback format: info_learn_page_<n>, where n is 1-based
+    parts = (query.data or '').rsplit('_', 1)
+    page = 1
+    try:
+        page = max(1, int(parts[-1]))
+    except Exception:
+        page = 1
+    idx = page - 1
+    idx = min(max(idx, 0), len(LEARN_PAGES)-1)
+    await query.edit_message_text(LEARN_PAGES[idx], parse_mode='HTML', reply_markup=_learn_nav_keyboard(idx))
 
 # --- FLUXO DE CONFIGURAÇÃO DE API ---
 async def config_api(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1132,10 +1197,15 @@ async def execute_manual_close_handler(update: Update, context: ContextTypes.DEF
 
             resultado_str = "LUCRO" if pnl >= 0 else "PREJUÍZO"
             emoji = "✅" if pnl >= 0 else "🔻"
+            # Cabeçalho claro: LUCRO / PREJUÍZO
+            sign = "+" if pnl >= 0 else ""
             message_text = (
-                f"{emoji} <b>Posição Fechada Manualmente ({resultado_str})</b>\n"
-                f"<b>Moeda:</b> {trade_to_close.symbol}\n"
-                f"<b>Resultado:</b> ${pnl:,.2f}"
+                f"{emoji} <b>{resultado_str}</b> — <b>{trade_to_close.symbol}</b> {trade_to_close.side}\n"
+                f"• Tipo: <b>Fechamento manual</b>\n"
+                f"• Quantidade: <b>{pnl_qty:g}</b>\n"
+                f"• Entrada: <b>${trade_to_close.entry_price:,.4f}</b>\n"
+                f"• Saída: <b>${current_price:,.4f}</b>\n"
+                f"• P/L: <b>{sign}${abs(pnl):,.2f}</b>"
             )
 
             # --- LÓGICA DE EDIÇÃO APLICADA AQUI ---

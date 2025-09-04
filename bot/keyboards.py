@@ -317,8 +317,9 @@ def notifications_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(kb)
 
 def info_menu_keyboard() -> InlineKeyboardMarkup:
-    """Menu para a seção Informações (apenas voltar)."""
+    """Menu para a seção Informações (status + aprender)."""
     kb = [
+        [InlineKeyboardButton("📖 Quero aprender", callback_data='info_learn_start')],
         [InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data='back_to_main_menu')],
     ]
     return InlineKeyboardMarkup(kb)

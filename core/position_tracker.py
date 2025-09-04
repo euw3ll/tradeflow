@@ -759,6 +759,13 @@ async def confirm_and_close_trade(
             return f"${float(v):,.2f}"
         except Exception:
             return str(v)
+    def _fmt_money_signed(v):
+        try:
+            f = float(v)
+            sign = "+" if f >= 0 else ""
+            return f"{sign}${abs(f):,.2f}" if False else f"{sign}{_fmt_money(abs(f) if f<0 else f)}"
+        except Exception:
+            return str(v)
 
     side = getattr(trade, "side", "") or ""
     qty  = getattr(trade, "qty", None)
@@ -771,14 +778,15 @@ async def confirm_and_close_trade(
         exit_price = info.get("exit_price")
         closed_at_val = info.get("closed_at")
 
-        if str(exit_type).lower().startswith("take"):
-            title = "🏆 Posição Fechada (Take Profit)"
-        elif str(exit_type).lower().startswith("stop"):
-            title = "🛡️ Posição Fechada (Stop)"
-        else:
-            title = "✅ Posição Fechada"
-
-        lines = [f"<b>{title}</b> — <b>{trade.symbol}</b> {side}"]
+        # Cabeçalho claro: LUCRO / PREJUÍZO
+        result_emoji = "✅" if (pnl is not None and float(pnl) >= 0) else "🔻"
+        result_label = "LUCRO" if (pnl is not None and float(pnl) >= 0) else "PREJUÍZO"
+        reason = (
+            "Take Profit" if str(exit_type).lower().startswith("take") else
+            "Stop" if str(exit_type).lower().startswith("stop") else
+            "Fechamento"
+        )
+        lines = [f"{result_emoji} <b>{result_label}</b> — <b>{trade.symbol}</b> {side}", f"• Tipo: <b>{reason}</b>"]
         if qty is not None:
             lines.append(f"• Quantidade: <b>{qty:g}</b>")
         if entry is not None:
@@ -786,8 +794,7 @@ async def confirm_and_close_trade(
         if exit_price is not None:
             lines.append(f"• Saída: <b>{_fmt_money(exit_price)}</b>")
         if pnl is not None:
-            pnl_prefix = "Lucro" if float(pnl) >= 0 else "Prejuízo"
-            lines.append(f"• {pnl_prefix}: <b>{_fmt_money(pnl)}</b>")
+            lines.append(f"• P/L: <b>{_fmt_money_signed(pnl)}</b>")
         if closed_at_val:
             lines.append(f"• Horário: <b>{closed_at_val}</b>")
         final_text = "\n".join(lines)
