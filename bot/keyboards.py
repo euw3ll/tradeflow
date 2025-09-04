@@ -24,6 +24,22 @@ def main_menu_keyboard(telegram_id: int):
 
     return InlineKeyboardMarkup(keyboard)
 
+def invite_welcome_keyboard():
+    """Teclado inicial para usuários sem cadastro/convite."""
+    keyboard = [
+        [InlineKeyboardButton("ℹ️ Como funciona e acesso", callback_data='no_invite_info')],
+        [InlineKeyboardButton("🎟️ Eu tenho um convite", callback_data='enter_invite')],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def invite_info_keyboard():
+    """Teclado para a tela de explicação de acesso por convite."""
+    keyboard = [
+        [InlineKeyboardButton("🎟️ Eu tenho um convite", callback_data='enter_invite')],
+        [InlineKeyboardButton("⬅️ Voltar", callback_data='back_to_invite_welcome')],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
 def dashboard_menu_keyboard(user):
     """Retorna o teclado para o painel do usuário, com a opção de remover a API e ligar/desligar o bot."""
     
@@ -264,5 +280,23 @@ def tp_strategy_menu_keyboard(user) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(f"Estratégia Atual: {strategy_text}", callback_data="noop")], # Botão apenas visual
         [InlineKeyboardButton("✏️ Alterar Estratégia", callback_data="ask_tp_distribution")],
         [InlineKeyboardButton("⬅️ Voltar para Configurações", callback_data="back_to_settings_menu")],
+    ]
+    return InlineKeyboardMarkup(kb)
+
+def onboarding_risk_keyboard():
+    """Teclado com as opções de modo inicial do bot."""
+    kb = [
+        [InlineKeyboardButton("🟢 Conservador", callback_data='onboard_risk_conservative')],
+        [InlineKeyboardButton("🟠 Mediano", callback_data='onboard_risk_moderate')],
+        [InlineKeyboardButton("🔴 Agressivo", callback_data='onboard_risk_aggressive')],
+        [InlineKeyboardButton("✍️ Configuração Manual", callback_data='onboard_risk_manual')],
+    ]
+    return InlineKeyboardMarkup(kb)
+
+def onboarding_terms_keyboard():
+    """Teclado para aceitar o termo de responsabilidade."""
+    kb = [
+        [InlineKeyboardButton("✅ Li e concordo", callback_data='onboard_accept_terms')],
+        [InlineKeyboardButton("❌ Cancelar", callback_data='onboard_decline_terms')],
     ]
     return InlineKeyboardMarkup(kb)

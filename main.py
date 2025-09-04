@@ -9,6 +9,7 @@ from telegram.error import TelegramError
 from utils.config import TELEGRAM_TOKEN
 from bot.handlers import (
     start, receive_invite_code, cancel, WAITING_CODE,
+    show_no_invite_info_handler, back_to_invite_welcome_handler, enter_invite_handler,
     config_api, receive_api_key, receive_api_secret, WAITING_API_KEY, WAITING_API_SECRET,
     remove_api_prompt, remove_api_action, CONFIRM_REMOVE_API,
     my_positions_handler, user_dashboard_handler, user_settings_handler,
@@ -39,7 +40,8 @@ from bot.handlers import (
     ask_rsi_overbought, receive_rsi_overbought, ASKING_RSI_OVERBOUGHT,
     show_risk_menu_handler, show_stopgain_menu_handler, show_circuit_menu_handler,
     back_to_settings_menu_handler, back_from_whitelist_handler,
-    show_tp_strategy_menu_handler, ask_tp_distribution, receive_tp_distribution, ASKING_TP_DISTRIBUTION
+    show_tp_strategy_menu_handler, ask_tp_distribution, receive_tp_distribution, ASKING_TP_DISTRIBUTION,
+    onboard_select_preset_handler, onboard_accept_terms_handler, onboard_decline_terms_handler,
 )
 from services.telethon_service import start_signal_monitor
 from core.position_tracker import run_tracker
@@ -89,7 +91,7 @@ async def main():
 
     # --- Handlers de Conversa ---
     register_conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
+        entry_points=[CommandHandler("start", start), CallbackQueryHandler(enter_invite_handler, pattern='^enter_invite$')],
         states={ WAITING_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_invite_code)] },
         fallbacks=[CommandHandler("cancel", cancel)], per_message=False, per_user=True,
     )
@@ -228,6 +230,9 @@ async def main():
     application.add_handler(CallbackQueryHandler(back_to_admin_menu_handler, pattern='^back_to_admin_menu$'))
 
     application.add_handler(CommandHandler("start", start))
+    # Fluxo para usuários sem convite
+    application.add_handler(CallbackQueryHandler(show_no_invite_info_handler, pattern='^no_invite_info$'))
+    application.add_handler(CallbackQueryHandler(back_to_invite_welcome_handler, pattern='^back_to_invite_welcome$'))
     
     application.add_handler(CallbackQueryHandler(my_positions_handler, pattern='^user_positions$'))
     application.add_handler(CallbackQueryHandler(user_settings_handler, pattern='^user_settings$'))
@@ -262,6 +267,11 @@ async def main():
     application.add_handler(rsi_oversold_conv)
     application.add_handler(rsi_overbought_conv)
     application.add_handler(tp_distribution_conv)
+
+    # Onboarding: preset e termos
+    application.add_handler(CallbackQueryHandler(onboard_select_preset_handler, pattern='^onboard_risk_'))
+    application.add_handler(CallbackQueryHandler(onboard_accept_terms_handler, pattern='^onboard_accept_terms$'))
+    application.add_handler(CallbackQueryHandler(onboard_decline_terms_handler, pattern='^onboard_decline_terms$'))
 
     application.add_handler(CallbackQueryHandler(show_risk_menu_handler, pattern='^settings_risk$'))
     application.add_handler(CallbackQueryHandler(show_stopgain_menu_handler, pattern='^settings_stopgain$'))

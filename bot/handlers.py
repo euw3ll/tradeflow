@@ -15,7 +15,9 @@ from .keyboards import (
     dashboard_menu_keyboard, settings_menu_keyboard, view_targets_keyboard, 
     bot_config_keyboard, performance_menu_keyboard, confirm_manual_close_keyboard,
     signal_filters_keyboard, ma_timeframe_keyboard, risk_menu_keyboard,
-    stopgain_menu_keyboard, circuit_menu_keyboard, tp_strategy_menu_keyboard
+    stopgain_menu_keyboard, circuit_menu_keyboard, tp_strategy_menu_keyboard,
+    invite_welcome_keyboard, invite_info_keyboard,
+    onboarding_risk_keyboard, onboarding_terms_keyboard,
 )
 from utils.security import encrypt_data, decrypt_data
 from services.bybit_service import (
@@ -85,10 +87,49 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         )
         return ConversationHandler.END
     else:
-        await update.message.reply_text(
-            f"Olá, {telegram_user.first_name}! Para usar o TradeFlow, insira seu código de convite."
+        # Mensagem amigável de boas-vindas para quem ainda não tem convite
+        text = (
+            f"Olá, {telegram_user.first_name}! 👋\n\n"
+            "O TradeFlow está em acesso antecipado. No momento, o uso é somente via convite.\n\n"
+            "• Quer entender como funciona e como conseguir acesso?\n"
+            "• Já tem um convite e quer entrar agora?"
         )
-        return WAITING_CODE
+        await update.message.reply_text(text, reply_markup=invite_welcome_keyboard())
+        return ConversationHandler.END
+
+async def show_no_invite_info_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Mostra explicação de funcionamento e acesso via convite."""
+    query = update.callback_query
+    await query.answer()
+    text = (
+        "ℹ️ Como funciona o TradeFlow\n\n"
+        "• Monitoramos sinais de fontes de alta qualidade e gerenciamos entradas/saídas de forma disciplinada.\n"
+        "• Você mantém o controle total: ajuste alavancagem, tamanho, filtros e metas no app.\n\n"
+        "Acesso e convites\n\n"
+        "• No momento, o acesso é somente com convite.\n"
+        "• Para pedir acesso, fale com um membro da comunidade ou aguarde novas vagas.\n\n"
+        "Se já tiver um convite, clique abaixo para ativá-lo."
+    )
+    await query.edit_message_text(text, reply_markup=invite_info_keyboard())
+
+async def back_to_invite_welcome_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    tg_user = update.effective_user
+    text = (
+        f"Olá, {tg_user.first_name}! 👋\n\n"
+        "O TradeFlow está em acesso antecipado. No momento, o uso é somente via convite.\n\n"
+        "• Quer entender como funciona e como conseguir acesso?\n"
+        "• Já tem um convite e quer entrar agora?"
+    )
+    await query.edit_message_text(text, reply_markup=invite_welcome_keyboard())
+
+async def enter_invite_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Inicia a coleta do código de convite via callback, mudando para o estado WAITING_CODE."""
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("Perfeito! Envie seu código de convite nesta conversa.")
+    return WAITING_CODE
 
 async def receive_invite_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     code_text = update.message.text
@@ -189,31 +230,175 @@ async def receive_api_secret(update: Update, context: ContextTypes.DEFAULT_TYPE)
     encrypted_key = encrypt_data(api_key)
     encrypted_secret = encrypt_data(api_secret)
 
+    # Valida as credenciais na Bybit antes de salvar
+    try:
+        account_info = await get_account_info(api_key, api_secret)
+    except Exception as e:
+        account_info = {"success": False, "error": str(e)}
+
+    if not account_info.get("success"):
+        # Não salva credenciais inválidas
+        await context.bot.edit_message_text(
+            chat_id=update.effective_chat.id,
+            message_id=context.user_data.get('entry_message_id'),
+            text=(
+                "❌ Não consegui validar suas credenciais da Bybit.\n"
+                f"Erro: {account_info.get('error','desconhecido')}\n\n"
+                "Por favor, envie novamente sua API Key."
+            ),
+        )
+        context.user_data.pop('api_key', None)
+        # Volta para pedir a API Key
+        return WAITING_API_KEY
+
+    # Sucesso: salva e inicia funil de onboarding com bot desativado por padrão
+    total_equity = (account_info.get("data") or {}).get("total_equity", 0.0)
+    context.user_data['onboarding_equity'] = total_equity
+
     db = SessionLocal()
     try:
         user_to_update = db.query(User).filter(User.telegram_id == telegram_id).first()
-        if user_to_update:
-            user_to_update.api_key_encrypted = encrypted_key
-            user_to_update.api_secret_encrypted = encrypted_secret
-            db.commit()
-            
-            await context.bot.edit_message_text(
-                chat_id=update.effective_chat.id,
-                message_id=context.user_data['entry_message_id'],
-                text="✅ Suas chaves de API foram salvas com sucesso!",
-            )
-            await context.bot.send_message(
-                chat_id=telegram_id,
-                text="Menu Principal:",
-                reply_markup=main_menu_keyboard(telegram_id=telegram_id)
-            )
-        else:
+        if not user_to_update:
             await update.message.reply_text("Ocorreu um erro. Usuário não encontrado.")
+            return ConversationHandler.END
+
+        user_to_update.api_key_encrypted = encrypted_key
+        user_to_update.api_secret_encrypted = encrypted_secret
+        # Bot inicia pausado após conectar a Bybit
+        user_to_update.is_active = False
+        db.commit()
+
+        await context.bot.edit_message_text(
+            chat_id=update.effective_chat.id,
+            message_id=context.user_data['entry_message_id'],
+            text=(
+                "✅ Suas chaves de API foram validadas e salvas!\n"
+                "Por segurança, o bot inicia PAUSADO. Você pode ativá‑lo no painel."
+            ),
+        )
+        # Inicia o funil de seleção de modo (conservador/mediano/agressivo/manual)
+        await show_onboarding_risk_options(update, context, total_equity)
     finally:
         db.close()
-        context.user_data.clear()
+        # Mantém onboarding_equity, limpa o resto
+        context.user_data.pop('prompt_message_id', None)
+        context.user_data.pop('entry_message_id', None)
+        context.user_data.pop('api_key', None)
 
     return ConversationHandler.END
+
+def _format_currency(v: float) -> str:
+    try:
+        return f"${v:,.2f}"
+    except Exception:
+        return f"${v}"
+
+def _compute_recommendations(equity: float) -> dict:
+    """Gera recomendações para cada modo com base no patrimônio atual."""
+    eq = float(equity or 0.0)
+    def rec(entry_pct, lev, conf, stop_trg, stop_lock, loss_pct, profit_pct):
+        return {
+            "entry_size_percent": entry_pct,
+            "max_leverage": lev,
+            "min_confidence": conf,
+            "stop_gain_trigger_pct": stop_trg,
+            "stop_gain_lock_pct": stop_lock,
+            "daily_loss_limit": round(eq * (loss_pct/100.0), 2),
+            "daily_profit_target": round(eq * (profit_pct/100.0), 2),
+        }
+    return {
+        "conservative": rec(2.0, 5, 75.0, 1.5, 0.5, 2.0, 1.0),
+        "moderate":    rec(5.0, 10, 65.0, 2.0, 0.7, 3.0, 1.5),
+        "aggressive":   rec(10.0, 20, 55.0, 3.0, 1.0, 5.0, 2.0),
+    }
+
+async def show_onboarding_risk_options(update: Update, context: ContextTypes.DEFAULT_TYPE, equity: float):
+    chat_id = update.effective_user.id
+    recs = _compute_recommendations(equity)
+    def line(name, r):
+        approx_entry = equity * (r["entry_size_percent"]/100.0)
+        return (
+            f"<b>{name}</b>\n"
+            f"• Tamanho: {r['entry_size_percent']:.1f}% (~{_format_currency(approx_entry)})\n"
+            f"• Alavancagem máx.: {r['max_leverage']}x\n"
+            f"• Confiança mínima: {r['min_confidence']:.0f}%\n"
+            f"• Stop‑Gain: gatilho {r['stop_gain_trigger_pct']:.2f}% | trava {r['stop_gain_lock_pct']:.2f}%\n"
+            f"• Limites diários: lucro {_format_currency(r['daily_profit_target'])} | perda {_format_currency(r['daily_loss_limit'])}\n"
+        )
+    msg = (
+        "🎯 Escolha como quer começar\n\n"
+        f"Saldo detectado: <b>{_format_currency(equity)}</b>\n\n"
+        f"{line('🟢 Conservador', recs['conservative'])}\n"
+        f"{line('🟠 Mediano', recs['moderate'])}\n"
+        f"{line('🔴 Agressivo', recs['aggressive'])}\n"
+        "Você pode alterar tudo depois em Configurações.\n\n"
+        "Ou escolha <b>Configuração Manual</b> para ajustar do zero."
+    )
+    await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='HTML', reply_markup=onboarding_risk_keyboard())
+
+async def onboard_select_preset_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Aplica o preset escolhido (ou manual) e mostra os termos."""
+    query = update.callback_query
+    await query.answer()
+
+    choice = query.data.replace('onboard_risk_', '')
+    equity = float(context.user_data.get('onboarding_equity') or 0.0)
+
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.telegram_id == update.effective_user.id).first()
+        if not user:
+            await query.edit_message_text("Usuário não encontrado. Use /start para registrar.")
+            return
+
+        if choice == 'manual':
+            # Zera para o usuário configurar depois; bot permanece pausado
+            user.entry_size_percent = 0.0
+            user.max_leverage = 0
+            user.min_confidence = 0.0
+            # Mantém stop-gain e metas padrão (0 = desativado)
+        else:
+            recs = _compute_recommendations(equity).get(choice)
+            if recs:
+                user.entry_size_percent = recs['entry_size_percent']
+                user.max_leverage = recs['max_leverage']
+                user.min_confidence = recs['min_confidence']
+                user.stop_gain_trigger_pct = recs['stop_gain_trigger_pct']
+                user.stop_gain_lock_pct = recs['stop_gain_lock_pct']
+                user.daily_loss_limit = recs['daily_loss_limit']
+                user.daily_profit_target = recs['daily_profit_target']
+
+        db.commit()
+
+        # Exibe termos de responsabilidade
+        terms = (
+            "📜 Termo de Responsabilidade\n\n"
+            "• Este bot NÃO promete ganhos e NÃO garante resultados.\n"
+            "• Operar mercados envolve riscos significativos, incluindo perdas parciais ou totais do capital.\n"
+            "• Você é o único responsável por suas operações e configurações.\n"
+            "• Monitoramos fontes de alta qualidade, mas risco sempre existe.\n\n"
+            "Para concluir a ativação do app, confirme que você leu e concorda."
+        )
+        await query.edit_message_text(terms, reply_markup=onboarding_terms_keyboard())
+    finally:
+        db.close()
+
+async def onboard_accept_terms_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    await query.edit_message_text("✅ Obrigado! Configuração inicial concluída.")
+    await context.bot.send_message(
+        chat_id=user_id,
+        text="Menu Principal:",
+        reply_markup=main_menu_keyboard(telegram_id=user_id)
+    )
+
+async def onboard_decline_terms_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        "Você precisa aceitar o termo para concluir a configuração. Você pode voltar ao /start quando quiser.")
 
 # --- FLUXO DE REMOÇÃO DE API ---
 async def remove_api_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
