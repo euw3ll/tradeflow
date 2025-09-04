@@ -40,6 +40,8 @@ ASKING_CIRCUIT_THRESHOLD, ASKING_CIRCUIT_PAUSE = range(18, 20)
 ASKING_COIN_WHITELIST = 15
 (ASKING_MA_PERIOD, ASKING_MA_TIMEFRAME, ASKING_RSI_OVERSOLD, ASKING_RSI_OVERBOUGHT) = range(20, 24)
 ASKING_TP_DISTRIBUTION = 25
+ASKING_BE_TRIGGER = 26
+ASKING_TS_TRIGGER = 27
 
 logger = logging.getLogger(__name__)
 
@@ -1407,6 +1409,18 @@ async def ask_stop_gain_lock(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.edit_message_text("🔒 Envie a <b>trava</b> do Stop-Gain em % (ex.: 1)", parse_mode="HTML")
     return ASKING_STOP_GAIN_LOCK
 
+async def ask_be_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("🎯 Envie o <b>gatilho opcional</b> do Break‑Even por PnL em % (ex.: 2). Use 0 para desativar.", parse_mode="HTML")
+    return ASKING_BE_TRIGGER
+
+async def ask_ts_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("📈 Envie o <b>gatilho opcional</b> do Trailing Stop por PnL em % (ex.: 3). Use 0 para desativar.", parse_mode="HTML")
+    return ASKING_TS_TRIGGER
+
 async def ask_circuit_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -1470,6 +1484,63 @@ async def receive_stop_gain_lock(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("Não entendi. Envie um número (ex.: 1).")
     except Exception as e:
         db.rollback(); logger.error(f"[settings] stop_gain_lock_pct: {e}", exc_info=True)
+        await update.message.reply_text("Erro ao salvar. Tente novamente.")
+    finally:
+        db.close()
+    return ConversationHandler.END
+
+async def receive_be_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip().replace("%", "").replace(",", ".")
+    db = SessionLocal()
+    try:
+        value = float(text)
+        if value < 0 or value > 100:
+            await update.message.reply_text("Valor inválido. Envie entre 0 e 100 (ex.: 2)."); return ConversationHandler.END
+        user = db.query(User).filter_by(telegram_id=update.effective_user.id).first()
+        if not user:
+            await update.message.reply_text("Usuário não encontrado. Use /start para registrar."); return ConversationHandler.END
+        # Persistência: atributo pode já existir na tabela; se não existir, SQL pode falhar. Exige migração.
+        setattr(user, 'be_trigger_pct', value)
+        db.commit()
+        try: await update.message.delete()
+        except Exception: pass
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"🛡️ <b>Stop-Gain / BE</b>\n✅ Gatilho Break‑Even por PnL salvo: <b>{value:.2f}%</b>",
+            reply_markup=stopgain_menu_keyboard(user), parse_mode="HTML",
+        )
+    except ValueError:
+        await update.message.reply_text("Não entendi. Envie um número (ex.: 2).")
+    except Exception as e:
+        db.rollback(); logger.error(f"[settings] be_trigger_pct: {e}", exc_info=True)
+        await update.message.reply_text("Erro ao salvar. Tente novamente.")
+    finally:
+        db.close()
+    return ConversationHandler.END
+
+async def receive_ts_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip().replace("%", "").replace(",", ".")
+    db = SessionLocal()
+    try:
+        value = float(text)
+        if value < 0 or value > 100:
+            await update.message.reply_text("Valor inválido. Envie entre 0 e 100 (ex.: 3)."); return ConversationHandler.END
+        user = db.query(User).filter_by(telegram_id=update.effective_user.id).first()
+        if not user:
+            await update.message.reply_text("Usuário não encontrado. Use /start para registrar."); return ConversationHandler.END
+        setattr(user, 'ts_trigger_pct', value)
+        db.commit()
+        try: await update.message.delete()
+        except Exception: pass
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"🛡️ <b>Stop-Gain / TS</b>\n✅ Gatilho Trailing por PnL salvo: <b>{value:.2f}%</b>",
+            reply_markup=stopgain_menu_keyboard(user), parse_mode="HTML",
+        )
+    except ValueError:
+        await update.message.reply_text("Não entendi. Envie um número (ex.: 3).")
+    except Exception as e:
+        db.rollback(); logger.error(f"[settings] ts_trigger_pct: {e}", exc_info=True)
         await update.message.reply_text("Erro ao salvar. Tente novamente.")
     finally:
         db.close()

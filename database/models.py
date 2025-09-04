@@ -22,6 +22,9 @@ class User(Base):
     is_active = Column(Boolean, default=True, nullable=False)
     stop_gain_trigger_pct = Column(Float, default=0.0, nullable=False)
     stop_gain_lock_pct = Column(Float, default=0.0, nullable=False)
+    # Gatilhos opcionais por PnL para antecipar BE/TS
+    be_trigger_pct = Column(Float, default=0.0, nullable=False)
+    ts_trigger_pct = Column(Float, default=0.0, nullable=False)
     circuit_breaker_threshold = Column(Integer, default=0, nullable=False)
     circuit_breaker_pause_minutes = Column(Integer, default=60, nullable=False)
     long_trades_paused_until = Column(DateTime(timezone=True), nullable=True)

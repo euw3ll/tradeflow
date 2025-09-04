@@ -111,10 +111,14 @@ def _read_stop_strategy_label(user) -> str:
 def stopgain_menu_keyboard(user) -> InlineKeyboardMarkup:
     trigger = f"{float(getattr(user, 'stop_gain_trigger_pct', 0) or 0):.2f}%"
     lock    = f"{float(getattr(user, 'stop_gain_lock_pct', 0) or 0):.2f}%"
+    be_trig = f"{float(getattr(user, 'be_trigger_pct', 0) or 0):.2f}%"
+    ts_trig = f"{float(getattr(user, 'ts_trigger_pct', 0) or 0):.2f}%"
     strategy_label = _read_stop_strategy_label(user)
 
     kb = [
         [InlineKeyboardButton(f"🧭 Estratégia: {strategy_label}", callback_data="set_stop_strategy")],
+        [InlineKeyboardButton(f"🎯 Gatilho BE por PnL ({be_trig})", callback_data="set_be_trigger")],
+        [InlineKeyboardButton(f"📈 Gatilho TS por PnL ({ts_trig})", callback_data="set_ts_trigger")],
         [InlineKeyboardButton(f"🚀 Gatilho Stop-Gain ({trigger})", callback_data="set_stop_gain_trigger")],
         [InlineKeyboardButton(f"🔒 Trava Stop-Gain ({lock})", callback_data="set_stop_gain_lock")],
         [InlineKeyboardButton("⬅️ Voltar", callback_data="back_to_settings_menu")],

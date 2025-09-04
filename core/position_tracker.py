@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import time
+import math
 from telegram.ext import Application
 from sqlalchemy.orm import Session
 from database.session import SessionLocal
@@ -23,6 +24,64 @@ logger = logging.getLogger(__name__)
 # cache em memória para evitar reedições repetidas
 # chave: trade.id, valor: {"sync_notified": bool}
 _SYNC_CACHE = {}
+
+def _compute_tp_distribution(strategy: str, total_tps: int) -> list[float]:
+    """Gera uma distribuição de porcentagens (soma ~100) para N TPs.
+    - 'EQUAL' => divide igualmente.
+    - Lista (ex.: "50,30,20"): usa como âncoras e extrapola cauda em ordem decrescente,
+      normalizando para 100% mesmo quando houver mais TPs que âncoras.
+    """
+    if total_tps <= 0:
+        return []
+    # Equal simples
+    if not strategy or str(strategy).strip().upper() == 'EQUAL':
+        return [100.0 / total_tps] * total_tps
+
+    # Parseia lista de âncoras
+    try:
+        anchors = [max(0.0, float(x)) for x in str(strategy).replace('%', '').split(',') if x.strip()]
+    except Exception:
+        return [100.0 / total_tps] * total_tps
+    if not anchors:
+        return [100.0 / total_tps] * total_tps
+
+    # Garante monotonicidade decrescente nas âncoras
+    for i in range(1, len(anchors)):
+        if anchors[i] > anchors[i-1]:
+            anchors[i] = anchors[i-1]
+
+    # Define fator de decaimento da cauda baseado nas duas últimas âncoras se possível, senão 0.66
+    if len(anchors) >= 2 and anchors[-2] > 0:
+        decay = min(0.95, max(0.3, anchors[-1] / anchors[-2]))  # clamp para estabilidade
+    else:
+        decay = 0.66
+
+    # Constrói sequência base (monótona decrescente)
+    base = []
+    for i in range(total_tps):
+        if i < len(anchors):
+            base.append(anchors[i])
+        else:
+            nxt = base[-1] * decay if base else 1.0
+            # Evita estagnar muito perto de zero com muitos TPs
+            if nxt < 1e-6:
+                nxt = 1e-6
+            base.append(nxt)
+
+    s = sum(base)
+    if s <= 0:
+        return [100.0 / total_tps] * total_tps
+    # Normaliza para 100 e preserva ordem
+    dist = [x * (100.0 / s) for x in base]
+    # Pequena correção para somar exatamente 100: ajusta o último
+    total = sum(dist)
+    if total != 100.0:
+        dist[-1] += (100.0 - total)
+    # Garante não-crescente por segurança
+    for i in range(1, len(dist)):
+        if dist[i] > dist[i-1]:
+            dist[i] = dist[i-1]
+    return dist
 
 def _generate_trade_status_message(trade: Trade, status_title: str, pnl_data: dict = None, current_price: float = None) -> str:
     """Dashboard compacto e rico para a mensagem de status do trade (HTML)."""
@@ -257,29 +316,32 @@ async def check_active_trades_for_user(application: Application, user: User, db:
             pnl_frac = float(pnl_data.get("unrealized_pnl_frac") or 0.0)
             pnl_pct = pnl_frac * 100.0
 
-            # --- Lógica de STOP-GAIN ---
-            # Permite acionar mesmo após BE, contanto que seja melhoria e sem cruzar o preço atual.
-            if (user.stop_gain_trigger_pct or 0) > 0 and not trade.is_stop_gain_active:
-                if pnl_pct >= float(user.stop_gain_trigger_pct):
+            # --- Stop-Gain com degraus (ladder) ---
+            # Em cada múltiplo do gatilho, avança a trava proporcionalmente ao número de degraus.
+            sg_trig = float(getattr(user, 'stop_gain_trigger_pct', 0) or 0.0)
+            sg_lock = float(getattr(user, 'stop_gain_lock_pct', 0) or 0.0)
+            if sg_trig > 0 and sg_lock > 0:
+                steps = int(math.floor(pnl_pct / sg_trig))
+                if steps >= 1:
                     log_prefix = f"[Stop-Gain {trade.symbol}]"
                     if trade.side == 'LONG':
-                        new_sl = trade.entry_price * (1 + (float(user.stop_gain_lock_pct or 0) / 100))
+                        new_sl = float(trade.entry_price) * (1.0 + (sg_lock / 100.0) * steps)
                     else:
-                        new_sl = trade.entry_price * (1 - (float(user.stop_gain_lock_pct or 0) / 100))
+                        new_sl = float(trade.entry_price) * (1.0 - (sg_lock / 100.0) * steps)
 
                     is_improvement = (trade.side == 'LONG' and new_sl > (trade.current_stop_loss or float('-inf'))) or \
                                      (trade.side == 'SHORT' and new_sl < (trade.current_stop_loss or float('inf')))
                     is_valid_to_set = (trade.side == 'LONG' and new_sl < current_price) or \
                                       (trade.side == 'SHORT' and new_sl > current_price)
-                    
+
                     if is_improvement and is_valid_to_set:
                         sl_result = await modify_position_stop_loss(api_key, api_secret, trade.symbol, new_sl, reason="lock")
                         if sl_result.get("success"):
-                            trade.is_stop_gain_active = True
+                            trade.is_stop_gain_active = True  # marca que foi ativado pelo menos uma vez
                             trade.current_stop_loss = new_sl
                             message_was_edited = True
-                            status_title_update = f"💰 Stop-Gain Ativado (+{float(user.stop_gain_lock_pct or 0):.2f}%)"
-                            logger.info(f"{log_prefix} SL → ${new_sl:.4f}")
+                            status_title_update = f"💰 Stop-Gain Avançado (+{sg_lock:.2f}% x {steps})"
+                            logger.info(f"{log_prefix} SL → ${new_sl:.4f} (steps={steps})")
                         else:
                             logger.error(f"{log_prefix} Falha ao mover SL (lock): {sl_result.get('error', 'desconhecido')}")
 
@@ -296,31 +358,18 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                         logger.warning(f"{trade.symbol}: total_initial_targets inválido ({trade.total_initial_targets}).")
                         continue
 
-                    # --- INÍCIO DA MODIFICAÇÃO: Lógica de Cálculo de Quantidade de TP ---
-                    qty_to_close = 0.0
+                    # --- Nova lógica de distribuição: adaptativa, decrescente e normalizada ---
                     strategy = getattr(user, 'tp_distribution', 'EQUAL')
-                    use_equal_distribution = True
-
-                    if strategy != 'EQUAL':
-                        try:
-                            percentages = [float(p) for p in strategy.split(',')]
-                            if len(percentages) == trade.total_initial_targets:
-                                # Calcula o índice do alvo atual (0 para o primeiro, 1 para o segundo, etc.)
-                                target_index = trade.total_initial_targets - len(trade.initial_targets)
-                                current_tp_percent = percentages[target_index]
-                                # A quantidade a fechar é baseada na QUANTIDADE INICIAL TOTAL do trade
-                                qty_to_close = trade.qty * (current_tp_percent / 100.0)
-                                use_equal_distribution = False # Sucesso ao usar estratégia customizada
-                                logger.info(f"[TP Custom] {trade.symbol}: Usando {current_tp_percent}% (alvo #{target_index + 1}). Qtd: {qty_to_close}")
-                            else:
-                                logger.warning(f"[TP Custom] {trade.symbol}: Fallback para 'EQUAL'. Número de TPs do sinal ({trade.total_initial_targets}) é diferente do número de porcentagens ({len(percentages)}).")
-                        except (ValueError, IndexError) as e:
-                            logger.error(f"[TP Custom] {trade.symbol}: Fallback para 'EQUAL'. Erro ao parsear a estratégia '{strategy}': {e}")
-                    
-                    if use_equal_distribution:
-                        # Lógica original como fallback
-                        qty_to_close = trade.qty / trade.total_initial_targets
-                    # --- FIM DA MODIFICAÇÃO ---
+                    dist = _compute_tp_distribution(strategy, int(trade.total_initial_targets))
+                    # Índice do TP atual (0-based)
+                    target_index = trade.total_initial_targets - len(trade.initial_targets)
+                    try:
+                        current_tp_percent = float(dist[target_index])
+                    except Exception:
+                        current_tp_percent = 100.0 / float(trade.total_initial_targets)
+                    qty_to_close = trade.qty * (current_tp_percent / 100.0)
+                    logger.info(f"[TP Distrib] %s: TP#%d = %.4f%% -> qty %.8f",
+                                trade.symbol, target_index + 1, current_tp_percent, qty_to_close)
                     
                     position_idx_to_close = 1 if trade.side == 'LONG' else 2
 

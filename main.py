@@ -30,6 +30,8 @@ from bot.handlers import (
     toggle_bot_status_handler,
     ask_stop_gain_trigger, receive_stop_gain_trigger, ASKING_STOP_GAIN_TRIGGER,
     ask_stop_gain_lock, receive_stop_gain_lock, ASKING_STOP_GAIN_LOCK,
+    ask_be_trigger, receive_be_trigger, ASKING_BE_TRIGGER,
+    ask_ts_trigger, receive_ts_trigger, ASKING_TS_TRIGGER,
     ask_circuit_threshold, receive_circuit_threshold, ASKING_CIRCUIT_THRESHOLD,
     ask_circuit_pause, receive_circuit_pause, ASKING_CIRCUIT_PAUSE,
     ask_ma_timeframe, set_ma_timeframe,
@@ -159,6 +161,16 @@ async def main():
         states={ ASKING_STOP_GAIN_LOCK: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_stop_gain_lock)] },
         fallbacks=[CommandHandler("cancel", cancel)], per_message=False, per_user=True,
     )
+    be_trigger_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(ask_be_trigger, pattern='^set_be_trigger$')],
+        states={ ASKING_BE_TRIGGER: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_be_trigger)] },
+        fallbacks=[CommandHandler("cancel", cancel)], per_message=False, per_user=True,
+    )
+    ts_trigger_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(ask_ts_trigger, pattern='^set_ts_trigger$')],
+        states={ ASKING_TS_TRIGGER: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_ts_trigger)] },
+        fallbacks=[CommandHandler("cancel", cancel)], per_message=False, per_user=True,
+    )
     circuit_threshold_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(ask_circuit_threshold, pattern='^set_circuit_threshold$')],
         states={ ASKING_CIRCUIT_THRESHOLD: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_circuit_threshold)] },
@@ -205,6 +217,8 @@ async def main():
     application.add_handler(whitelist_conv)
     application.add_handler(stop_gain_trigger_conv)
     application.add_handler(stop_gain_lock_conv)
+    application.add_handler(be_trigger_conv)
+    application.add_handler(ts_trigger_conv)
     
     application.add_handler(CommandHandler("admin", admin_menu))
     application.add_handler(CallbackQueryHandler(list_channels_handler, pattern='^admin_list_channels$'))
