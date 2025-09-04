@@ -2,7 +2,7 @@ import logging
 import asyncio
 import os
 import random
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from datetime import datetime, time, timedelta
 from pybit.unified_trading import HTTP
 from pybit.exceptions import InvalidRequestError
@@ -902,6 +902,97 @@ async def get_closed_pnl_breakdown(api_key: str, api_secret: str, start_time: da
             }
         except Exception as e:
             logger.error(f"Exceção em get_closed_pnl_breakdown: {e}", exc_info=True)
+            return {"success": False, "error": str(e)}
+
+    return await asyncio.to_thread(_sync_call)
+
+
+async def get_closed_pnl_for_trade(
+    api_key: str,
+    api_secret: str,
+    symbol: str,
+    side: str,
+    start_time: datetime,
+    end_time: Optional[datetime] = None,
+) -> dict:
+    """
+    Agrega o PnL fechado para um trade específico (por símbolo e lado),
+    dentro de uma janela de tempo. Retorna PnL bruto, taxas (se disponíveis),
+    funding (se disponível) e PnL líquido.
+
+    Observação: Nem todos os campos de taxa/funding são expostos de forma
+    consistente pela API; quando ausentes, são tratados como 0.
+    """
+    def _sync_call() -> dict:
+        try:
+            session = get_session(api_key, api_secret)
+            if end_time is None:
+                end = datetime.now()
+            else:
+                end = end_time
+
+            # Busca até 7 dias por página; itera se necessário.
+            cur = start_time
+            items: List[Dict[str, Any]] = []
+            while cur < end:
+                nxt = min(cur + timedelta(days=7), end)
+                resp = session.get_closed_pnl(
+                    category="linear",
+                    symbol=symbol,
+                    startTime=int(cur.timestamp() * 1000),
+                    endTime=int(nxt.timestamp() * 1000),
+                    limit=200,
+                )
+                if resp.get("retCode") != 0:
+                    return {"success": False, "error": resp.get("retMsg", "Erro get_closed_pnl")}
+                page = (resp.get("result", {}) or {}).get("list", []) or []
+                items.extend(page)
+                cur = nxt
+
+            # Normaliza lado
+            want = (side or "").upper()
+            want_api = "Buy" if want == "LONG" else "Sell"
+
+            gross = 0.0
+            fees = 0.0
+            funding = 0.0
+            last_exit_type = None
+
+            for it in items:
+                if (it.get("side") or it.get("positionSide") or "").strip() != want_api:
+                    continue
+                try:
+                    gross += float(it.get("closedPnl", 0) or 0)
+                except Exception:
+                    pass
+                # taxas (melhor esforço)
+                for key in ("orderFee", "fees", "fee", "closeFee", "openFee"):
+                    try:
+                        fees += float(it.get(key, 0) or 0)
+                    except Exception:
+                        pass
+                for key in ("cumFundingFee", "fundingFee"):
+                    try:
+                        funding += float(it.get(key, 0) or 0)
+                    except Exception:
+                        pass
+                # tipo de saída (se disponível)
+                if not last_exit_type:
+                    s = (it.get("stopOrderType") or it.get("orderType") or "").strip()
+                    if s:
+                        last_exit_type = s
+
+            net = gross - fees - funding
+            return {
+                "success": True,
+                "gross_pnl": gross,
+                "fees": fees,
+                "funding": funding,
+                "net_pnl": net,
+                "exit_type": last_exit_type or "Unknown",
+            }
+        except Exception as e:
+            logger.error(f"Exceção em get_closed_pnl_for_trade: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
     return await asyncio.to_thread(_sync_call)

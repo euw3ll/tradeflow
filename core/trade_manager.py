@@ -60,10 +60,16 @@ async def _avaliar_sinal(signal_data: dict, user_settings: User) -> Tuple[bool, 
             logger.warning(f"Não foi possível obter dados históricos para {symbol} no timeframe {tf}. Filtros para este timeframe serão ignorados.")
             hist_data_map[tf] = None
             continue
-        
-        # Converte os dados para um DataFrame do Pandas
-        df = pd.DataFrame(klines_result['data'], columns=['startTime', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
-        df['close'] = pd.to_numeric(df['close']) # Garante que os preços são numéricos
+
+        # Converte os dados para um DataFrame do Pandas em ordem cronológica crescente
+        df = pd.DataFrame(
+            klines_result['data'],
+            columns=['startTime', 'open', 'high', 'low', 'close', 'volume', 'turnover']
+        )
+        # Garante tipos numéricos adequados e ordenação por tempo (oldest -> newest)
+        df['close'] = pd.to_numeric(df['close'], errors='coerce')
+        df['startTime'] = pd.to_numeric(df['startTime'], errors='coerce')
+        df = df.sort_values(by='startTime').reset_index(drop=True)
         hist_data_map[tf] = df
 
     # Filtro 2: Média Móvel (MA)
@@ -71,15 +77,19 @@ async def _avaliar_sinal(signal_data: dict, user_settings: User) -> Tuple[bool, 
         df_ma = hist_data_map.get(user_settings.ma_timeframe)
         if df_ma is not None:
             ma_period = user_settings.ma_period
-            df_ma.ta.sma(length=ma_period, append=True) # Calcula e adiciona a coluna da MA
-            
-            latest_close = df_ma['close'].iloc[0]
-            latest_ma = df_ma[f'SMA_{ma_period}'].iloc[0]
+            df_ma = df_ma.copy()
+            df_ma.ta.sma(length=ma_period, append=True)  # Calcula e adiciona a coluna da MA
 
-            if side == 'LONG' and latest_close < latest_ma:
-                return False, f"Rejeitado por Média Móvel (preço {latest_close:.4f} < MA {latest_ma:.4f})"
-            if side == 'SHORT' and latest_close > latest_ma:
-                return False, f"Rejeitado por Média Móvel (preço {latest_close:.4f} > MA {latest_ma:.4f})"
+            ma_col = f'SMA_{ma_period}'
+            last_idx = df_ma[ma_col].last_valid_index()
+            if last_idx is not None:
+                latest_close = float(df_ma.loc[last_idx, 'close'])
+                latest_ma = float(df_ma.loc[last_idx, ma_col])
+
+                if side == 'LONG' and latest_close < latest_ma:
+                    return False, f"Rejeitado por Média Móvel (preço {latest_close:.4f} < MA {latest_ma:.4f})"
+                if side == 'SHORT' and latest_close > latest_ma:
+                    return False, f"Rejeitado por Média Móvel (preço {latest_close:.4f} > MA {latest_ma:.4f})"
 
     # Filtro 3: Índice de Força Relativa (RSI)
     if user_settings.is_rsi_filter_enabled:
@@ -87,14 +97,18 @@ async def _avaliar_sinal(signal_data: dict, user_settings: User) -> Tuple[bool, 
         if df_rsi is not None:
             oversold = user_settings.rsi_oversold_threshold
             overbought = user_settings.rsi_overbought_threshold
-            df_rsi.ta.rsi(append=True) # Calcula e adiciona a coluna do RSI
-            
-            latest_rsi = df_rsi['RSI_14'].iloc[0]
+            df_rsi = df_rsi.copy()
+            df_rsi.ta.rsi(append=True)  # Calcula e adiciona a coluna do RSI
 
-            if side == 'LONG' and latest_rsi > overbought:
-                return False, f"Rejeitado por RSI (RSI {latest_rsi:.2f} > Sobrecompra {overbought})"
-            if side == 'SHORT' and latest_rsi < oversold:
-                return False, f"Rejeitado por RSI (RSI {latest_rsi:.2f} < Sobrevenda {oversold})"
+            rsi_col = 'RSI_14'
+            last_idx = df_rsi[rsi_col].last_valid_index()
+            if last_idx is not None:
+                latest_rsi = float(df_rsi.loc[last_idx, rsi_col])
+
+                if side == 'LONG' and latest_rsi > overbought:
+                    return False, f"Rejeitado por RSI (RSI {latest_rsi:.2f} > Sobrecompra {overbought})"
+                if side == 'SHORT' and latest_rsi < oversold:
+                    return False, f"Rejeitado por RSI (RSI {latest_rsi:.2f} < Sobrevenda {oversold})"
     
     # --- FIM DA NOVA LÓGICA ---
 

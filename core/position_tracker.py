@@ -257,8 +257,9 @@ async def check_active_trades_for_user(application: Application, user: User, db:
             pnl_frac = float(pnl_data.get("unrealized_pnl_frac") or 0.0)
             pnl_pct = pnl_frac * 100.0
 
-            # --- Lógica de STOP-GAIN (sem alterações) ---
-            if (user.stop_gain_trigger_pct or 0) > 0 and not trade.is_stop_gain_active and not trade.is_breakeven:
+            # --- Lógica de STOP-GAIN ---
+            # Permite acionar mesmo após BE, contanto que seja melhoria e sem cruzar o preço atual.
+            if (user.stop_gain_trigger_pct or 0) > 0 and not trade.is_stop_gain_active:
                 if pnl_pct >= float(user.stop_gain_trigger_pct):
                     log_prefix = f"[Stop-Gain {trade.symbol}]"
                     if trade.side == 'LONG':
@@ -659,16 +660,49 @@ async def confirm_and_close_trade(
     Retorna True se persistiu fechamento com dados; False caso contrário.
     """
     info = None
-    if get_last_closed_trade_info:
+    # 1) Tenta calcular PnL do trade por símbolo+lado dentro da janela
+    try:
+        from services.bybit_service import get_closed_pnl_for_trade
+        api_key = decrypt_data(user.api_key_encrypted)
+        api_secret = decrypt_data(user.api_secret_encrypted)
+        start_ts = getattr(trade, "created_at", None)
+        if start_ts is None:
+            from datetime import datetime, timedelta
+            start_ts = datetime.utcnow() - timedelta(hours=6)
+        for i in range(1, attempts + 1):
+            agg = await get_closed_pnl_for_trade(
+                api_key, api_secret, trade.symbol, trade.side, start_ts
+            )
+            if agg.get("success"):
+                # Se não achou itens, gross/fees/funding devem ser 0 e exit_type Unknown — considera sem dados
+                gross = float(agg.get("gross_pnl", 0) or 0)
+                fees = float(agg.get("fees", 0) or 0)
+                funding = float(agg.get("funding", 0) or 0)
+                etype = agg.get("exit_type") or ""
+                if gross != 0 or fees != 0 or funding != 0 or (etype and etype.lower() != "unknown"):
+                    info = {
+                        "pnl": float(agg.get("net_pnl", 0) or 0),
+                        "exit_type": agg.get("exit_type"),
+                        "exit_price": None,
+                        "closed_at": None,
+                    }
+                    logger.debug("[close-confirm] agg info obtida para %s: %s", trade.symbol, str(info))
+                    break
+            await asyncio.sleep(delay_seconds)
+    except Exception:
+        logger.exception("[close-confirm] falha no cálculo agregado do PnL para %s. Usando fallback.", trade.symbol)
+
+    # 2) Fallback: usa detetive simples (último closedPnL do símbolo)
+    if not info and get_last_closed_trade_info:
         for i in range(1, attempts + 1):
             try:
                 info = await get_last_closed_trade_info(trade.symbol)
                 if info:
-                    logger.debug("[close-confirm] info obtida para %s na tentativa %d: %s", trade.symbol, i, str(info))
+                    logger.debug("[close-confirm:fallback] info obtida para %s na tentativa %d: %s", trade.symbol, i, str(info))
                     break
-                logger.debug("[close-confirm] sem info para %s na tentativa %d.", trade.symbol, i)
+                logger.debug("[close-confirm:fallback] sem info para %s na tentativa %d.", trade.symbol, i)
             except Exception:
-                logger.exception("[close-confirm] tentativa %d falhou para %s", i, trade.symbol)
+                logger.exception("[close-confirm:fallback] tentativa %d falhou para %s", i, trade.symbol)
             await asyncio.sleep(delay_seconds)
 
     def _fmt_money(v):
