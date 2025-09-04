@@ -6,7 +6,7 @@ from services.signal_parser import SignalType
 from services.bybit_service import get_account_info, cancel_order 
 from datetime import datetime, time, timedelta 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-import subprocess
+import os, subprocess
 from telegram.ext import ContextTypes, ConversationHandler
 from telegram.error import BadRequest
 from database.session import SessionLocal
@@ -231,7 +231,7 @@ async def refresh_active_messages_handler(update: Update, context: ContextTypes.
         db.close()
 
 async def open_information_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Mostra a seção 'Informações' com última atualização e explicações."""
+    """Mostra a seção 'Informações' com última atualização e guia detalhado."""
     query = update.callback_query
     await query.answer()
 
@@ -239,41 +239,74 @@ async def open_information_handler(update: Update, context: ContextTypes.DEFAULT
         try:
             def _run():
                 msg = subprocess.check_output(["git", "log", "-1", "--pretty=%B"], text=True).strip()
-                date = subprocess.check_output(["git", "log", "-1", "--date=iso-local", "--pretty=%cd"], text=True).strip()
+                date = subprocess.check_output(["git", "show", "-s", "--format=%ci", "HEAD"], text=True).strip()
                 short = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], text=True).strip()
                 return msg, date, short
             return await asyncio.to_thread(_run)
         except Exception:
             return None
 
+    # Tenta git; se falhar, usa variáveis de ambiente definidas no build/deploy
     git_info = await _fetch_git_info()
-    commit_subject = "Não disponível"
-    commit_body = ""
-    commit_date = "—"
-    commit_hash = "—"
     if git_info:
         full_msg, commit_date, commit_hash = git_info
-        lines = (full_msg or "").splitlines()
-        commit_subject = lines[0] if lines else "(sem mensagem)"
-        commit_body = "\n".join(lines[1:]).strip()
+    else:
+        # Fallback 1: variáveis de ambiente
+        full_msg = os.getenv("BUILD_MESSAGE", "")
+        commit_date = os.getenv("BUILD_DATE", "")
+        commit_hash = os.getenv("BUILD_COMMIT", "")
+        # Fallback 2: arquivo COMMIT_INFO (opcional, 3 linhas: hash, date, message...)
+        if not any([full_msg, commit_date, commit_hash]):
+            try:
+                with open("COMMIT_INFO", "r", encoding="utf-8") as f:
+                    lines = [l.rstrip("\n") for l in f.readlines()]
+                if lines:
+                    commit_hash = lines[0] if len(lines) >= 1 else commit_hash
+                    commit_date = lines[1] if len(lines) >= 2 else commit_date
+                    full_msg = "\n".join(lines[2:]).strip() if len(lines) >= 3 else full_msg
+            except Exception:
+                pass
+        # Valores finais padrão
+        commit_date = commit_date or "—"
+        commit_hash = commit_hash or "—"
+
+    lines = (full_msg or "").splitlines()
+    commit_subject = lines[0] if lines else "Não disponível"
+    commit_body = "\n".join(lines[1:]).strip()
 
     info_text = (
         "<b>ℹ️ Informações</b>\n\n"
-        "<b>Última atualização</b>\n"
-        f"• Data: {commit_date}\n"
-        f"• Commit: {commit_subject} ({commit_hash})\n"
-        + (f"• Descrição:\n<code>{commit_body}</code>\n\n" if commit_body else "\n") +
-        "<b>Como funciona o bot</b>\n\n"
-        "1) <b>Coleta de sinais</b>: monitoramos canais selecionados e padronizamos os sinais.\n"
-        "2) <b>Filtros</b>: MA/RSI, whitelist de moedas e confiança mínima.\n"
-        "3) <b>Risco</b>: tamanho de entrada (%), alavancagem máxima, metas diárias.\n"
-        "4) <b>Execução</b>: ordens a mercado ou limite, SL validado e TPs gerenciados.\n"
-        "5) <b>Gestão</b>: Stop‑Gain (Breakeven/Trailing), disjuntor e pausas.\n"
-        "6) <b>Fechamento</b>: por alvo, stop, manual ou externo — tudo logado.\n\n"
-        "<b>Glossário rápido</b>\n"
+        "🛠️ <b>Última atualização</b>\n"
+        f"• 🗓️ Data: {commit_date}\n"
+        f"• 🔖 Commit: <code>{commit_hash}</code>\n"
+        f"• 📝 Mensagem: {commit_subject}\n"
+        + (f"• 📄 Descrição:\n<code>{commit_body}</code>\n\n" if commit_body else "\n") +
+        "📚 <b>Como funciona o bot</b>\n\n"
+        "1) 🔎 <b>Coleta de sinais</b>\n"
+        "   • Monitoramos fontes selecionadas e padronizamos as entradas.\n\n"
+        "2) 🧪 <b>Filtros</b>\n"
+        "   • Média Móvel (MA), RSI, whitelist de moedas e confiança mínima.\n\n"
+        "3) 🎛️ <b>Risco & Tamanho</b>\n"
+        "   • Tamanho de entrada (%), alavancagem máxima, metas diárias de lucro/perda.\n\n"
+        "4) 🧾 <b>Execução</b>\n"
+        "   • Ordens a mercado ou limite, SL validado e TPs gerenciados.\n\n"
+        "5) 🛡️ <b>Gestão de posição (Stop‑Gain)</b>\n"
+        "   • <b>Breakeven</b>: ao atingir o gatilho, o SL sobe para o preço de entrada (protegendo capital).\n"
+        "   • <b>Trailing</b>: o SL acompanha a evolução do preço após o gatilho.\n"
+        "   • <b>Trava</b>: porcentagem fixa acima do gatilho para consolidar parte do ganho.\n\n"
+        "6) ✅ <b>Fechamento</b>\n"
+        "   • Por alvo (TP), por <b>Stop Loss</b>, manual ou externo — sempre registrado.\n\n"
+        "🏷️ <b>Status que você verá</b>\n"
+        "• ⏳ <b>Em andamento</b>: posição aberta sendo gerenciada; P/L e TPs atualizam em tempo real.\n"
+        "• 🏆 <b>Lucro</b>: posição encerrada com resultado positivo (atingiu TP ou fechamento manual positivo).\n"
+        "• 🛑 <b>Prejuízo / Stop</b>: posição encerrada no SL ou com resultado negativo.\n"
+        "• ✅ <b>Fechado manualmente</b>: você encerrou a posição pelo botão.\n"
+        "• ℹ️ <b>Fechado externamente</b>: posição encerrada fora do bot (app/corretora).\n"
+        "• 👋 <b>Aprovação</b>: quando o modo Manual está ativo, você recebe botões para aprovar/rejeitar entradas.\n\n"
+        "❓ <b>Glossário rápido</b>\n"
         "• <b>Stop Loss</b>: preço que encerra a posição para limitar perdas.\n"
-        "• <b>Take Profit</b>: preço(s) de realização parcial/total de lucro.\n"
-        "• <b>Status</b>: ACTIVE, CLOSED_PROFIT, CLOSED_LOSS, CLOSED_MANUAL, CLOSED_EXTERNALLY.\n"
+        "• <b>Take Profit</b>: um ou mais preços de realização de lucro.\n"
+        "• <b>Stop‑Gain</b>: estratégia para <i>proteger ganhos</i> (Breakeven/Trailing com gatilho e trava).\n"
     )
 
     await query.edit_message_text(info_text, parse_mode='HTML', reply_markup=info_menu_keyboard())
