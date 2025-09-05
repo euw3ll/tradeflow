@@ -309,6 +309,32 @@ async def open_information_handler(update: Update, context: ContextTypes.DEFAULT
     finally:
         db.close()
 
+    # Normaliza a data do commit para America/Sao_Paulo, se possível
+    def _normalize_commit_date(s: str) -> str:
+        if not s:
+            return "—"
+        from datetime import datetime
+        import pytz
+        br = pytz.timezone("America/Sao_Paulo")
+        fmts = [
+            "%Y-%m-%d %H:%M:%S %z",
+            "%Y-%m-%d %H:%M:%S%z",
+            "%Y-%m-%dT%H:%M:%S%z",
+            "%Y-%m-%dT%H:%M:%S.%f%z",
+            "%Y-%m-%d %H:%M:%S",
+        ]
+        for fmt in fmts:
+            try:
+                dt = datetime.strptime(s, fmt)
+                if not dt.tzinfo:
+                    dt = pytz.utc.localize(dt)
+                return dt.astimezone(br).strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                continue
+        return s
+
+    commit_date = _normalize_commit_date(commit_date)
+
     lines = (full_msg or "").splitlines()
     commit_subject = lines[0] if lines else "Não disponível"
 
@@ -1752,8 +1778,20 @@ async def list_closed_trades_handler(update: Update, context: ContextTypes.DEFAU
         if not closed_trades:
             message += "Nenhum trade fechado encontrado no seu histórico."
         else:
+            import pytz
+            br_tz = pytz.timezone("America/Sao_Paulo")
+            utc = pytz.utc
             for trade in closed_trades:
-                data_fechamento = trade.closed_at.strftime('%d/%m %H:%M') if trade.closed_at else 'N/A'
+                if trade.closed_at:
+                    dt = trade.closed_at
+                    try:
+                        if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None:
+                            dt = utc.localize(dt)
+                        data_fechamento = dt.astimezone(br_tz).strftime('%d/%m %H:%M')
+                    except Exception:
+                        data_fechamento = trade.closed_at.strftime('%d/%m %H:%M')
+                else:
+                    data_fechamento = 'N/A'
 
                 render_mode = "fallback_externo"
                 if trade.closed_pnl is not None:

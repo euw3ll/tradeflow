@@ -18,6 +18,7 @@ from utils.security import decrypt_data
 from sqlalchemy.sql import func
 from telegram.error import BadRequest
 from typing import Optional, Callable, Awaitable, Dict, Any, Set, Tuple, List
+import pytz
 
 logger = logging.getLogger(__name__)
 
@@ -796,7 +797,34 @@ async def confirm_and_close_trade(
         if pnl is not None:
             lines.append(f"• P/L: <b>{_fmt_money_signed(pnl)}</b>")
         if closed_at_val:
-            lines.append(f"• Horário: <b>{closed_at_val}</b>")
+            # Tenta converter para America/Sao_Paulo
+            from datetime import datetime
+            br = pytz.timezone("America/Sao_Paulo")
+            try:
+                dt = None
+                if isinstance(closed_at_val, (int, float)):
+                    ts = float(closed_at_val)
+                    if ts > 10_000_000_000:
+                        ts = ts / 1000.0
+                    dt = datetime.utcfromtimestamp(ts).replace(tzinfo=pytz.utc)
+                elif isinstance(closed_at_val, str):
+                    # Tenta ISO first
+                    try:
+                        dt = datetime.fromisoformat(closed_at_val.replace("Z", "+00:00"))
+                        if not dt.tzinfo:
+                            dt = pytz.utc.localize(dt)
+                    except Exception:
+                        dt = None
+                elif hasattr(closed_at_val, 'tzinfo'):
+                    dt = closed_at_val
+                    if not dt.tzinfo:
+                        dt = pytz.utc.localize(dt)
+                if dt is not None:
+                    lines.append(f"• Horário: <b>{dt.astimezone(br).strftime('%d/%m %H:%M')}</b>")
+                else:
+                    lines.append(f"• Horário: <b>{closed_at_val}</b>")
+            except Exception:
+                lines.append(f"• Horário: <b>{closed_at_val}</b>")
         final_text = "\n".join(lines)
     else:
         lines = [
