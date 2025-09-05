@@ -6,7 +6,7 @@ from services.signal_parser import SignalType
 from services.bybit_service import get_account_info, cancel_order 
 from datetime import datetime, time, timedelta 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-import os, subprocess
+import os, re, subprocess
 from telegram.ext import ContextTypes, ConversationHandler
 from telegram.error import BadRequest
 from database.session import SessionLocal
@@ -273,6 +273,31 @@ async def open_information_handler(update: Update, context: ContextTypes.DEFAULT
                     full_msg = "\n".join(lines[2:]).strip() if len(lines) >= 3 else full_msg
             except Exception:
                 pass
+        # Fallback 3: última modificação do código (aproximação)
+        if not any([full_msg, commit_date, commit_hash]):
+            def _latest_change():
+                latest_ts = 0
+                latest_path = None
+                for root, _, files in os.walk('.'):
+                    for fname in files:
+                        if fname.endswith(('.py', '.sql', '.ini', '.yml', '.yaml', '.txt', '.md')):
+                            p = os.path.join(root, fname)
+                            try:
+                                ts = os.path.getmtime(p)
+                                if ts > latest_ts:
+                                    latest_ts, latest_path = ts, p
+                            except Exception:
+                                continue
+                return latest_ts, latest_path
+            try:
+                ts, pth = await asyncio.to_thread(_latest_change)
+                if ts:
+                    from datetime import datetime
+                    commit_date = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')
+                    commit_hash = 'local'
+                    full_msg = f'Alteração mais recente em {pth}'
+            except Exception:
+                pass
         # Valores finais padrão
         commit_date = commit_date or "—"
         commit_hash = commit_hash or "—"
@@ -291,7 +316,7 @@ async def open_information_handler(update: Update, context: ContextTypes.DEFAULT
     if user:
         bot_state = "Ativo" if user.is_active else "Pausado"
         sleep = " (Modo Dormir)" if (user.is_active and user.is_sleep_mode_enabled) else ""
-        approval = "Manual 👋" if str(user.approval_mode).upper() == 'MANUAL' else "Automático ⚡"
+        approval = "Manual" if str(user.approval_mode).upper() == 'MANUAL' else "Automático"
         risk = f"{float(user.entry_size_percent or 0):.1f}% @ {int(user.max_leverage or 0)}x (conf. mín. {float(user.min_confidence or 0):.0f}%)"
         stop_strategy = (getattr(user, 'stop_strategy', '') or '').upper()
         stop_strategy_label = "Breakeven" if stop_strategy.startswith('BREAKEVEN') or stop_strategy.startswith('BREAK') else "Trailing"
@@ -312,27 +337,27 @@ async def open_information_handler(update: Update, context: ContextTypes.DEFAULT
         daily_l = float(getattr(user, 'daily_loss_limit', 0) or 0)
         circuit_th = int(getattr(user, 'circuit_breaker_threshold', 0) or 0)
         circuit_pause = int(getattr(user, 'circuit_breaker_pause_minutes', 0) or 0)
-        bybit_link = "Conectado ✅" if getattr(user, 'api_key_encrypted', None) else "Não conectado ❌"
+        bybit_link = "Conectado" if getattr(user, 'api_key_encrypted', None) else "Não conectado"
 
         status_lines += [
-            f"• 🤖 Bot: <b>{bot_state}{sleep}</b>",
-            f"• 🧭 Aprovação: <b>{approval}</b>",
-            f"• 🔗 Bybit: <b>{bybit_link}</b>",
-            f"• 🧮 Risco: <b>{risk}</b>",
-            f"• 🛡️ Stop‑Gain: <b>{stopgain}</b>",
-            f"• 🎯 Gatilhos BE/TS: <b>{be_trg:.2f}% / {ts_trg:.2f}%</b>",
-            f"• 🎯 TP: <b>{tp_distribution}</b>",
-            f"• 📅 Metas do dia: lucro <b>${daily_p:,.2f}</b> / perda <b>${daily_l:,.2f}</b>",
-            f"• 🔌 Filtros: <b>{filters_text}</b> (MA {ma_period}/{ma_timeframe}, RSI {rsi_oversold}/{rsi_overbought})",
-            f"• ✅ Whitelist: <code>{whitelist}</code>",
-            f"• 🚫 Disjuntor: limite <b>{circuit_th}</b> / pausa <b>{circuit_pause} min</b>",
+            f"• Bot: <b>{bot_state}{sleep}</b>",
+            f"• Aprovação: <b>{approval}</b>",
+            f"• Bybit: <b>{bybit_link}</b>",
+            f"• Risco: <b>{risk}</b>",
+            f"• Stop‑Gain: <b>{stopgain}</b>",
+            f"• Gatilhos BE/TS: <b>{be_trg:.2f}% / {ts_trg:.2f}%</b>",
+            f"• TP: <b>{tp_distribution}</b>",
+            f"• Metas do dia: lucro <b>${daily_p:,.2f}</b> / perda <b>${daily_l:,.2f}</b>",
+            f"• Filtros: <b>{filters_text}</b> (MA {ma_period}/{ma_timeframe}, RSI {rsi_oversold}/{rsi_overbought})",
+            f"• Whitelist: <code>{whitelist}</code>",
+            f"• Disjuntor: limite <b>{circuit_th}</b> / pausa <b>{circuit_pause} min</b>",
         ]
     status_lines += [
         "",
         "🛠️ <b>Última atualização</b>",
-        f"• 🗓️ Data: {commit_date}",
-        f"• 🔖 Commit: <code>{commit_hash}</code>",
-        f"• 📝 Mensagem: {commit_subject}",
+        f"• Data: {commit_date}",
+        f"• Commit: <code>{commit_hash}</code>",
+        f"• Mensagem: {commit_subject}",
     ]
 
     await query.edit_message_text("\n".join(status_lines), parse_mode='HTML', reply_markup=info_menu_keyboard())
@@ -346,6 +371,53 @@ LEARN_PAGES = [
         "• Filtramos ruídos e extraímos símbolo, lado (LONG/SHORT), SL e TPs.\n\n"
         "🧪 <b>Pré‑filtros</b>\n"
         "• Média Móvel (MA), RSI, whitelist e confiança mínima — você decide o quanto filtrar.\n"
+    ),
+    (
+        "<b>📖 Guia — Take Profit (TP)</b>\n\n"
+        "O que é: preço(s) em que parte da posição é fechada para realizar lucro.\n\n"
+        "Como o bot usa TPs:\n"
+        "• Se o sinal tem <b>1 TP</b>, ele pode ser enviado diretamente à corretora.\n"
+        "• Se há <b>múltiplos TPs</b>, o bot gerencia <i>fechamentos parciais</i> na sequência.\n\n"
+        "Distribuição de TPs:\n"
+        "• Estratégia <b>EQUAL</b>: divide igualmente entre os alvos.\n"
+        "• Estratégia <b>personalizada</b> (ex.: 50,30,20): usa as âncoras e ajusta cauda para somar 100%.\n"
+        "• Se houver mais TPs que âncoras, a cauda decai progressivamente e é normalizada.\n"
+    ),
+    (
+        "<b>📖 Guia — Gestão de TPs pelo bot</b>\n\n"
+        "Execução prática:\n"
+        "• Cada alvo atingido fecha a fração correspondente da posição.\n"
+        "• O restante segue para os próximos TPs, até zerar a posição ou ser parado pelo SL/Stop‑Gain.\n\n"
+        "Observações:\n"
+        "• Se o tamanho remanescente ficar pequeno (abaixo do mínimo da corretora), o bot pode fechar tudo no próximo evento.\n"
+        "• A distribuição é aplicada sobre o <i>tamanho de entrada</i> já ajustado por alavancagem e regras do símbolo.\n"
+    ),
+    (
+        "<b>📖 Guia — Stop Loss (SL)</b>\n\n"
+        "O que é: preço que encerra a posição para limitar perdas.\n\n"
+        "Exemplos práticos:\n"
+        "• LONG: entrada 1.0000, SL 0.9800 → se o preço cair até 0.9800, a posição é fechada.\n"
+        "• SHORT: entrada 1.0000, SL 1.0200 → se o preço subir até 1.0200, a posição é fechada.\n\n"
+        "Regras e validações:\n"
+        "• O SL precisa estar do <i>lado correto</i> do preço; o bot valida contra o preço atual e o tick do instrumento.\n"
+        "• Em Stop‑Gain (Breakeven/Trailing), o SL pode ser movido automaticamente.\n"
+    ),
+    (
+        "<b>📖 Guia — Disjuntor</b>\n\n"
+        "Objetivo: pausar novas operações de uma direção (LONG/SHORT) quando há perdas recorrentes.\n\n"
+        "Como funciona:\n"
+        "• Você define um <b>limite</b> (ex.: 2). Se houver esse número de trades <i>ativos</i> em prejuízo na mesma direção, ativa a pausa.\n"
+        "• A pausa dura o período definido (<b>pausa</b> em minutos).\n"
+        "• Durante a pausa, novos sinais naquela direção são ignorados. Após o tempo, as entradas voltam normalmente.\n"
+    ),
+    (
+        "<b>📖 Guia — Aprovação Manual vs Automática</b>\n\n"
+        "Automática: o bot executa o sinal assim que ele passa pelos filtros e whitelist.\n\n"
+        "Manual: você recebe botões para <b>Aprovar</b> ou <b>Rejeitar</b> cada entrada.\n\n"
+        "Exemplos de fluxo:\n"
+        "• Modo Manual → chega o sinal → você toca em Aprovar → o bot executa e começa a gerenciar SL/TP.\n"
+        "• Modo Automático → chega o sinal → o bot executa diretamente, respeitando seus filtros.\n"
+        "Você pode alternar o modo em Configuração do Bot a qualquer momento.\n"
     ),
     (
         "<b>📖 Guia — Risco & Tamanho</b>\n\n"
@@ -411,11 +483,12 @@ async def info_learn_start_handler(update: Update, context: ContextTypes.DEFAULT
 async def info_learn_nav_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    # format: info_learn_nav_<dir>_<idx>
-    try:
-        _, _, direction, idx_str = (query.data or '').split('_', 3)
-        idx = int(idx_str)
-    except Exception:
+    # format: info_learn_nav_(prev|next)_<idx>
+    m = re.match(r'^info_learn_nav_(prev|next)_(\d+)$', query.data or '')
+    if m:
+        direction = m.group(1)
+        idx = int(m.group(2))
+    else:
         direction, idx = 'next', 0
     total = len(LEARN_PAGES)
     if direction == 'prev':
