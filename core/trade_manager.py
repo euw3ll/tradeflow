@@ -280,10 +280,19 @@ async def process_new_signal(signal_data: dict, application: Application, source
                 # 1. Verifica se há uma pausa ativa para a direção do sinal
                 signal_side = signal_data.get('order_type')
                 is_paused = False
-                # Usa datetime timezone-aware para comparar com campos timezone-aware do DB
-                if signal_side == 'LONG' and user.long_trades_paused_until and datetime.now(pytz.utc) < user.long_trades_paused_until:
+                # Usa datetime timezone-aware para comparar com campos do DB.
+                # Também normaliza valores antigos que possam ter sido salvos como 'naive'.
+                now_utc = datetime.now(pytz.utc)
+                long_paused = user.long_trades_paused_until
+                short_paused = user.short_trades_paused_until
+                if long_paused is not None and getattr(long_paused, 'tzinfo', None) is None:
+                    long_paused = long_paused.replace(tzinfo=pytz.utc)
+                if short_paused is not None and getattr(short_paused, 'tzinfo', None) is None:
+                    short_paused = short_paused.replace(tzinfo=pytz.utc)
+
+                if signal_side == 'LONG' and long_paused and now_utc < long_paused:
                     is_paused = True
-                elif signal_side == 'SHORT' and user.short_trades_paused_until and datetime.now(pytz.utc) < user.short_trades_paused_until:
+                elif signal_side == 'SHORT' and short_paused and now_utc < short_paused:
                     is_paused = True
                 
                 if is_paused:

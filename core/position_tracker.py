@@ -718,7 +718,8 @@ async def confirm_and_close_trade(
         start_ts = getattr(trade, "created_at", None)
         if start_ts is None:
             from datetime import datetime, timedelta
-            start_ts = datetime.utcnow() - timedelta(hours=6)
+            # Use timezone-aware UTC to avoid naive/aware comparison issues downstream
+            start_ts = datetime.now(pytz.utc) - timedelta(hours=6)
         for i in range(1, attempts + 1):
             agg = await get_closed_pnl_for_trade(
                 api_key, api_secret, trade.symbol, trade.side, start_ts
@@ -876,7 +877,8 @@ async def confirm_and_close_trade(
                         ts = float(closed_at_val)
                         if ts > 10_000_000_000:
                             ts = ts / 1000.0
-                        trade.closed_at = datetime.utcfromtimestamp(ts)
+                        # Store timezone-aware UTC timestamps in DB columns configured with timezone=True
+                        trade.closed_at = datetime.utcfromtimestamp(ts).replace(tzinfo=pytz.utc)
                     elif isinstance(closed_at_val, str):
                         trade.closed_at = datetime.fromisoformat(closed_at_val.replace("Z", "+00:00"))
                     else:
