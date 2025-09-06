@@ -8,7 +8,7 @@ from datetime import datetime, time, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 import os, re, subprocess
 from telegram.ext import ContextTypes, ConversationHandler
-from telegram.error import BadRequest
+from telegram.error import BadRequest, TimedOut
 from database.session import SessionLocal
 from database.models import User, InviteCode, MonitoredTarget, Trade, SignalForApproval
 from .keyboards import (
@@ -2527,7 +2527,11 @@ async def show_stopgain_menu_handler(update: Update, context: ContextTypes.DEFAU
 
 async def show_circuit_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    try:
+        await query.answer()
+    except TimedOut:
+        # ack do Telegram expirou; segue normalmente
+        logger.warning("[settings] circuito: query.answer timeout (ignorado)")
     db = SessionLocal()
     try:
         user = db.query(User).filter(User.telegram_id == query.from_user.id).first()
@@ -2545,7 +2549,10 @@ async def show_circuit_menu_handler(update: Update, context: ContextTypes.DEFAUL
 
 async def back_to_settings_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    try:
+        await query.answer()
+    except TimedOut:
+        logger.warning("[settings] voltar: query.answer timeout (ignorado)")
     db = SessionLocal()
     try:
         user = db.query(User).filter(User.telegram_id == query.from_user.id).first()
@@ -2553,7 +2560,14 @@ async def back_to_settings_menu_handler(update: Update, context: ContextTypes.DE
             await query.edit_message_text("Não encontrei seu usuário. Use /start para registrar.")
             return
         header = "⚙️ <b>Configurações de Trade</b>\n<i>Escolha uma categoria para ajustar seus parâmetros.</i>"
-        await query.edit_message_text(text=header, reply_markup=settings_menu_keyboard(user), parse_mode="HTML")
+        try:
+            await query.edit_message_text(text=header, reply_markup=settings_menu_keyboard(user), parse_mode="HTML")
+        except BadRequest as br:
+            # Evita erro barulhento quando o conteúdo é idêntico
+            if 'message is not modified' in str(br).lower():
+                logger.info("[settings] voltar menu raiz: mensagem não modificada (ignorado)")
+                return
+            raise
     except Exception as e:
         logger.error(f"[settings] voltar menu raiz: {e}", exc_info=True)
         await query.edit_message_text("Não foi possível voltar ao menu de configurações agora.")

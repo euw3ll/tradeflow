@@ -81,7 +81,7 @@ async def on_error(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if isinstance(err, (TimedOut, RetryAfter, NetworkError)) or (
             err and any(s in str(err) for s in ("ConnectTimeout", "ReadTimeout"))
         ):
-            logger.warning("Transient Telegram network error suppressed: %s", repr(err))
+            logger.debug("Transient Telegram network error suppressed: %s", repr(err))
             return
         if isinstance(err, Conflict):
             logger.error("Conflict: another getUpdates is running. Ensure single instance.")
