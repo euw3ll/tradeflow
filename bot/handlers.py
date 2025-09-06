@@ -46,6 +46,7 @@ ASKING_COIN_WHITELIST = 15
 ASKING_TP_DISTRIBUTION = 25
 ASKING_BE_TRIGGER = 26
 ASKING_TS_TRIGGER = 27
+ASKING_CLEANUP_MINUTES = 28
 
 logger = logging.getLogger(__name__)
 
@@ -176,13 +177,24 @@ async def notifications_settings_handler(update: Update, context: ContextTypes.D
     """Abre a seção de Configurações de Notificações."""
     query = update.callback_query
     await query.answer()
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.telegram_id == query.from_user.id).first()
+    finally:
+        db.close()
+
+    mode = getattr(user, 'msg_cleanup_mode', 'OFF') if user else 'OFF'
+    delay = int(getattr(user, 'msg_cleanup_delay_minutes', 30) or 30) if user else 30
+    mode_human = 'Desativada' if mode == 'OFF' else ('Após ' + str(delay) + ' min' if mode == 'AFTER' else 'Fim do dia')
+
     await query.edit_message_text(
         text=(
             "🔔 <b>Configurações de Notificações</b>\n\n"
-            "Se você apagou o chat com o bot e perdeu as mensagens ativas, use a opção abaixo para recriá-las."
+            "• Limpeza de mensagens fechadas: <b>" + mode_human + "</b>\n"
+            "• Dica: mensagens ativas podem ser recriadas abaixo."
         ),
         parse_mode='HTML',
-        reply_markup=notifications_menu_keyboard()
+        reply_markup=notifications_menu_keyboard(user)
     )
 
 async def refresh_active_messages_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -647,6 +659,85 @@ async def receive_api_secret(update: Update, context: ContextTypes.DEFAULT_TYPE)
         context.user_data.pop('entry_message_id', None)
         context.user_data.pop('api_key', None)
 
+    return ConversationHandler.END
+
+# --- Notificações: Toggle limpeza ---
+async def toggle_cleanup_mode_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.telegram_id == query.from_user.id).first()
+        if not user:
+            await query.edit_message_text("Usuário não encontrado.")
+            return
+        cur = (getattr(user, 'msg_cleanup_mode', 'OFF') or 'OFF').upper()
+        nxt = 'AFTER' if cur == 'OFF' else ('EOD' if cur == 'AFTER' else 'OFF')
+        user.msg_cleanup_mode = nxt
+        db.commit()
+        await query.edit_message_text(
+            text=(
+                "🔔 <b>Configurações de Notificações</b>\n\n"
+                f"• Limpeza de mensagens fechadas: <b>{'Desativada' if nxt=='OFF' else ('Após ' + str(int(user.msg_cleanup_delay_minutes or 30)) + ' min' if nxt=='AFTER' else 'Fim do dia')}</b>\n"
+            ),
+            parse_mode='HTML',
+            reply_markup=notifications_menu_keyboard(user)
+        )
+    finally:
+        db.close()
+
+async def ask_cleanup_minutes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        text=(
+            "Digite o tempo (em minutos) para excluir mensagens de trades já fechados.\n"
+            "Ex.: 30. Use 0 para desativar (equivale a OFF)."
+        )
+    )
+    return ASKING_CLEANUP_MINUTES
+
+async def receive_cleanup_minutes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.effective_user.id
+    text = (update.message.text or '').strip().replace(',', '.')
+    try:
+        n = int(float(text))
+        if n < 0:
+            raise ValueError
+    except Exception:
+        await update.message.reply_text("Valor inválido. Envie um número inteiro (ex.: 30).")
+        return ASKING_CLEANUP_MINUTES
+
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.telegram_id == user_id).first()
+        if not user:
+            await update.message.reply_text("Usuário não encontrado.")
+            return ConversationHandler.END
+        if n == 0:
+            user.msg_cleanup_mode = 'OFF'
+        else:
+            user.msg_cleanup_mode = 'AFTER'
+            user.msg_cleanup_delay_minutes = n
+        db.commit()
+    finally:
+        db.close()
+
+    # Mostra menu de notificações atualizado
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.telegram_id == user_id).first()
+    finally:
+        db.close()
+    await context.bot.send_message(
+        chat_id=user_id,
+        text=(
+            "🔔 <b>Configurações de Notificações</b>\n\n"
+            f"• Limpeza de mensagens fechadas: <b>{'Desativada' if user.msg_cleanup_mode=='OFF' else ('Após ' + str(int(user.msg_cleanup_delay_minutes or 30)) + ' min' if user.msg_cleanup_mode=='AFTER' else 'Fim do dia')}</b>\n"
+        ),
+        parse_mode='HTML',
+        reply_markup=notifications_menu_keyboard(user)
+    )
     return ConversationHandler.END
 
 def _format_currency(v: float) -> str:

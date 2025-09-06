@@ -29,6 +29,7 @@ from bot.handlers import (
     performance_menu_handler, list_closed_trades_handler,
     prompt_manual_close_handler, execute_manual_close_handler,
     open_settings_root_handler, notifications_settings_handler, refresh_active_messages_handler, open_information_handler,
+    toggle_cleanup_mode_handler, ask_cleanup_minutes, receive_cleanup_minutes, ASKING_CLEANUP_MINUTES,
     toggle_bot_status_handler,
     ask_stop_gain_trigger, receive_stop_gain_trigger, ASKING_STOP_GAIN_TRIGGER,
     ask_stop_gain_lock, receive_stop_gain_lock, ASKING_STOP_GAIN_LOCK,
@@ -280,6 +281,13 @@ async def main():
     application.add_handler(CallbackQueryHandler(toggle_approval_mode_handler, pattern='^toggle_approval_mode$'))
     # Notificações
     application.add_handler(CallbackQueryHandler(notifications_settings_handler, pattern='^notifications_settings$'))
+    application.add_handler(CallbackQueryHandler(toggle_cleanup_mode_handler, pattern='^toggle_cleanup_mode$'))
+    cleanup_minutes_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(ask_cleanup_minutes, pattern='^ask_cleanup_minutes$')],
+        states={ ASKING_CLEANUP_MINUTES: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_cleanup_minutes)] },
+        fallbacks=[CommandHandler("cancel", cancel)], per_message=False, per_user=True,
+    )
+    application.add_handler(cleanup_minutes_conv)
     application.add_handler(CallbackQueryHandler(refresh_active_messages_handler, pattern='^refresh_active_messages$'))
 
     application.add_handler(CallbackQueryHandler(handle_signal_approval, pattern=r'^(approve_signal_|reject_signal_)'))

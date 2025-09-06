@@ -684,6 +684,7 @@ async def run_tracker(application: Application):
                 for user in all_users:
                     await check_pending_orders_for_user(application, user, db)
                     await check_active_trades_for_user(application, user, db)
+                    await cleanup_closed_trade_messages(application, user, db)
                 db.commit()
             else:
                 logger.info("Rastreador: Nenhum usuário com API para verificar.")
@@ -695,6 +696,70 @@ async def run_tracker(application: Application):
             db.close()
 
         await asyncio.sleep(15)
+
+async def cleanup_closed_trade_messages(application: Application, user: User, db: Session) -> None:
+    """
+    Exclui mensagens no Telegram de trades já fechados, conforme a política do usuário:
+      - OFF: não faz nada
+      - AFTER: exclui se (now - closed_at) >= delay_minutes
+      - EOD: exclui se o trade fechou em um dia anterior ao dia atual (America/Sao_Paulo)
+    Após excluir, zera notification_message_id para evitar repetição.
+    """
+    mode = (getattr(user, 'msg_cleanup_mode', 'OFF') or 'OFF').upper()
+    if mode == 'OFF':
+        return
+
+    delay_minutes = int(getattr(user, 'msg_cleanup_delay_minutes', 30) or 30)
+    br_tz = pytz.timezone('America/Sao_Paulo')
+    from datetime import datetime
+
+    # Busca trades fechados que ainda têm mensagem
+    closed_with_msg: List[Trade] = db.query(Trade).filter(
+        Trade.user_telegram_id == user.telegram_id,
+        Trade.status.like('%CLOSED%'),
+        Trade.notification_message_id.isnot(None)
+    ).order_by(Trade.closed_at.desc()).all()
+
+    for t in closed_with_msg:
+        try:
+            if not getattr(t, 'closed_at', None):
+                continue
+            closed_at = t.closed_at
+            try:
+                if getattr(closed_at, 'tzinfo', None) is None:
+                    # assume UTC se naive
+                    from datetime import timezone
+                    closed_at = closed_at.replace(tzinfo=pytz.utc)
+            except Exception:
+                pass
+
+            should_delete = False
+            if mode == 'AFTER':
+                try:
+                    delta = datetime.utcnow().replace(tzinfo=pytz.utc) - closed_at.astimezone(pytz.utc)
+                    if delta.total_seconds() >= delay_minutes * 60:
+                        should_delete = True
+                except Exception:
+                    pass
+            elif mode == 'EOD':
+                try:
+                    closed_br = closed_at.astimezone(br_tz).date()
+                    now_br = datetime.utcnow().replace(tzinfo=pytz.utc).astimezone(br_tz).date()
+                    if closed_br < now_br:
+                        should_delete = True
+                except Exception:
+                    pass
+
+            if should_delete and getattr(t, 'notification_message_id', None):
+                try:
+                    await application.bot.delete_message(chat_id=user.telegram_id, message_id=t.notification_message_id)
+                except BadRequest:
+                    pass
+                except Exception:
+                    pass
+                t.notification_message_id = None
+        except Exception:
+            logger.exception('[cleanup] falha ao avaliar trade_id=%s', getattr(t, 'id', None))
 
 async def notify_sync_status(application, user, trade, text: Optional[str] = None) -> None:
     """

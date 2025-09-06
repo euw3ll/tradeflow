@@ -308,9 +308,23 @@ def settings_root_keyboard() -> InlineKeyboardMarkup:
     ]
     return InlineKeyboardMarkup(kb)
 
-def notifications_menu_keyboard() -> InlineKeyboardMarkup:
-    """Menu de Configurações de Notificações."""
+def notifications_menu_keyboard(user=None) -> InlineKeyboardMarkup:
+    """Menu de Configurações de Notificações.
+    Mostra e permite ajustar a política de limpeza das mensagens fechadas.
+    """
+    mode = getattr(user, 'msg_cleanup_mode', 'OFF') if user is not None else 'OFF'
+    delay = int(getattr(user, 'msg_cleanup_delay_minutes', 30) or 30) if user is not None else 30
+
+    if mode == 'AFTER':
+        mode_text = f"🧹 Limpeza: Após {delay} min"
+    elif mode == 'EOD':
+        mode_text = "🧹 Limpeza: Fim do dia"
+    else:
+        mode_text = "🧹 Limpeza: Desativada"
+
     kb = [
+        [InlineKeyboardButton(mode_text, callback_data='toggle_cleanup_mode')],
+        [InlineKeyboardButton("⏱️ Definir minutos", callback_data='ask_cleanup_minutes')],
         [InlineKeyboardButton("♻️ Recriar mensagens ativas", callback_data='refresh_active_messages')],
         [InlineKeyboardButton("⬅️ Voltar", callback_data='open_settings_root')],
     ]
