@@ -255,20 +255,48 @@ async def check_pending_orders_for_user(application: Application, user: User, db
                 # Fallback para ordens antigas que não tinham o ID da mensagem salvo.
                 sent_message = await application.bot.send_message(chat_id=user.telegram_id, text=message, parse_mode='HTML')
 
-            new_trade = Trade(
-                user_telegram_id=order.user_telegram_id, order_id=order.order_id,
-                notification_message_id=sent_message.message_id, # Passa o ID correto para o trade
-                symbol=order.symbol, side=side, qty=qty, entry_price=entry_price,
-                stop_loss=stop_loss, current_stop_loss=stop_loss,
-                initial_targets=all_targets,
-                total_initial_targets=num_targets,
-                status='ACTIVE', remaining_qty=qty
-            )
-            db.add(new_trade)
-            logger.info("[order->trade] %s %s qty=%.6f entry=%.6f msg_id=%s",
-                new_trade.symbol, new_trade.side, new_trade.qty, new_trade.entry_price,
-                str(getattr(new_trade, "notification_message_id", None)))
+            # --- DEDUPE: se já existir trade ativo para este símbolo, atualiza-o; caso contrário cria um novo ---
+            existing = db.query(Trade).filter(
+                Trade.user_telegram_id == order.user_telegram_id,
+                Trade.symbol == order.symbol,
+                ~Trade.status.like('%CLOSED%')
+            ).order_by(Trade.created_at.desc()).first()
 
+            if existing:
+                # Atualiza o trade existente com os dados confirmados da execução
+                existing.order_id = existing.order_id or order.order_id
+                existing.side = side
+                existing.qty = qty
+                existing.remaining_qty = qty
+                existing.entry_price = entry_price
+                existing.stop_loss = stop_loss
+                existing.current_stop_loss = stop_loss
+                existing.initial_targets = all_targets
+                existing.total_initial_targets = num_targets
+                # Prioriza a mensagem recém-enviada para manter o histórico coerente
+                existing.notification_message_id = sent_message.message_id
+                logger.info(
+                    "[order->trade:merge] %s %s qty=%.6f entry=%.6f -> trade_id=%s",
+                    existing.symbol, existing.side, existing.qty, existing.entry_price, str(existing.id)
+                )
+            else:
+                new_trade = Trade(
+                    user_telegram_id=order.user_telegram_id, order_id=order.order_id,
+                    notification_message_id=sent_message.message_id, # Passa o ID correto para o trade
+                    symbol=order.symbol, side=side, qty=qty, entry_price=entry_price,
+                    stop_loss=stop_loss, current_stop_loss=stop_loss,
+                    initial_targets=all_targets,
+                    total_initial_targets=num_targets,
+                    status='ACTIVE', remaining_qty=qty
+                )
+                db.add(new_trade)
+                logger.info(
+                    "[order->trade:new] %s %s qty=%.6f entry=%.6f msg_id=%s",
+                    new_trade.symbol, new_trade.side, new_trade.qty, new_trade.entry_price,
+                    str(getattr(new_trade, "notification_message_id", None))
+                )
+
+            # Em qualquer dos casos, remove o PendingSignal correspondente
             db.delete(order)
 
 
@@ -575,6 +603,16 @@ async def run_tracker(application: Application):
                     pos = bybit_map_by_symbol.get(symbol)
                     if not pos:
                         continue  # segurança
+
+                    # Safeguard: se aparecer um trade ativo para o mesmo símbolo (concorrência), não duplique
+                    exists_active = db.query(Trade).filter(
+                        Trade.user_telegram_id == user.telegram_id,
+                        Trade.symbol == symbol,
+                        ~Trade.status.like('%CLOSED%')
+                    ).first()
+                    if exists_active:
+                        logger.info("[sync:safe-skip] %s já tem trade ativo (id=%s).", symbol, str(exists_active.id))
+                        continue
 
                     side = pos.get("side")
                     entry = float(pos.get("entry", 0) or 0)

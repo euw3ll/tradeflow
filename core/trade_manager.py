@@ -192,18 +192,41 @@ async def _execute_trade(signal_data: dict, user: User, application: Application
         )
         sent_message = await application.bot.send_message(chat_id=user.telegram_id, text=message, parse_mode='HTML')
 
-        new_trade = Trade(
-            user_telegram_id=user.telegram_id, order_id=order_id,
-            notification_message_id=sent_message.message_id,
-            symbol=symbol, side=side, qty=qty, entry_price=entry_price,
-            stop_loss=stop_loss, current_stop_loss=stop_loss,
-            initial_targets=all_targets,
-            total_initial_targets=num_targets,
-            status='ACTIVE',
-            remaining_qty=qty
-        )
-        db.add(new_trade)
-        logger.info(f"Trade {order_id} para o usuário {user.telegram_id} salvo no DB com dados de execução.")
+        # --- DEDUPE: se já houver trade ativo do mesmo símbolo, atualiza em vez de duplicar ---
+        existing = db.query(Trade).filter(
+            Trade.user_telegram_id == user.telegram_id,
+            Trade.symbol == symbol,
+            ~Trade.status.like('%CLOSED%')
+        ).order_by(Trade.created_at.desc()).first()
+
+        if existing:
+            existing.order_id = existing.order_id or order_id
+            existing.side = side
+            existing.qty = qty
+            existing.remaining_qty = qty
+            existing.entry_price = entry_price
+            existing.stop_loss = stop_loss
+            existing.current_stop_loss = stop_loss
+            existing.initial_targets = all_targets
+            existing.total_initial_targets = num_targets
+            existing.notification_message_id = sent_message.message_id
+            logger.info(
+                "[market->trade:merge] %s %s qty=%.6f entry=%.6f -> trade_id=%s",
+                existing.symbol, existing.side, existing.qty, existing.entry_price, str(existing.id)
+            )
+        else:
+            new_trade = Trade(
+                user_telegram_id=user.telegram_id, order_id=order_id,
+                notification_message_id=sent_message.message_id,
+                symbol=symbol, side=side, qty=qty, entry_price=entry_price,
+                stop_loss=stop_loss, current_stop_loss=stop_loss,
+                initial_targets=all_targets,
+                total_initial_targets=num_targets,
+                status='ACTIVE',
+                remaining_qty=qty
+            )
+            db.add(new_trade)
+            logger.info(f"[market->trade:new] {order_id} para o usuário {user.telegram_id} salvo no DB.")
 
 async def process_new_signal(signal_data: dict, application: Application, source_name: str):
     """Processa um novo sinal, verificando a preferência de cada usuário individualmente."""

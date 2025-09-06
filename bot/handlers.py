@@ -838,6 +838,27 @@ async def my_positions_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             )
             return
 
+        # DEDUPE DE EXIBIÇÃO: em caso de resíduos antigos duplicados, mostra apenas 1 trade por símbolo
+        grouped = {}
+        for t in active_trades:
+            grouped.setdefault(t.symbol, []).append(t)
+        canonical_trades = []
+        for sym, items in grouped.items():
+            if len(items) == 1:
+                canonical_trades.append(items[0])
+            else:
+                # prioriza quem tem message_id e o mais recente
+                items_sorted = sorted(
+                    items,
+                    key=lambda x: (
+                        1 if getattr(x, 'notification_message_id', None) else 0,
+                        getattr(x, 'created_at', None) or datetime(1970,1,1),
+                        float(getattr(x, 'remaining_qty', None) or getattr(x, 'qty', 0.0) or 0.0)
+                    ),
+                    reverse=True
+                )
+                canonical_trades.append(items_sorted[0])
+
         live_pnl_data = {}
         live_positions_result = await get_open_positions_with_pnl(api_key, api_secret)
         if live_positions_result.get("success"):
@@ -847,11 +868,11 @@ async def my_positions_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         lines = ["<b>📊 Suas Posições Ativas (Gerenciadas pelo Bot)</b>", ""]
         keyboard_rows = []
         
-        if not active_trades:
+        if not canonical_trades:
              lines.append("Nenhuma posição encontrada na Bybit.")
         else:
             # COMENTÁRIO: A lógica agora itera por trade individual, sem agregação.
-            for trade in active_trades:
+            for trade in canonical_trades:
                 arrow = "⬆️" if trade.side == "LONG" else "⬇️"
                 entry = float(trade.entry_price or 0.0)
                 qty = float(trade.remaining_qty if trade.remaining_qty is not None else trade.qty)
@@ -889,11 +910,21 @@ async def my_positions_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         lines.append("<i>P/L é atualizado em tempo real pela corretora.</i>")
         keyboard_rows.append([InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data='back_to_main_menu')])
         
-        await query.edit_message_text(
-            "\n".join(lines), 
-            parse_mode='HTML', 
-            reply_markup=InlineKeyboardMarkup(keyboard_rows)
-        )
+        try:
+            await query.edit_message_text(
+                "\n".join(lines), 
+                parse_mode='HTML', 
+                reply_markup=InlineKeyboardMarkup(keyboard_rows)
+            )
+        except BadRequest as e:
+            # Se não for possível editar (ex.: apagada/antiga), envia nova
+            logger.warning(f"Falha ao editar lista de posições: {e}. Enviando nova mensagem.")
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="\n".join(lines),
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup(keyboard_rows)
+            )
 
     finally:
         db.close()
@@ -1593,12 +1624,15 @@ async def receive_loss_limit(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def performance_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Exibe o painel de desempenho e lida com a seleção de período, usando o fuso horário de SP."""
     query = update.callback_query
+    from telegram.error import TimedOut
     try:
         await query.answer()
     except BadRequest as e:
         # callback antigo/expirado: não faz nada e evita stacktrace
         logger.warning(f"[perf] callback expirado/antigo: {e}")
         return
+    except TimedOut as e:
+        logger.warning(f"[perf] query.answer timeout: {e} — seguindo fluxo mesmo assim")
 
     user_id = query.from_user.id
     

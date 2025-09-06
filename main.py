@@ -5,7 +5,7 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters, 
     ConversationHandler, CallbackQueryHandler, ContextTypes
 )
-from telegram.error import TelegramError
+from telegram.error import TelegramError, TimedOut, RetryAfter, NetworkError, Conflict
 from utils.config import TELEGRAM_TOKEN
 from bot.handlers import (
     start, receive_invite_code, cancel, WAITING_CODE,
@@ -72,9 +72,30 @@ async def run_ptb(application: Application, queue: asyncio.Queue):
     logger.info("✅ Bot do Telegram (PTB) ativo.")
 
 async def on_error(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Error handler global: loga a exceção e avisa o usuário (em chat privado)."""
+    """Error handler global: loga a exceção com contexto e avisa o usuário (apenas em chat privado)."""
     logger = logging.getLogger(__name__)
-    logger.error("Unhandled error", exc_info=context.error)
+    try:
+        # Curto‑circuito para erros transitórios de rede do Telegram
+        err = context.error
+        if isinstance(err, (TimedOut, RetryAfter, NetworkError)) or (
+            err and any(s in str(err) for s in ("ConnectTimeout", "ReadTimeout"))
+        ):
+            logger.warning("Transient Telegram network error suppressed: %s", repr(err))
+            return
+        if isinstance(err, Conflict):
+            logger.error("Conflict: another getUpdates is running. Ensure single instance.")
+            return
+        # Extra contexto útil para diagnosticar
+        ctx = {
+            "chat_id": getattr(getattr(update, "effective_chat", None), "id", None),
+            "chat_type": getattr(getattr(update, "effective_chat", None), "type", None),
+            "user_id": getattr(getattr(update, "effective_user", None), "id", None),
+            "callback_data": getattr(getattr(update, "callback_query", None), "data", None),
+            "message_text": getattr(getattr(update, "message", None), "text", None),
+        }
+        logger.error("Unhandled error | context=%s", ctx, exc_info=context.error)
+    except Exception:
+        logger.error("Unhandled error (failed to log context)", exc_info=context.error)
     try:
         if update and update.effective_chat and update.effective_chat.type == "private":
             await context.bot.send_message(
