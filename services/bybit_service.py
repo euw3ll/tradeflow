@@ -949,9 +949,14 @@ async def get_closed_pnl_for_trade(
                 items.extend(page)
                 cur = nxt
 
-            # Normaliza lado
+            # Normaliza lado da POSIÇÃO (preferência) e, como fallback, o lado da ORDEM DE FECHAMENTO
+            # Bybit: em closedPnL, geralmente temos:
+            #   - positionSide: "Long" | "Short"  (lado da posição)
+            #   - side: "Buy" | "Sell"            (lado da ordem que fechou)
+            # Para um LONG, a ordem de fechamento é Sell; para um SHORT, é Buy.
             want = (side or "").upper()
-            want_api = "Buy" if want == "LONG" else "Sell"
+            want_pos_side = "Long" if want == "LONG" else "Short"
+            want_close_side = "Sell" if want == "LONG" else "Buy"
 
             gross = 0.0
             fees = 0.0
@@ -959,8 +964,16 @@ async def get_closed_pnl_for_trade(
             last_exit_type = None
 
             for it in items:
-                if (it.get("side") or it.get("positionSide") or "").strip() != want_api:
-                    continue
+                # Preferimos filtrar por positionSide quando disponível; caso não haja,
+                # caímos no filtro por 'side' do fechamento (Buy/Sell inverso do LONG/SHORT)
+                pos_side = (it.get("positionSide") or "").strip()
+                side_close = (it.get("side") or "").strip()
+                if pos_side:
+                    if pos_side != want_pos_side:
+                        continue
+                else:
+                    if side_close != want_close_side:
+                        continue
                 try:
                     gross += float(it.get("closedPnl", 0) or 0)
                 except Exception:
