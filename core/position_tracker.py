@@ -802,8 +802,7 @@ async def confirm_and_close_trade(
     def _fmt_money_signed(v):
         try:
             f = float(v)
-            sign = "+" if f >= 0 else ""
-            return f"{sign}${abs(f):,.2f}" if False else f"{sign}{_fmt_money(abs(f) if f<0 else f)}"
+            return f"-${abs(f):,.2f}" if f < 0 else f"+${f:,.2f}"
         except Exception:
             return str(v)
 

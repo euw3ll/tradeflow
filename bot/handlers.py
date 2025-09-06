@@ -1832,7 +1832,8 @@ async def list_closed_trades_handler(update: Update, context: ContextTypes.DEFAU
                     try:
                         pnl_val = float(trade.closed_pnl)
                         emoji = "🏆" if pnl_val >= 0 else "🛑"
-                        resultado_str = f"{emoji} <b>{'Lucro' if pnl_val >= 0 else 'Prejuízo'}: ${pnl_val:,.2f}</b>"
+                        label = "Lucro (líquido)" if pnl_val >= 0 else "Prejuízo (líquido)"
+                        resultado_str = f"{emoji} <b>{label}: ${pnl_val:,.2f}</b>"
                         render_mode = "via_pnl"
                     except Exception:
                         status_upper = (trade.status or "").upper()
