@@ -681,10 +681,12 @@ async def toggle_cleanup_mode_handler(update: Update, context: ContextTypes.DEFA
         nxt = 'AFTER' if cur == 'OFF' else ('EOD' if cur == 'AFTER' else 'OFF')
         user.msg_cleanup_mode = nxt
         db.commit()
+        alert_mode = (getattr(user, 'alert_cleanup_mode', 'OFF') or 'OFF').upper()
         await query.edit_message_text(
             text=(
                 "🔔 <b>Configurações de Notificações</b>\n\n"
-                f"• Limpeza de mensagens fechadas: <b>{'Desativada' if nxt=='OFF' else ('Após ' + str(int(user.msg_cleanup_delay_minutes or 30)) + ' min' if nxt=='AFTER' else 'Fim do dia')}</b>\n"
+                f"• Fechados: <b>{'Desativada' if nxt=='OFF' else ('Após ' + str(int(user.msg_cleanup_delay_minutes or 30)) + ' min' if nxt=='AFTER' else 'Fim do dia')}</b>\n"
+                f"• Alertas gerais: <b>{'Desativada' if alert_mode=='OFF' else ('Após ' + str(int(getattr(user,'alert_cleanup_delay_minutes',30) or 30)) + ' min' if alert_mode=='AFTER' else 'Fim do dia')}</b>\n"
             ),
             parse_mode='HTML',
             reply_markup=notifications_menu_keyboard(user)
