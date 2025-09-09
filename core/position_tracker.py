@@ -672,7 +672,7 @@ async def run_tracker(application: Application):
                         f"A posição foi encontrada aberta na Bybit e adotada pelo bot.\n"
                         f"{'Alvos/SL recuperados.' if new_trade.total_initial_targets else 'Sem alvos conhecidos.'}"
                     )
-                    await application.bot.send_message(chat_id=user.telegram_id, text=msg, parse_mode='HTML')
+                    await send_user_alert(application, user.telegram_id, msg)
 
                 # Fechar fantasmas com tolerância (janela de 3 ciclos)
                 await apply_missing_cycles_policy(

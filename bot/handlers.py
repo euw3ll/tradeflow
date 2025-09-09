@@ -695,6 +695,7 @@ async def toggle_cleanup_mode_handler(update: Update, context: ContextTypes.DEFA
 async def ask_cleanup_minutes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
+    context.user_data['settings_message_id'] = query.message.message_id
     await query.edit_message_text(
         text=(
             "Digite o tempo (em minutos) para excluir mensagens de trades já fechados.\n"
@@ -706,12 +707,16 @@ async def ask_cleanup_minutes(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def receive_cleanup_minutes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
     text = (update.message.text or '').strip().replace(',', '.')
+    message_id_to_edit = context.user_data.get('settings_message_id')
     try:
         n = int(float(text))
         if n < 0:
             raise ValueError
     except Exception:
-        await update.message.reply_text("Valor inválido. Envie um número inteiro (ex.: 30).")
+        try: await update.message.delete()
+        except Exception: pass
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit,
+                                            text="Valor inválido. Envie um número inteiro (ex.: 30).")
         return ASKING_CLEANUP_MINUTES
 
     db = SessionLocal()
@@ -735,8 +740,11 @@ async def receive_cleanup_minutes(update: Update, context: ContextTypes.DEFAULT_
         user = db.query(User).filter(User.telegram_id == user_id).first()
     finally:
         db.close()
-    await context.bot.send_message(
+    try: await update.message.delete()
+    except Exception: pass
+    await context.bot.edit_message_text(
         chat_id=user_id,
+        message_id=message_id_to_edit,
         text=(
             "🔔 <b>Configurações de Notificações</b>\n\n"
             f"• Fechados: <b>{'Desativada' if user.msg_cleanup_mode=='OFF' else ('Após ' + str(int(user.msg_cleanup_delay_minutes or 30)) + ' min' if user.msg_cleanup_mode=='AFTER' else 'Fim do dia')}</b>\n"
@@ -776,6 +784,7 @@ async def toggle_alert_cleanup_mode_handler(update: Update, context: ContextType
 async def ask_alert_cleanup_minutes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
+    context.user_data['settings_message_id'] = query.message.message_id
     await query.edit_message_text(
         text=(
             "Digite o tempo (em minutos) para excluir mensagens de ALERTA (erros/avisos).\n"
@@ -787,12 +796,16 @@ async def ask_alert_cleanup_minutes(update: Update, context: ContextTypes.DEFAUL
 async def receive_alert_cleanup_minutes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
     text = (update.message.text or '').strip().replace(',', '.')
+    message_id_to_edit = context.user_data.get('settings_message_id')
     try:
         n = int(float(text))
         if n < 0:
             raise ValueError
     except Exception:
-        await update.message.reply_text("Valor inválido. Envie um número inteiro (ex.: 30).")
+        try: await update.message.delete()
+        except Exception: pass
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit,
+                                            text="Valor inválido. Envie um número inteiro (ex.: 30).")
         return ASKING_ALERT_CLEANUP_MINUTES
 
     db = SessionLocal()
@@ -815,8 +828,11 @@ async def receive_alert_cleanup_minutes(update: Update, context: ContextTypes.DE
         user = db.query(User).filter(User.telegram_id == user_id).first()
     finally:
         db.close()
-    await context.bot.send_message(
+    try: await update.message.delete()
+    except Exception: pass
+    await context.bot.edit_message_text(
         chat_id=user_id,
+        message_id=message_id_to_edit,
         text=(
             "🔔 <b>Configurações de Notificações</b>\n\n"
             f"• Fechados: <b>{'Desativada' if getattr(user,'msg_cleanup_mode','OFF')=='OFF' else ('Após ' + str(int(getattr(user,'msg_cleanup_delay_minutes',30) or 30)) + ' min' if getattr(user,'msg_cleanup_mode','OFF')=='AFTER' else 'Fim do dia')}</b>\n"
@@ -1370,87 +1386,114 @@ async def user_settings_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
 # ---- RISCO & TAMANHO ----
 async def receive_entry_percent(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message_id_to_edit = context.user_data.get('settings_message_id')
     text = (update.message.text or "").strip().replace("%", "").replace(",", ".")
     db = SessionLocal()
     try:
         value = float(text)
         if value <= 0 or value > 100:
-            await update.message.reply_text("Valor inválido. Envie um número entre 0 e 100 (ex.: 3.5).")
-            return ConversationHandler.END
+            try: await update.message.delete()
+            except Exception: pass
+            await context.bot.edit_message_text(
+                chat_id=update.effective_chat.id,
+                message_id=message_id_to_edit,
+                text="❌ Valor inválido. Envie um número entre 0 e 100 (ex.: 3.5)."
+            )
+            return ASKING_ENTRY_PERCENT
         user = db.query(User).filter_by(telegram_id=update.effective_user.id).first()
         if not user:
-            await update.message.reply_text("Usuário não encontrado. Use /start para registrar."); return ConversationHandler.END
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text="Usuário não encontrado. Use /start para registrar.")
+            return ConversationHandler.END
         user.entry_size_percent = value; db.commit()
         try: await update.message.delete()
         except Exception: pass
-        await context.bot.send_message(
+        await context.bot.edit_message_text(
             chat_id=update.effective_chat.id,
+            message_id=message_id_to_edit,
             text=f"🧮 <b>Risco & Tamanho</b>\n✅ Tamanho de entrada salvo: <b>{value:.1f}%</b>",
             reply_markup=risk_menu_keyboard(user), parse_mode="HTML",
         )
     except ValueError:
-        await update.message.reply_text("Não entendi. Envie um número (ex.: 3.5).")
+        try: await update.message.delete()
+        except Exception: pass
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text="❌ Não entendi. Envie um número (ex.: 3.5).")
+        return ASKING_ENTRY_PERCENT
     except Exception as e:
         db.rollback(); logger.error(f"[settings] entry_size_percent: {e}", exc_info=True)
-        await update.message.reply_text("Erro ao salvar. Tente novamente.")
+        try: await update.message.delete()
+        except Exception: pass
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text="Erro ao salvar. Tente novamente.")
+        return ASKING_ENTRY_PERCENT
     finally:
         db.close()
     return ConversationHandler.END
 
 
 async def receive_max_leverage(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message_id_to_edit = context.user_data.get('settings_message_id')
     text = (update.message.text or "").strip().lower().replace("x", "")
     db = SessionLocal()
     try:
         value = int(float(text))
         if value < 1 or value > 125:
-            await update.message.reply_text("Valor inválido. Envie um inteiro entre 1 e 125 (ex.: 10).")
-            return ConversationHandler.END
+            try: await update.message.delete()
+            except Exception: pass
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text="❌ Valor inválido. Envie um inteiro entre 1 e 125 (ex.: 10).")
+            return ASKING_MAX_LEVERAGE
         user = db.query(User).filter_by(telegram_id=update.effective_user.id).first()
         if not user:
-            await update.message.reply_text("Usuário não encontrado. Use /start para registrar."); return ConversationHandler.END
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text="Usuário não encontrado. Use /start para registrar.")
+            return ConversationHandler.END
         user.max_leverage = value; db.commit()
         try: await update.message.delete()
         except Exception: pass
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=f"🧮 <b>Risco & Tamanho</b>\n✅ Alavancagem máxima salva: <b>{value}x</b>",
-            reply_markup=risk_menu_keyboard(user), parse_mode="HTML",
-        )
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text=f"🧮 <b>Risco & Tamanho</b>\n✅ Alavancagem máxima salva: <b>{value}x</b>", reply_markup=risk_menu_keyboard(user), parse_mode="HTML")
     except ValueError:
-        await update.message.reply_text("Não entendi. Envie um número inteiro (ex.: 10).")
+        try: await update.message.delete()
+        except Exception: pass
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text="❌ Não entendi. Envie um número inteiro (ex.: 10).")
+        return ASKING_MAX_LEVERAGE
     except Exception as e:
         db.rollback(); logger.error(f"[settings] max_leverage: {e}", exc_info=True)
-        await update.message.reply_text("Erro ao salvar. Tente novamente.")
+        try: await update.message.delete()
+        except Exception: pass
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text="Erro ao salvar. Tente novamente.")
+        return ASKING_MAX_LEVERAGE
     finally:
         db.close()
     return ConversationHandler.END
 
 
 async def receive_min_confidence(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message_id_to_edit = context.user_data.get('settings_message_id')
     text = (update.message.text or "").strip().replace("%", "").replace(",", ".")
     db = SessionLocal()
     try:
         value = float(text)
         if value < 0 or value > 100:
-            await update.message.reply_text("Valor inválido. Envie um número entre 0 e 100 (ex.: 70).")
-            return ConversationHandler.END
+            try: await update.message.delete()
+            except Exception: pass
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text="❌ Valor inválido. Envie um número entre 0 e 100 (ex.: 70).")
+            return ASKING_MIN_CONFIDENCE
         user = db.query(User).filter_by(telegram_id=update.effective_user.id).first()
         if not user:
-            await update.message.reply_text("Usuário não encontrado. Use /start para registrar."); return ConversationHandler.END
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text="Usuário não encontrado. Use /start para registrar.")
+            return ConversationHandler.END
         user.min_confidence = value; db.commit()
         try: await update.message.delete()
         except Exception: pass
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=f"🧮 <b>Risco & Tamanho</b>\n✅ Confiança mínima salva: <b>{value:.1f}%</b>",
-            reply_markup=risk_menu_keyboard(user), parse_mode="HTML",
-        )
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text=f"🧮 <b>Risco & Tamanho</b>\n✅ Confiança mínima salva: <b>{value:.1f}%</b>", reply_markup=risk_menu_keyboard(user), parse_mode="HTML")
     except ValueError:
-        await update.message.reply_text("Não entendi. Envie um número (ex.: 70).")
+        try: await update.message.delete()
+        except Exception: pass
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text="❌ Não entendi. Envie um número (ex.: 70).")
+        return ASKING_MIN_CONFIDENCE
     except Exception as e:
         db.rollback(); logger.error(f"[settings] min_confidence: {e}", exc_info=True)
-        await update.message.reply_text("Erro ao salvar. Tente novamente.")
+        try: await update.message.delete()
+        except Exception: pass
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text="Erro ao salvar. Tente novamente.")
+        return ASKING_MIN_CONFIDENCE
     finally:
         db.close()
     return ConversationHandler.END
@@ -1857,6 +1900,7 @@ async def ask_coin_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     await query.answer()
 
+    context.user_data['settings_message_id'] = query.message.message_id
     db = SessionLocal()
     try:
         user = db.query(User).filter(User.telegram_id == query.from_user.id).first()
@@ -1904,11 +1948,15 @@ async def receive_coin_whitelist(update: Update, context: ContextTypes.DEFAULT_T
     Aceita tickers (ex.: BTCUSDT) e keywords de categorias (ex.: bluechips, defi, memecoins, infra, altcoins).
     """
     text = (update.message.text or "").strip()
+    message_id_to_edit = context.user_data.get('settings_message_id')
     db = SessionLocal()
     try:
         if not text:
-            await update.message.reply_text("Envie ao menos 1 ticker ou categoria. Ex.: BTCUSDT,ETHUSDT ou bluechips")
-            return ConversationHandler.END
+            try: await update.message.delete()
+            except Exception: pass
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit,
+                                               text="❌ Envie ao menos 1 ticker ou categoria. Ex.: BTCUSDT,ETHUSDT ou bluechips")
+            return ASKING_COIN_WHITELIST
 
         # Normalização básica
         raw_items = [i.strip().upper() for i in text.split(",") if i.strip()]
@@ -1925,7 +1973,8 @@ async def receive_coin_whitelist(update: Update, context: ContextTypes.DEFAULT_T
 
         user = db.query(User).filter(User.telegram_id == update.effective_user.id).first()
         if not user:
-            await update.message.reply_text("Usuário não encontrado. Use /start para registrar.")
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit,
+                                               text="Usuário não encontrado. Use /start para registrar.")
             return ConversationHandler.END
 
         # Se seu modelo for user.coin_whitelist_str ou similar, ajuste o campo aqui:
@@ -1951,8 +2000,9 @@ async def receive_coin_whitelist(update: Update, context: ContextTypes.DEFAULT_T
             "<i>Whitelist atualizada com sucesso.</i>\n\n"
             f"📦 <b>Lista salva</b>: <code>{normalized}</code>"
         )
-        await context.bot.send_message(
+        await context.bot.edit_message_text(
             chat_id=update.effective_chat.id,
+            message_id=message_id_to_edit,
             text=header,
             reply_markup=settings_menu_keyboard(user),
             parse_mode="HTML",
@@ -1960,7 +2010,10 @@ async def receive_coin_whitelist(update: Update, context: ContextTypes.DEFAULT_T
     except Exception as e:
         db.rollback()
         logger.error(f"[settings] receive_coin_whitelist erro: {e}", exc_info=True)
-        await update.message.reply_text("Erro ao salvar a whitelist. Tente novamente.")
+        try: await update.message.delete()
+        except Exception: pass
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text="Erro ao salvar a whitelist. Tente novamente.")
+        return ASKING_COIN_WHITELIST
     finally:
         db.close()
     return ConversationHandler.END
@@ -2201,181 +2254,223 @@ async def ask_ts_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def ask_circuit_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    context.user_data['settings_message_id'] = query.message.message_id
     await query.edit_message_text("⚡ Envie o <b>limite</b> do disjuntor (inteiro, ex.: 3)", parse_mode="HTML")
     return ASKING_CIRCUIT_THRESHOLD
 
 async def ask_circuit_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    context.user_data['settings_message_id'] = query.message.message_id
     await query.edit_message_text("⏸️ Envie a <b>pausa</b> após disparo (minutos, ex.: 120)", parse_mode="HTML")
     return ASKING_CIRCUIT_PAUSE
 
 # ---- STOP-GAIN ----
 async def receive_stop_gain_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message_id_to_edit = context.user_data.get('settings_message_id')
     text = (update.message.text or "").strip().replace("%", "").replace(",", ".")
     db = SessionLocal()
     try:
         value = float(text)
         if value < 0 or value > 100:
-            await update.message.reply_text("Valor inválido. Envie entre 0 e 100 (ex.: 3)."); return ConversationHandler.END
+            try: await update.message.delete()
+            except Exception: pass
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text="❌ Valor inválido. Envie entre 0 e 100 (ex.: 3).")
+            return ASKING_STOP_GAIN_TRIGGER
         user = db.query(User).filter_by(telegram_id=update.effective_user.id).first()
         if not user:
-            await update.message.reply_text("Usuário não encontrado. Use /start para registrar."); return ConversationHandler.END
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text="Usuário não encontrado. Use /start para registrar.")
+            return ConversationHandler.END
         user.stop_gain_trigger_pct = value; db.commit()
         try: await update.message.delete()
         except Exception: pass
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=f"🛡️ <b>Stop-Gain</b>\n✅ Gatilho salvo: <b>{value:.2f}%</b>",
-            reply_markup=stopgain_menu_keyboard(user), parse_mode="HTML",
-        )
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text=f"🛡️ <b>Stop-Gain</b>\n✅ Gatilho salvo: <b>{value:.2f}%</b>", reply_markup=stopgain_menu_keyboard(user), parse_mode="HTML")
     except ValueError:
-        await update.message.reply_text("Não entendi. Envie um número (ex.: 3).")
+        try: await update.message.delete()
+        except Exception: pass
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text="❌ Não entendi. Envie um número (ex.: 3).")
+        return ASKING_STOP_GAIN_TRIGGER
     except Exception as e:
         db.rollback(); logger.error(f"[settings] stop_gain_trigger_pct: {e}", exc_info=True)
-        await update.message.reply_text("Erro ao salvar. Tente novamente.")
+        try: await update.message.delete()
+        except Exception: pass
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text="Erro ao salvar. Tente novamente.")
+        return ASKING_STOP_GAIN_TRIGGER
     finally:
         db.close()
     return ConversationHandler.END
 
 
 async def receive_stop_gain_lock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message_id_to_edit = context.user_data.get('settings_message_id')
     text = (update.message.text or "").strip().replace("%", "").replace(",", ".")
     db = SessionLocal()
     try:
         value = float(text)
         if value < 0 or value > 100:
-            await update.message.reply_text("Valor inválido. Envie entre 0 e 100 (ex.: 1)."); return ConversationHandler.END
+            try: await update.message.delete()
+            except Exception: pass
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text="❌ Valor inválido. Envie entre 0 e 100 (ex.: 1).")
+            return ASKING_STOP_GAIN_LOCK
         user = db.query(User).filter_by(telegram_id=update.effective_user.id).first()
         if not user:
-            await update.message.reply_text("Usuário não encontrado. Use /start para registrar."); return ConversationHandler.END
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text="Usuário não encontrado. Use /start para registrar.")
+            return ConversationHandler.END
         user.stop_gain_lock_pct = value; db.commit()
         try: await update.message.delete()
         except Exception: pass
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=f"🛡️ <b>Stop-Gain</b>\n✅ Trava salva: <b>{value:.2f}%</b>",
-            reply_markup=stopgain_menu_keyboard(user), parse_mode="HTML",
-        )
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text=f"🛡️ <b>Stop-Gain</b>\n✅ Trava salva: <b>{value:.2f}%</b>", reply_markup=stopgain_menu_keyboard(user), parse_mode="HTML")
     except ValueError:
-        await update.message.reply_text("Não entendi. Envie um número (ex.: 1).")
+        try: await update.message.delete()
+        except Exception: pass
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text="❌ Não entendi. Envie um número (ex.: 1).")
+        return ASKING_STOP_GAIN_LOCK
     except Exception as e:
         db.rollback(); logger.error(f"[settings] stop_gain_lock_pct: {e}", exc_info=True)
-        await update.message.reply_text("Erro ao salvar. Tente novamente.")
+        try: await update.message.delete()
+        except Exception: pass
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text="Erro ao salvar. Tente novamente.")
+        return ASKING_STOP_GAIN_LOCK
     finally:
         db.close()
     return ConversationHandler.END
 
 async def receive_be_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message_id_to_edit = context.user_data.get('settings_message_id')
     text = (update.message.text or "").strip().replace("%", "").replace(",", ".")
     db = SessionLocal()
     try:
         value = float(text)
         if value < 0 or value > 100:
-            await update.message.reply_text("Valor inválido. Envie entre 0 e 100 (ex.: 2)."); return ConversationHandler.END
+            try: await update.message.delete()
+            except Exception: pass
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text="❌ Valor inválido. Envie entre 0 e 100 (ex.: 2).")
+            return ASKING_BE_TRIGGER
         user = db.query(User).filter_by(telegram_id=update.effective_user.id).first()
         if not user:
-            await update.message.reply_text("Usuário não encontrado. Use /start para registrar."); return ConversationHandler.END
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text="Usuário não encontrado. Use /start para registrar.")
+            return ConversationHandler.END
         # Persistência: atributo pode já existir na tabela; se não existir, SQL pode falhar. Exige migração.
         setattr(user, 'be_trigger_pct', value)
         db.commit()
         try: await update.message.delete()
         except Exception: pass
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=f"🛡️ <b>Stop-Gain / BE</b>\n✅ Gatilho Break‑Even por PnL salvo: <b>{value:.2f}%</b>",
-            reply_markup=stopgain_menu_keyboard(user), parse_mode="HTML",
-        )
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text=f"🛡️ <b>Stop-Gain / BE</b>\n✅ Gatilho Break‑Even por PnL salvo: <b>{value:.2f}%</b>", reply_markup=stopgain_menu_keyboard(user), parse_mode="HTML")
     except ValueError:
-        await update.message.reply_text("Não entendi. Envie um número (ex.: 2).")
+        try: await update.message.delete()
+        except Exception: pass
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text="❌ Não entendi. Envie um número (ex.: 2).")
+        return ASKING_BE_TRIGGER
     except Exception as e:
         db.rollback(); logger.error(f"[settings] be_trigger_pct: {e}", exc_info=True)
-        await update.message.reply_text("Erro ao salvar. Tente novamente.")
+        try: await update.message.delete()
+        except Exception: pass
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text="Erro ao salvar. Tente novamente.")
+        return ASKING_BE_TRIGGER
     finally:
         db.close()
     return ConversationHandler.END
 
 async def receive_ts_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message_id_to_edit = context.user_data.get('settings_message_id')
     text = (update.message.text or "").strip().replace("%", "").replace(",", ".")
     db = SessionLocal()
     try:
         value = float(text)
         if value < 0 or value > 100:
-            await update.message.reply_text("Valor inválido. Envie entre 0 e 100 (ex.: 3)."); return ConversationHandler.END
+            try: await update.message.delete()
+            except Exception: pass
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text="❌ Valor inválido. Envie entre 0 e 100 (ex.: 3).")
+            return ASKING_TS_TRIGGER
         user = db.query(User).filter_by(telegram_id=update.effective_user.id).first()
         if not user:
-            await update.message.reply_text("Usuário não encontrado. Use /start para registrar."); return ConversationHandler.END
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text="Usuário não encontrado. Use /start para registrar.")
+            return ConversationHandler.END
         setattr(user, 'ts_trigger_pct', value)
         db.commit()
         try: await update.message.delete()
         except Exception: pass
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=f"🛡️ <b>Stop-Gain / TS</b>\n✅ Gatilho Trailing por PnL salvo: <b>{value:.2f}%</b>",
-            reply_markup=stopgain_menu_keyboard(user), parse_mode="HTML",
-        )
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text=f"🛡️ <b>Stop-Gain / TS</b>\n✅ Gatilho Trailing por PnL salvo: <b>{value:.2f}%</b>", reply_markup=stopgain_menu_keyboard(user), parse_mode="HTML")
     except ValueError:
-        await update.message.reply_text("Não entendi. Envie um número (ex.: 3).")
+        try: await update.message.delete()
+        except Exception: pass
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text="❌ Não entendi. Envie um número (ex.: 3).")
+        return ASKING_TS_TRIGGER
     except Exception as e:
         db.rollback(); logger.error(f"[settings] ts_trigger_pct: {e}", exc_info=True)
-        await update.message.reply_text("Erro ao salvar. Tente novamente.")
+        try: await update.message.delete()
+        except Exception: pass
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text="Erro ao salvar. Tente novamente.")
+        return ASKING_TS_TRIGGER
     finally:
         db.close()
     return ConversationHandler.END
 
 # ---- DISJUNTOR ----
 async def receive_circuit_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message_id_to_edit = context.user_data.get('settings_message_id')
     text = (update.message.text or "").strip()
     db = SessionLocal()
     try:
         value = int(float(text))
         if value < 0 or value > 1000:
-            await update.message.reply_text("Valor inválido. Envie um inteiro entre 0 e 1000 (ex.: 3).")
-            return ConversationHandler.END
+            try: await update.message.delete()
+            except Exception: pass
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text="❌ Valor inválido. Envie um inteiro entre 0 e 1000 (ex.: 3).")
+            return ASKING_CIRCUIT_THRESHOLD
         user = db.query(User).filter_by(telegram_id=update.effective_user.id).first()
         if not user:
-            await update.message.reply_text("Usuário não encontrado. Use /start para registrar."); return ConversationHandler.END
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text="Usuário não encontrado. Use /start para registrar.")
+            return ConversationHandler.END
         user.circuit_breaker_threshold = value; db.commit()
         try: await update.message.delete()
         except Exception: pass
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=f"🚫 <b>Disjuntor</b>\n✅ Limite salvo: <b>{value}</b>",
-            reply_markup=circuit_menu_keyboard(user), parse_mode="HTML",
-        )
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text=f"🚫 <b>Disjuntor</b>\n✅ Limite salvo: <b>{value}</b>", reply_markup=circuit_menu_keyboard(user), parse_mode="HTML")
     except ValueError:
-        await update.message.reply_text("Não entendi. Envie um número inteiro (ex.: 3).")
+        try: await update.message.delete()
+        except Exception: pass
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text="❌ Não entendi. Envie um número inteiro (ex.: 3).")
+        return ASKING_CIRCUIT_THRESHOLD
     except Exception as e:
         db.rollback(); logger.error(f"[settings] circuit_breaker_threshold: {e}", exc_info=True)
-        await update.message.reply_text("Erro ao salvar. Tente novamente.")
+        try: await update.message.delete()
+        except Exception: pass
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text="Erro ao salvar. Tente novamente.")
+        return ASKING_CIRCUIT_THRESHOLD
     finally:
         db.close()
     return ConversationHandler.END
 
 async def receive_circuit_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message_id_to_edit = context.user_data.get('settings_message_id')
     text = (update.message.text or "").strip().lower().replace("min", "").replace("m", "")
     db = SessionLocal()
     try:
         value = int(float(text))
         if value < 0 or value > 1440:
-            await update.message.reply_text("Valor inválido. Envie um inteiro entre 0 e 1440 (ex.: 120).")
-            return ConversationHandler.END
+            try: await update.message.delete()
+            except Exception: pass
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text="❌ Valor inválido. Envie um inteiro entre 0 e 1440 (ex.: 120).")
+            return ASKING_CIRCUIT_PAUSE
         user = db.query(User).filter_by(telegram_id=update.effective_user.id).first()
         if not user:
-            await update.message.reply_text("Usuário não encontrado. Use /start para registrar."); return ConversationHandler.END
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text="Usuário não encontrado. Use /start para registrar.")
+            return ConversationHandler.END
         user.circuit_breaker_pause_minutes = value; db.commit()
         try: await update.message.delete()
         except Exception: pass
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=f"🚫 <b>Disjuntor</b>\n✅ Pausa salva: <b>{value} min</b>",
-            reply_markup=circuit_menu_keyboard(user), parse_mode="HTML",
-        )
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text=f"🚫 <b>Disjuntor</b>\n✅ Pausa salva: <b>{value} min</b>", reply_markup=circuit_menu_keyboard(user), parse_mode="HTML")
     except ValueError:
-        await update.message.reply_text("Não entendi. Envie um número inteiro (ex.: 120).")
+        try: await update.message.delete()
+        except Exception: pass
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text="❌ Não entendi. Envie um número inteiro (ex.: 120).")
+        return ASKING_CIRCUIT_PAUSE
     except Exception as e:
         db.rollback(); logger.error(f"[settings] circuit_breaker_pause_minutes: {e}", exc_info=True)
-        await update.message.reply_text("Erro ao salvar. Tente novamente.")
+        try: await update.message.delete()
+        except Exception: pass
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text="Erro ao salvar. Tente novamente.")
+        return ASKING_CIRCUIT_PAUSE
     finally:
         db.close()
     return ConversationHandler.END

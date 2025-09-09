@@ -265,19 +265,13 @@ async def process_new_signal(signal_data: dict, application: Application, source
                 if cancel_result.get("success"):
                     logger.info(f"Ordem {pending.order_id} ({symbol}) cancelada com sucesso para o usuário {user.telegram_id}.")
                     db.delete(pending)
-                    await application.bot.send_message(
-                        chat_id=user.telegram_id,
-                        text=f"ℹ️ Sua ordem limite pendente para <b>{symbol}</b> foi cancelada pela fonte do sinal.",
-                        parse_mode='HTML'
-                    )
+                    await send_user_alert(application, user.telegram_id,
+                        f"ℹ️ Sua ordem limite pendente para <b>{symbol}</b> foi cancelada pela fonte do sinal.")
                 else:
                     error_msg = cancel_result.get("error", "Erro desconhecido")
                     logger.error(f"Falha ao cancelar ordem {pending.order_id} ({symbol}) para o usuário {user.telegram_id}. Erro: {error_msg}")
-                    await application.bot.send_message(
-                        chat_id=user.telegram_id,
-                        text=f"⚠️ Falha ao tentar cancelar sua ordem limite para <b>{symbol}</b>. Verifique na corretora.\n<b>Motivo:</b> {error_msg}",
-                        parse_mode='HTML'
-                    )
+                    await send_user_alert(application, user.telegram_id,
+                        f"⚠️ Falha ao tentar cancelar sua ordem limite para <b>{symbol}</b>. Verifique na corretora.\n<b>Motivo:</b> {error_msg}")
             
             db.commit()
             return

@@ -24,10 +24,11 @@ def upgrade():
     op.create_table(
         'alert_messages',
         sa.Column('id', sa.Integer(), primary_key=True),
-        sa.Column('user_telegram_id', sa.BigInteger(), nullable=False, index=True),
+        sa.Column('user_telegram_id', sa.BigInteger(), nullable=False),
         sa.Column('message_id', sa.BigInteger(), nullable=False),
         sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.func.now())
     )
+    op.create_index('ix_alert_messages_user', 'alert_messages', ['user_telegram_id'])
 
     # remove defaults
     with op.batch_alter_table('users') as batch_op:
@@ -36,8 +37,8 @@ def upgrade():
 
 
 def downgrade():
+    op.drop_index('ix_alert_messages_user', table_name='alert_messages')
     op.drop_table('alert_messages')
     with op.batch_alter_table('users') as batch_op:
         batch_op.drop_column('alert_cleanup_delay_minutes')
         batch_op.drop_column('alert_cleanup_mode')
-
