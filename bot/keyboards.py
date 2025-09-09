@@ -96,7 +96,7 @@ def settings_menu_keyboard(user) -> InlineKeyboardMarkup:
             InlineKeyboardButton("🔬 Filtros de Sinais", callback_data="signal_filters_menu"),
             InlineKeyboardButton("🎯 Estratégia de TP", callback_data="show_tp_strategy"),
         ],
-        [InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data="back_to_main_menu")],
+        [InlineKeyboardButton("⬅️ Voltar", callback_data="open_settings_root")],
     ]
     return InlineKeyboardMarkup(kb)
 
@@ -173,7 +173,7 @@ def bot_config_keyboard(user_settings):
         # --- NOVAS LINHAS ADICIONADAS AO TECLADO ---
         [InlineKeyboardButton(profit_text, callback_data='set_profit_target')],
         [InlineKeyboardButton(loss_text, callback_data='set_loss_limit')],
-        [InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data='back_to_main_menu')]
+        [InlineKeyboardButton("⬅️ Voltar", callback_data='open_settings_root')]
     ]
     return InlineKeyboardMarkup(keyboard)
 
