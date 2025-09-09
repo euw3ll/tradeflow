@@ -13,7 +13,7 @@ from services.bybit_service import (
     get_last_closed_trade_info, get_open_positions_with_pnl,
     cancel_order
 )
-from services.notification_service import send_notification
+from services.notification_service import send_notification, send_user_alert
 from utils.security import decrypt_data
 from sqlalchemy.sql import func
 from telegram.error import BadRequest
@@ -212,7 +212,8 @@ async def check_pending_orders_for_user(application: Application, user: User, db
             if qty <= 0 or entry_price <= 0:
                 logger.warning(f"Ordem {order.order_id} Filled, mas com qty/preço zerado. Removendo.")
                 db.delete(order)
-                await application.bot.send_message(chat_id=user.telegram_id, text=f"ℹ️ Sua ordem limite para <b>{order.symbol}</b> foi finalizada sem execução reportada.", parse_mode='HTML')
+                await send_user_alert(application, user.telegram_id,
+                                      f"ℹ️ Sua ordem limite para <b>{order.symbol}</b> foi finalizada sem execução reportada.")
                 continue
 
             side = signal_data.get('order_type')
@@ -549,6 +550,7 @@ async def run_tracker(application: Application):
                     await check_pending_orders_for_user(application, user, db)
                     await check_active_trades_for_user(application, user, db)
                     await cleanup_closed_trade_messages(application, user, db)
+                    await cleanup_alert_messages(application, user, db)
                 db.commit()
             else:
                 logger.info("Rastreador: Nenhum usuário com API para verificar.")
@@ -760,6 +762,61 @@ async def cleanup_closed_trade_messages(application: Application, user: User, db
                 t.notification_message_id = None
         except Exception:
             logger.exception('[cleanup] falha ao avaliar trade_id=%s', getattr(t, 'id', None))
+
+async def cleanup_alert_messages(application: Application, user: User, db: Session) -> None:
+    """
+    Limpa mensagens de ALERTA (erros/avisos) conforme política do usuário:
+      - OFF: não faz nada
+      - AFTER: exclui após N minutos
+      - EOD: exclui se enviada em dia anterior (America/Sao_Paulo)
+    """
+    from database.models import AlertMessage
+    mode = (getattr(user, 'alert_cleanup_mode', 'OFF') or 'OFF').upper()
+    if mode == 'OFF':
+        return
+
+    delay_minutes = int(getattr(user, 'alert_cleanup_delay_minutes', 30) or 30)
+    br_tz = pytz.timezone('America/Sao_Paulo')
+    from datetime import datetime
+
+    alerts = db.query(AlertMessage).filter(AlertMessage.user_telegram_id == user.telegram_id).order_by(AlertMessage.created_at.asc()).all()
+    for a in alerts:
+        try:
+            created_at = a.created_at
+            if created_at is None:
+                should_delete = True
+            else:
+                try:
+                    if getattr(created_at, 'tzinfo', None) is None:
+                        created_at = created_at.replace(tzinfo=pytz.utc)
+                except Exception:
+                    pass
+
+                should_delete = False
+                if mode == 'AFTER':
+                    delta = datetime.utcnow().replace(tzinfo=pytz.utc) - created_at.astimezone(pytz.utc)
+                    if delta.total_seconds() >= delay_minutes * 60:
+                        should_delete = True
+                elif mode == 'EOD':
+                    now_br = datetime.utcnow().replace(tzinfo=pytz.utc).astimezone(br_tz)
+                    created_br = created_at.astimezone(br_tz)
+                    if created_br.date() < now_br.date():
+                        should_delete = True
+
+            if should_delete:
+                try:
+                    await application.bot.delete_message(chat_id=user.telegram_id, message_id=a.message_id)
+                except BadRequest:
+                    # mensagem já inexistente – prosseguir removendo do log
+                    pass
+                except Exception:
+                    # algo inesperado – não remover do log para tentar novamente
+                    continue
+                db.delete(a)
+                db.commit()
+        except Exception:
+            db.rollback()
+            logger.exception('[cleanup-alerts] falha ao avaliar alerta id=%s', getattr(a, 'id', None))
 
 async def notify_sync_status(application, user, trade, text: Optional[str] = None) -> None:
     """

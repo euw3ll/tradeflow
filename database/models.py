@@ -41,6 +41,9 @@ class User(Base):
     # Notificações: política de limpeza das mensagens de trades fechados
     msg_cleanup_mode = Column(String(20), default='OFF', nullable=False)  # OFF | AFTER | EOD
     msg_cleanup_delay_minutes = Column(Integer, default=30, nullable=False)
+    # Notificações: política de limpeza de alertas gerais (erros/avisos)
+    alert_cleanup_mode = Column(String(20), default='OFF', nullable=False)  # OFF | AFTER | EOD
+    alert_cleanup_delay_minutes = Column(Integer, default=30, nullable=False)
 
 class InviteCode(Base):
     __tablename__ = 'invite_codes'
@@ -100,4 +103,11 @@ class SignalForApproval(Base):
     source_name = Column(String)
     signal_data = Column(JSON, nullable=False)
     approval_message_id = Column(BigInteger)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+class AlertMessage(Base):
+    __tablename__ = 'alert_messages'
+    id = Column(Integer, primary_key=True)
+    user_telegram_id = Column(BigInteger, index=True, nullable=False)
+    message_id = Column(BigInteger, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())

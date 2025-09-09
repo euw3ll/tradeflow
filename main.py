@@ -30,6 +30,7 @@ from bot.handlers import (
     prompt_manual_close_handler, execute_manual_close_handler,
     open_settings_root_handler, notifications_settings_handler, refresh_active_messages_handler, open_information_handler,
     toggle_cleanup_mode_handler, ask_cleanup_minutes, receive_cleanup_minutes, ASKING_CLEANUP_MINUTES,
+    toggle_alert_cleanup_mode_handler, ask_alert_cleanup_minutes, receive_alert_cleanup_minutes, ASKING_ALERT_CLEANUP_MINUTES,
     toggle_bot_status_handler,
     ask_stop_gain_trigger, receive_stop_gain_trigger, ASKING_STOP_GAIN_TRIGGER,
     ask_stop_gain_lock, receive_stop_gain_lock, ASKING_STOP_GAIN_LOCK,
@@ -48,6 +49,7 @@ from bot.handlers import (
 )
 from services.telethon_service import start_signal_monitor
 from core.position_tracker import run_tracker
+from services.notification_service import send_user_alert
 
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="telegram.ext.conversationhandler")
@@ -99,10 +101,8 @@ async def on_error(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error("Unhandled error (failed to log context)", exc_info=context.error)
     try:
         if update and update.effective_chat and update.effective_chat.type == "private":
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text="⚠️ Ocorreu um erro inesperado. Já registrei aqui e vou corrigir.",
-            )
+            await send_user_alert(context.application, update.effective_chat.id,
+                                  "⚠️ Ocorreu um erro inesperado. Já registrei aqui e vou corrigir.")
     except TelegramError:
         # Evita encadear erros caso o envio falhe
         pass
@@ -288,6 +288,14 @@ async def main():
         fallbacks=[CommandHandler("cancel", cancel)], per_message=False, per_user=True,
     )
     application.add_handler(cleanup_minutes_conv)
+    # Alert cleanup
+    application.add_handler(CallbackQueryHandler(toggle_alert_cleanup_mode_handler, pattern='^toggle_alert_cleanup_mode$'))
+    alert_cleanup_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(ask_alert_cleanup_minutes, pattern='^ask_alert_cleanup_minutes$')],
+        states={ ASKING_ALERT_CLEANUP_MINUTES: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_alert_cleanup_minutes)] },
+        fallbacks=[CommandHandler("cancel", cancel)], per_message=False, per_user=True,
+    )
+    application.add_handler(alert_cleanup_conv)
     application.add_handler(CallbackQueryHandler(refresh_active_messages_handler, pattern='^refresh_active_messages$'))
 
     application.add_handler(CallbackQueryHandler(handle_signal_approval, pattern=r'^(approve_signal_|reject_signal_)'))

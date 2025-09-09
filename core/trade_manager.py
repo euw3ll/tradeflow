@@ -15,7 +15,7 @@ from services.bybit_service import (
     get_order_history,
     get_historical_klines
 )
-from services.notification_service import send_notification
+from services.notification_service import send_notification, send_user_alert
 from utils.security import decrypt_data
 from utils.config import ADMIN_ID
 from bot.keyboards import signal_approval_keyboard
@@ -128,7 +128,7 @@ async def _execute_trade(signal_data: dict, user: User, application: Application
     
     account_info = await get_account_info(api_key, api_secret)
     if not account_info.get("success"):
-        await application.bot.send_message(chat_id=user.telegram_id, text=f"❌ Falha ao buscar seu saldo Bybit para operar {signal_data['coin']}.")
+        await send_user_alert(application, user.telegram_id, f"❌ Falha ao buscar seu saldo Bybit para operar {signal_data['coin']}.")
         return
 
     balance_data = account_info.get("data", {})
@@ -143,7 +143,7 @@ async def _execute_trade(signal_data: dict, user: User, application: Application
         await asyncio.sleep(2)
         final_order_data_result = await get_order_history(api_key, api_secret, order_id)
         if not final_order_data_result.get("success"):
-            await application.bot.send_message(chat_id=user.telegram_id, text=f"⚠️ Ordem {signal_data['coin']} enviada, mas falha ao confirmar detalhes. Verifique na corretora.")
+            await send_user_alert(application, user.telegram_id, f"⚠️ Ordem {signal_data['coin']} enviada, mas falha ao confirmar detalhes. Verifique na corretora.")
             return
         final_order_data = final_order_data_result['data']
         
@@ -154,7 +154,7 @@ async def _execute_trade(signal_data: dict, user: User, application: Application
         entry_price = float(final_order_data.get('avgPrice', 0))
         
         if qty == 0 or entry_price == 0:
-            await application.bot.send_message(chat_id=user.telegram_id, text=f"⚠️ Ordem {symbol} enviada, mas a execução reportou quantidade/preço zerado.")
+            await send_user_alert(application, user.telegram_id, f"⚠️ Ordem {symbol} enviada, mas a execução reportou quantidade/preço zerado.")
             return
             
         margin = (qty * entry_price) / leverage if leverage > 0 else 0
@@ -417,7 +417,7 @@ async def _execute_limit_order_for_user(signal_data: dict, user: User, applicati
     symbol = signal_data.get("coin")
     existing_pending = db.query(PendingSignal).filter_by(user_telegram_id=user.telegram_id, symbol=symbol).first()
     if existing_pending:
-        await application.bot.send_message(chat_id=user.telegram_id, text=f"ℹ️ Você já tem uma ordem limite pendente para <b>{symbol}</b>.", parse_mode='HTML')
+        await send_user_alert(application, user.telegram_id, f"ℹ️ Você já tem uma ordem limite pendente para <b>{symbol}</b>.")
         return
 
     entries = (signal_data.get('entries') or [])[:2]
@@ -480,4 +480,4 @@ async def _execute_limit_order_for_user(signal_data: dict, user: User, applicati
         ))
     else:
         error = limit_order_result.get('error') or "Erro desconhecido"
-        await application.bot.send_message(chat_id=user.telegram_id, text=f"❌ Falha ao posicionar sua ordem limite para <b>{symbol}</b>.\n<b>Motivo:</b> {error}", parse_mode='HTML')
+        await send_user_alert(application, user.telegram_id, f"❌ Falha ao posicionar sua ordem limite para <b>{symbol}</b>.\n<b>Motivo:</b> {error}")

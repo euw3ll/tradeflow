@@ -310,21 +310,34 @@ def settings_root_keyboard() -> InlineKeyboardMarkup:
 
 def notifications_menu_keyboard(user=None) -> InlineKeyboardMarkup:
     """Menu de Configurações de Notificações.
-    Mostra e permite ajustar a política de limpeza das mensagens fechadas.
+    Mostra e permite ajustar:
+      - Limpeza das mensagens de trades FECHADOS
+      - Limpeza das mensagens de ALERTA (avisos/erros)
     """
     mode = getattr(user, 'msg_cleanup_mode', 'OFF') if user is not None else 'OFF'
     delay = int(getattr(user, 'msg_cleanup_delay_minutes', 30) or 30) if user is not None else 30
 
     if mode == 'AFTER':
-        mode_text = f"🧹 Limpeza: Após {delay} min"
+        mode_text = f"🧹 Fechados: Após {delay} min"
     elif mode == 'EOD':
-        mode_text = "🧹 Limpeza: Fim do dia"
+        mode_text = "🧹 Fechados: Fim do dia"
     else:
-        mode_text = "🧹 Limpeza: Desativada"
+        mode_text = "🧹 Fechados: Desativada"
+
+    alert_mode = getattr(user, 'alert_cleanup_mode', 'OFF') if user is not None else 'OFF'
+    alert_delay = int(getattr(user, 'alert_cleanup_delay_minutes', 30) or 30) if user is not None else 30
+    if alert_mode == 'AFTER':
+        alert_text = f"🔔 Alertas: Após {alert_delay} min"
+    elif alert_mode == 'EOD':
+        alert_text = "🔔 Alertas: Fim do dia"
+    else:
+        alert_text = "🔔 Alertas: Desativada"
 
     kb = [
         [InlineKeyboardButton(mode_text, callback_data='toggle_cleanup_mode')],
-        [InlineKeyboardButton("⏱️ Definir minutos", callback_data='ask_cleanup_minutes')],
+        [InlineKeyboardButton("⏱️ Minutos (fechados)", callback_data='ask_cleanup_minutes')],
+        [InlineKeyboardButton(alert_text, callback_data='toggle_alert_cleanup_mode')],
+        [InlineKeyboardButton("⏱️ Minutos (alertas)", callback_data='ask_alert_cleanup_minutes')],
         [InlineKeyboardButton("♻️ Recriar mensagens ativas", callback_data='refresh_active_messages')],
         [InlineKeyboardButton("⬅️ Voltar", callback_data='open_settings_root')],
     ]

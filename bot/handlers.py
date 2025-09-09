@@ -47,6 +47,7 @@ ASKING_TP_DISTRIBUTION = 25
 ASKING_BE_TRIGGER = 26
 ASKING_TS_TRIGGER = 27
 ASKING_CLEANUP_MINUTES = 28
+ASKING_ALERT_CLEANUP_MINUTES = 29
 
 logger = logging.getLogger(__name__)
 
@@ -187,10 +188,15 @@ async def notifications_settings_handler(update: Update, context: ContextTypes.D
     delay = int(getattr(user, 'msg_cleanup_delay_minutes', 30) or 30) if user else 30
     mode_human = 'Desativada' if mode == 'OFF' else ('Após ' + str(delay) + ' min' if mode == 'AFTER' else 'Fim do dia')
 
+    alert_mode = getattr(user, 'alert_cleanup_mode', 'OFF') if user else 'OFF'
+    alert_delay = int(getattr(user, 'alert_cleanup_delay_minutes', 30) or 30) if user else 30
+    alert_human = 'Desativada' if alert_mode == 'OFF' else ('Após ' + str(alert_delay) + ' min' if alert_mode == 'AFTER' else 'Fim do dia')
+
     await query.edit_message_text(
         text=(
             "🔔 <b>Configurações de Notificações</b>\n\n"
-            "• Limpeza de mensagens fechadas: <b>" + mode_human + "</b>\n"
+            "• Fechados: <b>" + mode_human + "</b>\n"
+            "• Alertas gerais: <b>" + alert_human + "</b>\n"
             "• Dica: mensagens ativas podem ser recriadas abaixo."
         ),
         parse_mode='HTML',
@@ -733,7 +739,88 @@ async def receive_cleanup_minutes(update: Update, context: ContextTypes.DEFAULT_
         chat_id=user_id,
         text=(
             "🔔 <b>Configurações de Notificações</b>\n\n"
-            f"• Limpeza de mensagens fechadas: <b>{'Desativada' if user.msg_cleanup_mode=='OFF' else ('Após ' + str(int(user.msg_cleanup_delay_minutes or 30)) + ' min' if user.msg_cleanup_mode=='AFTER' else 'Fim do dia')}</b>\n"
+            f"• Fechados: <b>{'Desativada' if user.msg_cleanup_mode=='OFF' else ('Após ' + str(int(user.msg_cleanup_delay_minutes or 30)) + ' min' if user.msg_cleanup_mode=='AFTER' else 'Fim do dia')}</b>\n"
+            f"• Alertas gerais: <b>{'Desativada' if getattr(user,'alert_cleanup_mode','OFF')=='OFF' else ('Após ' + str(int(getattr(user,'alert_cleanup_delay_minutes',30) or 30)) + ' min' if getattr(user,'alert_cleanup_mode','OFF')=='AFTER' else 'Fim do dia')}</b>\n"
+        ),
+        parse_mode='HTML',
+        reply_markup=notifications_menu_keyboard(user)
+    )
+    return ConversationHandler.END
+
+# --- Notificações: Toggle limpeza de ALERTAS ---
+async def toggle_alert_cleanup_mode_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.telegram_id == query.from_user.id).first()
+        if not user:
+            await query.edit_message_text("Usuário não encontrado.")
+            return
+        cur = (getattr(user, 'alert_cleanup_mode', 'OFF') or 'OFF').upper()
+        nxt = 'AFTER' if cur == 'OFF' else ('EOD' if cur == 'AFTER' else 'OFF')
+        user.alert_cleanup_mode = nxt
+        db.commit()
+        await query.edit_message_text(
+            text=(
+                "🔔 <b>Configurações de Notificações</b>\n\n"
+                f"• Fechados: <b>{'Desativada' if getattr(user,'msg_cleanup_mode','OFF')=='OFF' else ('Após ' + str(int(getattr(user,'msg_cleanup_delay_minutes',30) or 30)) + ' min' if getattr(user,'msg_cleanup_mode','OFF')=='AFTER' else 'Fim do dia')}</b>\n"
+                f"• Alertas gerais: <b>{'Desativada' if nxt=='OFF' else ('Após ' + str(int(getattr(user,'alert_cleanup_delay_minutes',30) or 30)) + ' min' if nxt=='AFTER' else 'Fim do dia')}</b>\n"
+            ),
+            parse_mode='HTML',
+            reply_markup=notifications_menu_keyboard(user)
+        )
+    finally:
+        db.close()
+
+async def ask_alert_cleanup_minutes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        text=(
+            "Digite o tempo (em minutos) para excluir mensagens de ALERTA (erros/avisos).\n"
+            "Ex.: 30. Use 0 para desativar (equivale a OFF)."
+        )
+    )
+    return ASKING_ALERT_CLEANUP_MINUTES
+
+async def receive_alert_cleanup_minutes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.effective_user.id
+    text = (update.message.text or '').strip().replace(',', '.')
+    try:
+        n = int(float(text))
+        if n < 0:
+            raise ValueError
+    except Exception:
+        await update.message.reply_text("Valor inválido. Envie um número inteiro (ex.: 30).")
+        return ASKING_ALERT_CLEANUP_MINUTES
+
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.telegram_id == user_id).first()
+        if not user:
+            await update.message.reply_text("Usuário não encontrado.")
+            return ConversationHandler.END
+        if n == 0:
+            user.alert_cleanup_mode = 'OFF'
+        else:
+            user.alert_cleanup_mode = 'AFTER'
+            user.alert_cleanup_delay_minutes = n
+        db.commit()
+    finally:
+        db.close()
+
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.telegram_id == user_id).first()
+    finally:
+        db.close()
+    await context.bot.send_message(
+        chat_id=user_id,
+        text=(
+            "🔔 <b>Configurações de Notificações</b>\n\n"
+            f"• Fechados: <b>{'Desativada' if getattr(user,'msg_cleanup_mode','OFF')=='OFF' else ('Após ' + str(int(getattr(user,'msg_cleanup_delay_minutes',30) or 30)) + ' min' if getattr(user,'msg_cleanup_mode','OFF')=='AFTER' else 'Fim do dia')}</b>\n"
+            f"• Alertas gerais: <b>{'Desativada' if user.alert_cleanup_mode=='OFF' else ('Após ' + str(int(user.alert_cleanup_delay_minutes or 30)) + ' min' if user.alert_cleanup_mode=='AFTER' else 'Fim do dia')}</b>\n"
         ),
         parse_mode='HTML',
         reply_markup=notifications_menu_keyboard(user)
