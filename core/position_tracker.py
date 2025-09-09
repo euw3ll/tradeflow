@@ -529,7 +529,10 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                 await _send_or_edit_trade_message(application, user, trade, db, msg_text)
 
 async def run_tracker(application: Application):
-    """Função principal que roda o verificador em loop para TODOS os usuários."""
+    """Função principal do verificador: primeiro consolida o estado interno (ordens/trades),
+    depois sincroniza/adota órfãs. Essa ordem evita mensagens de "Posição Sincronizada"
+    logo após abrirmos nós mesmos a posição.
+    """
     logger.info("Iniciando Rastreador de Posições e Ordens (Modo Multiusuário)...")
     while True:
         cycle_started = time.perf_counter()
@@ -538,8 +541,20 @@ async def run_tracker(application: Application):
 
         db = SessionLocal()
         try:
-            # --- LÓGICA DE SINCRONIZAÇÃO APRIMORADA ---
-            all_api_users_for_sync = db.query(User).filter(User.api_key_encrypted.isnot(None)).all()
+            # 1) Etapa NORMAL: primeiro consolida ordens e atualiza trades
+            all_users = db.query(User).filter(User.api_key_encrypted.isnot(None)).all()
+            if all_users:
+                logger.info(f"Rastreador: Verificando assets para {len(all_users)} usuário(s).")
+                for user in all_users:
+                    await check_pending_orders_for_user(application, user, db)
+                    await check_active_trades_for_user(application, user, db)
+                    await cleanup_closed_trade_messages(application, user, db)
+                db.commit()
+            else:
+                logger.info("Rastreador: Nenhum usuário com API para verificar.")
+
+            # 2) Etapa de SINCRONIZAÇÃO: agora busca na corretora e adota órfãs reais
+            all_api_users_for_sync = all_users  # reaproveita lista já obtida acima
             for user in all_api_users_for_sync:
                 total_users += 1
                 sync_api_key = decrypt_data(user.api_key_encrypted)
@@ -551,7 +566,6 @@ async def run_tracker(application: Application):
                     if not res or not res.get("success"):
                         return None
                     d = res.get("data") or {}
-                    # padroniza campos esperados pelo detetive
                     return {
                         "pnl": float(d.get("closedPnl", 0.0)) if d.get("closedPnl") is not None else None,
                         "exit_type": d.get("exitType"),
@@ -561,18 +575,17 @@ async def run_tracker(application: Application):
 
                 bybit_positions_result = await get_open_positions_with_pnl(sync_api_key, sync_api_secret)
                 if not bybit_positions_result.get("success"):
-                    logger.error(f"Sincronização: Falha ao buscar posições da Bybit para o usuário {user.telegram_id}. Pulando.")
+                    logger.error(
+                        f"Sincronização: Falha ao buscar posições da Bybit para o usuário {user.telegram_id}. Pulando.")
                     continue
 
                 bybit_list = bybit_positions_result.get("data", []) or []
                 bybit_keys = {(p["symbol"], p["side"]) for p in bybit_list}
-                bybit_map = {(p["symbol"], p["side"]): p for p in bybit_list}
 
                 # [NOVO] conjunto só por símbolo (ignora side)
                 bybit_symbols = {p["symbol"] for p in bybit_list}
 
-                # [NOVO] mapa por símbolo -> se tiver mais de uma entrada do mesmo símbolo,
-                # fica com a de maior tamanho absoluto (mais relevante)
+                # [NOVO] mapa por símbolo -> fica com a entrada de maior tamanho
                 bybit_map_by_symbol: Dict[str, Dict[str, Any]] = {}
                 for p in bybit_list:
                     sym = p["symbol"]
@@ -587,24 +600,23 @@ async def run_tracker(application: Application):
                     Trade.user_telegram_id == user.telegram_id,
                     ~Trade.status.like('%CLOSED%')
                 ).all()
-            
+
                 db_pending_signals = db.query(PendingSignal).filter(
                     PendingSignal.user_telegram_id == user.telegram_id
                 ).all()
                 db_pending_symbols = {s.symbol for s in db_pending_signals}
 
-                # [NOVO] Adotar órfãs por SÍMBOLO (ignora side)
+                # Adota por SÍMBOLO (ignora side) somente se não estiver ativo nem pendente
                 db_active_symbols = {t.symbol for t in db_active_trades}
-                # db_pending_symbols você JÁ construiu acima e é um set de strings: {s.symbol for s in db_pending_signals}
-
                 symbols_to_adopt = bybit_symbols - db_active_symbols - db_pending_symbols
+
                 for symbol in symbols_to_adopt:
                     adopted_count += 1
                     pos = bybit_map_by_symbol.get(symbol)
                     if not pos:
                         continue  # segurança
 
-                    # Safeguard: se aparecer um trade ativo para o mesmo símbolo (concorrência), não duplique
+                    # Safeguard extra: se apareceu um trade ativo concorrente, não duplique
                     exists_active = db.query(Trade).filter(
                         Trade.user_telegram_id == user.telegram_id,
                         Trade.symbol == symbol,
@@ -660,34 +672,22 @@ async def run_tracker(application: Application):
                     )
                     await application.bot.send_message(chat_id=user.telegram_id, text=msg, parse_mode='HTML')
 
-                # [NOVO] Fechar fantasmas com tolerância (aplica janela de 3 ciclos)
+                # Fechar fantasmas com tolerância (janela de 3 ciclos)
                 await apply_missing_cycles_policy(
                     application=application,
                     user=user,
                     db=db,
                     db_active_trades=db_active_trades,
                     bybit_keys=bybit_keys,
-                    threshold=3,  # configurável no futuro via env/setting se necessário
+                    threshold=3,
                     get_last_closed_trade_info=_fetch_closed_info,
                 )
 
             duration = time.perf_counter() - cycle_started
             logger.info("[cycle] resumo: usuarios=%d, adotadas=%d, duracao=%.2fs",
-            total_users, adopted_count, duration)
+                        total_users, adopted_count, duration)
 
             db.commit()
-
-            # --- Lógica de verificação normal ---
-            all_users = db.query(User).filter(User.api_key_encrypted.isnot(None)).all()
-            if all_users:
-                logger.info(f"Rastreador: Verificando assets para {len(all_users)} usuário(s).")
-                for user in all_users:
-                    await check_pending_orders_for_user(application, user, db)
-                    await check_active_trades_for_user(application, user, db)
-                    await cleanup_closed_trade_messages(application, user, db)
-                db.commit()
-            else:
-                logger.info("Rastreador: Nenhum usuário com API para verificar.")
 
         except Exception as e:
             logger.critical(f"Erro crítico no loop do rastreador: {e}", exc_info=True)
