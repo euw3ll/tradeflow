@@ -264,59 +264,58 @@ async def open_information_handler(update: Update, context: ContextTypes.DEFAULT
         except Exception:
             return None
 
-    # Tenta git; se falhar, usa variáveis de ambiente definidas no build/deploy
-    git_info = await _fetch_git_info()
-    if git_info:
-        full_msg, commit_date, commit_hash = git_info
-    else:
-        # Fallback 1: variáveis de ambiente (suporte amplo a nomes comuns em CI)
-        def first_env(*keys, default=""):
-            for k in keys:
-                v = os.getenv(k)
-                if v:
-                    return v
-            return default
+    # Preferimos COMMIT_INFO gerado no deploy (confiável em Docker)
+    full_msg, commit_date, commit_hash = "", "", ""
+    try:
+        with open("COMMIT_INFO", "r", encoding="utf-8") as f:
+            lines = [l.rstrip("\n") for l in f.readlines()]
+        if lines:
+            commit_hash = lines[0] if len(lines) >= 1 else commit_hash
+            commit_date = lines[1] if len(lines) >= 2 else commit_date
+            full_msg = "\n".join(lines[2:]).strip() if len(lines) >= 3 else full_msg
+    except Exception:
+        pass
 
-        full_msg = first_env("BUILD_MESSAGE", "GIT_COMMIT_MSG", "VERCEL_GIT_COMMIT_MESSAGE", default="")
-        commit_date = first_env("BUILD_DATE", "GIT_COMMIT_DATE", "VERCEL_GIT_COMMIT_DATE", default="")
-        commit_hash = first_env("BUILD_COMMIT", "GIT_COMMIT", "GIT_SHA", "GIT_COMMIT_SHA", "GITHUB_SHA", "VERCEL_GIT_COMMIT_SHA", default="")
-        # Fallback 2: arquivo COMMIT_INFO (opcional, 3 linhas: hash, date, message...)
-        if not any([full_msg, commit_date, commit_hash]):
-            try:
-                with open("COMMIT_INFO", "r", encoding="utf-8") as f:
-                    lines = [l.rstrip("\n") for l in f.readlines()]
-                if lines:
-                    commit_hash = lines[0] if len(lines) >= 1 else commit_hash
-                    commit_date = lines[1] if len(lines) >= 2 else commit_date
-                    full_msg = "\n".join(lines[2:]).strip() if len(lines) >= 3 else full_msg
-            except Exception:
-                pass
-        # Fallback 3: última modificação do código (aproximação)
-        if not any([full_msg, commit_date, commit_hash]):
-            def _latest_change():
-                latest_ts = 0
-                latest_path = None
-                for root, _, files in os.walk('.'):
-                    for fname in files:
-                        if fname.endswith(('.py', '.sql', '.ini', '.yml', '.yaml', '.txt', '.md')):
-                            p = os.path.join(root, fname)
-                            try:
-                                ts = os.path.getmtime(p)
-                                if ts > latest_ts:
-                                    latest_ts, latest_path = ts, p
-                            except Exception:
-                                continue
-                return latest_ts, latest_path
-            try:
-                ts, pth = await asyncio.to_thread(_latest_change)
-                if ts:
-                    from datetime import datetime
-                    commit_date = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')
-                    commit_hash = 'local'
-                    full_msg = f'Alteração mais recente em {pth}'
-            except Exception:
-                pass
-        # Valores finais padrão
+    if not any([full_msg, commit_date, commit_hash]):
+        # Tenta git; se falhar, usa variáveis de ambiente e por fim a heurística de arquivos
+        git_info = await _fetch_git_info()
+        if git_info:
+            full_msg, commit_date, commit_hash = git_info
+        else:
+            def first_env(*keys, default=""):
+                for k in keys:
+                    v = os.getenv(k)
+                    if v:
+                        return v
+                return default
+
+            full_msg = first_env("BUILD_MESSAGE", "GIT_COMMIT_MSG", "VERCEL_GIT_COMMIT_MESSAGE", default="")
+            commit_date = first_env("BUILD_DATE", "GIT_COMMIT_DATE", "VERCEL_GIT_COMMIT_DATE", default="")
+            commit_hash = first_env("BUILD_COMMIT", "GIT_COMMIT", "GIT_SHA", "GIT_COMMIT_SHA", "GITHUB_SHA", "VERCEL_GIT_COMMIT_SHA", default="")
+            if not any([full_msg, commit_date, commit_hash]):
+                def _latest_change():
+                    latest_ts = 0
+                    latest_path = None
+                    for root, _, files in os.walk('.'):
+                        for fname in files:
+                            if fname.endswith(('.py', '.sql', '.ini', '.yml', '.yaml', '.txt', '.md')):
+                                p = os.path.join(root, fname)
+                                try:
+                                    ts = os.path.getmtime(p)
+                                    if ts > latest_ts:
+                                        latest_ts, latest_path = ts, p
+                                except Exception:
+                                    continue
+                    return latest_ts, latest_path
+                try:
+                    ts, pth = await asyncio.to_thread(_latest_change)
+                    if ts:
+                        from datetime import datetime
+                        commit_date = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')
+                        commit_hash = 'local'
+                        full_msg = f'Alteração mais recente em {pth}'
+                except Exception:
+                    pass
         commit_date = commit_date or "—"
         commit_hash = commit_hash or "—"
 

@@ -926,13 +926,26 @@ async def get_closed_pnl_for_trade(
     def _sync_call() -> dict:
         try:
             session = get_session(api_key, api_secret)
+            # Normaliza datas para UTC naive para evitar comparações aware x naive
+            from datetime import datetime as _dt, timezone as _tz
             if end_time is None:
-                end = datetime.now()
+                end = _dt.utcnow()
             else:
-                end = end_time
+                e = end_time
+                try:
+                    if getattr(e, 'tzinfo', None) is not None and e.tzinfo.utcoffset(e) is not None:
+                        e = e.astimezone(_tz.utc).replace(tzinfo=None)
+                except Exception:
+                    pass
+                end = e
 
             # Busca até 7 dias por página; itera se necessário.
             cur = start_time
+            try:
+                if getattr(cur, 'tzinfo', None) is not None and cur.tzinfo.utcoffset(cur) is not None:
+                    cur = cur.astimezone(_tz.utc).replace(tzinfo=None)
+            except Exception:
+                pass
             items: List[Dict[str, Any]] = []
             while cur < end:
                 nxt = min(cur + timedelta(days=7), end)
