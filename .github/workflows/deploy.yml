@@ -26,21 +26,25 @@ jobs:
 
           # Script com os comandos a serem executados na VPS
           script: |
+            set -euo pipefail
             # Navega para a pasta da aplicação
             cd /srv/apps/tradeflow
 
-            echo "Atualizando o código-fonte..."
+            echo "==> Atualizando o código-fonte..."
             git fetch origin
             git reset --hard origin/main
 
-            echo "Parando containers antigos..."
-            sudo docker-compose down
+            # --- SEÇÃO MODIFICADA ---
+            # O comando a seguir faz tudo de uma vez:
+            #   - --build: Reconstrói a imagem se o Dockerfile ou o código mudaram.
+            #   - --force-recreate: Para e recria os contêineres, forçando a atualização.
+            #   - --remove-orphans: Remove contêineres de serviços antigos.
+            #   - -d: Roda em background.
+            echo "==> Reconstruindo e reiniciando o serviço..."
+            sudo docker-compose up -d --build --force-recreate --remove-orphans
 
-            echo "Reconstruindo as imagens do Docker sem usar cache..."
-            sudo docker-compose build --no-cache
-
-            echo "Iniciando novos containers..."
-            sudo docker-compose up -d
-
-            echo "Limpando imagens Docker antigas..."
+            echo "==> Limpando imagens Docker antigas..."
             sudo docker image prune -af
+
+            echo "==> Verificando serviços ativos..."
+            sudo docker-compose ps
