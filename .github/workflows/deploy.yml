@@ -35,13 +35,11 @@ jobs:
             git reset --hard origin/main
 
             # --- SEÇÃO MODIFICADA ---
-            # O comando a seguir faz tudo de uma vez:
-            #   - --build: Reconstrói a imagem se o Dockerfile ou o código mudaram.
-            #   - --force-recreate: Para e recria os contêineres, forçando a atualização.
-            #   - --remove-orphans: Remove contêineres de serviços antigos.
-            #   - -d: Roda em background.
-            echo "==> Reconstruindo e reiniciando o serviço..."
-            sudo docker-compose up -d --build --force-recreate --remove-orphans
+            echo "==> Parando e removendo contêineres antigos para evitar conflitos..."
+            sudo docker-compose down --remove-orphans
+
+            echo "==> Reconstruindo e reiniciando os serviços..."
+            sudo docker-compose up -d --build
 
             echo "==> Limpando imagens Docker antigas..."
             sudo docker image prune -af
