@@ -18,7 +18,7 @@ Mako==1.3.10
 MarkupSafe==3.0.2
 multidict==6.6.4
 numpy
-pandas==2.2.2
+pandas
 pandas-ta
 packaging==25.0
 pluggy==1.6.0
