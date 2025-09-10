@@ -34,7 +34,13 @@ jobs:
             git fetch origin
             git reset --hard origin/main
 
-            # --- SEÇÃO MODIFICADA ---
+            # --- SEÇÃO ADICIONADA ---
+            echo "==> Gerando informações do commit para o bot..."
+            SHA=$(git rev-parse HEAD)
+            DATE=$(date -u +"%Y-%m-%d %H:%M:%S%z")
+            MSG=$(git log -1 --pretty=%B | tr -d '\r')
+            printf "%s\n%s\n%s\n" "$SHA" "$DATE" "$MSG" > COMMIT_INFO
+
             echo "==> Parando e removendo contêineres antigos para evitar conflitos..."
             sudo docker-compose down --remove-orphans
 
