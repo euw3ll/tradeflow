@@ -19,7 +19,7 @@ MarkupSafe==3.0.2
 multidict==6.6.4
 numpy==1.26.4
 pandas==2.2.2
-pandas-ta==0.3.14b
+pandas-ta
 packaging==25.0
 pluggy==1.6.0
 propcache==0.3.2
