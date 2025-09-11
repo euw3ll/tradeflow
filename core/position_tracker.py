@@ -335,6 +335,19 @@ async def check_active_trades_for_user(application: Application, user: User, db:
 
         if position_data:
             trade.unrealized_pnl_pct = position_data.get("unrealized_pnl_frac", 0.0)
+            # Mantém a entrada do trade sincronizada com a Bybit para evitar BE incorreto
+            try:
+                bybit_entry = float(position_data.get("entry") or 0.0)
+                if bybit_entry > 0:
+                    local_entry = float(trade.entry_price or 0.0)
+                    # Atualiza somente se houver diferença material (evita ruído por arredondamento)
+                    if local_entry <= 0 or abs(bybit_entry - local_entry) > max(1e-6, local_entry * 1e-4):
+                        trade.entry_price = bybit_entry
+                        # não precisamos de título — atualização silenciosa do dashboard
+                        message_was_edited = True
+            except Exception:
+                # Se algo falhar aqui, apenas segue o fluxo normal
+                pass
 
         if live_position_size > 0:
             price_result = await get_market_price(trade.symbol)
@@ -346,6 +359,9 @@ async def check_active_trades_for_user(application: Application, user: User, db:
             pnl_frac = float(pnl_data.get("unrealized_pnl_frac") or 0.0)
             pnl_pct = pnl_frac * 100.0
 
+            # Entrada efetiva (sempre que possível, a entrada atual reportada pela corretora)
+            effective_entry = float(position_data.get("entry") or trade.entry_price or 0.0)
+
             # --- Stop-Gain com degraus (ladder) ---
             sg_trig = float(getattr(user, 'stop_gain_trigger_pct', 0) or 0.0)
             sg_lock = float(getattr(user, 'stop_gain_lock_pct', 0) or 0.0)
@@ -354,9 +370,9 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                 if steps >= 1:
                     log_prefix = f"[Stop-Gain {trade.symbol}]"
                     if trade.side == 'LONG':
-                        new_sl = float(trade.entry_price) * (1.0 + (sg_lock / 100.0) * steps)
+                        new_sl = float(effective_entry) * (1.0 + (sg_lock / 100.0) * steps)
                     else:
-                        new_sl = float(trade.entry_price) * (1.0 - (sg_lock / 100.0) * steps)
+                        new_sl = float(effective_entry) * (1.0 - (sg_lock / 100.0) * steps)
 
                     is_improvement = (trade.side == 'LONG' and new_sl > (trade.current_stop_loss or float('-inf'))) or \
                                      (trade.side == 'SHORT' and new_sl < (trade.current_stop_loss or float('inf')))
@@ -459,7 +475,8 @@ async def check_active_trades_for_user(application: Application, user: User, db:
             be_trigger_hit = False
             if be_trigger_pct > 0 and not trade.is_breakeven:
                 if pnl_pct >= be_trigger_pct:
-                    desired_sl = float(trade.entry_price)
+                    # Use a entrada efetiva para BE inicial
+                    desired_sl = float(effective_entry)
                     be_trigger_hit = True
             
             if user.stop_strategy == 'BREAK_EVEN':
@@ -470,10 +487,10 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                             desired_sl = float(tp_ref)
                             reason = f"Break-Even Avançado (TP {tp_ref:.4f})"
                         else:
-                            desired_sl = float(trade.entry_price)
+                            desired_sl = float(effective_entry)
                             reason = "Break-Even Ativado (1º TP)"
                     else: # veio do gatilho por PnL
-                        desired_sl = float(trade.entry_price)
+                        desired_sl = float(effective_entry)
                         reason = f"Break-Even por PnL ({pnl_pct:.2f}%)"
 
                     is_improvement = (trade.side == 'LONG' and desired_sl > (trade.current_stop_loss or float('-inf'))) or \
@@ -503,7 +520,7 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                 if ts_started:
                     log_prefix = f"[Trailing Stop {trade.symbol}]"
                     if not trade.is_breakeven:
-                        new_sl = float(trade.entry_price)
+                        new_sl = float(effective_entry)
                         sl_result = await modify_position_stop_loss(api_key, api_secret, trade.symbol, new_sl, reason="ts")
                         if sl_result.get("success"):
                             trade.is_breakeven = True
@@ -516,7 +533,7 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                             logger.error(f"{log_prefix} Falha ao mover SL para BE: {sl_result.get('error', 'desconhecido')}")
                     else:
                         if trade.trail_high_water_mark is None:
-                            trade.trail_high_water_mark = trade.entry_price
+                            trade.trail_high_water_mark = effective_entry
                         new_hwm = trade.trail_high_water_mark
                         if trade.side == 'LONG' and current_price > new_hwm:
                             new_hwm = current_price
@@ -527,8 +544,8 @@ async def check_active_trades_for_user(application: Application, user: User, db:
                             logger.info(f"{log_prefix} Novo pico: ${new_hwm:.4f}")
                             trade.trail_high_water_mark = new_hwm
 
-                        trail_distance = abs(trade.entry_price - (trade.stop_loss or trade.entry_price * 0.98)) \
-                                         if trade.stop_loss is not None else trade.entry_price * 0.02
+                        trail_distance = abs(effective_entry - (trade.stop_loss or effective_entry * 0.98)) \
+                                         if trade.stop_loss is not None else effective_entry * 0.02
                         potential_new_sl = new_hwm - trail_distance if trade.side == 'LONG' else new_hwm + trail_distance
 
                         is_improvement = (trade.side == 'LONG' and potential_new_sl > (trade.current_stop_loss or float('-inf'))) or \
