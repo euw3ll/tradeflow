@@ -49,7 +49,7 @@ from bot.handlers import (
     show_risk_menu_handler, show_stopgain_menu_handler, show_circuit_menu_handler,
     back_to_settings_menu_handler, back_from_whitelist_handler,
     show_tp_strategy_menu_handler, ask_tp_distribution, receive_tp_distribution, ASKING_TP_DISTRIBUTION,
-    show_tp_presets_handler, set_tp_preset_handler,
+    cycle_tp_preset_handler,
     onboard_select_preset_handler, onboard_accept_terms_handler, onboard_decline_terms_handler,
     info_learn_start_handler, info_learn_nav_handler,
 )
@@ -357,8 +357,7 @@ async def main():
     application.add_handler(CallbackQueryHandler(show_circuit_menu_handler, pattern='^settings_circuit$'))
     application.add_handler(CallbackQueryHandler(back_to_settings_menu_handler, pattern='^back_to_settings_menu$'))
     application.add_handler(CallbackQueryHandler(show_tp_strategy_menu_handler, pattern='^show_tp_strategy$'))
-    application.add_handler(CallbackQueryHandler(show_tp_presets_handler, pattern='^show_tp_presets$'))
-    application.add_handler(CallbackQueryHandler(set_tp_preset_handler, pattern='^set_tp_preset_'))
+    application.add_handler(CallbackQueryHandler(cycle_tp_preset_handler, pattern='^cycle_tp_preset$'))
 
     application.add_error_handler(on_error)
 

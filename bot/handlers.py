@@ -3244,15 +3244,29 @@ async def show_tp_strategy_menu_handler(update: Update, context: ContextTypes.DE
             await query.edit_message_text("Não encontrei seu usuário.")
             return
 
+        token = (getattr(user, 'tp_distribution', 'EQUAL') or 'EQUAL')
+        # Mapeia rótulo e descrição
+        def _tp_label_and_info(token: str):
+            t = (token or 'EQUAL').upper()
+            if t == 'EQUAL':
+                return ('Divisão Igual', 'Divide igualmente o volume entre todos os alvos.')
+            if t == 'FRONT_HEAVY':
+                return ('Mais cedo (frente)', 'Concentra mais fechamento nos primeiros alvos.')
+            if t == 'EXP_FRONT':
+                return ('Exponencial cedo', 'Concentra fortemente nos primeiros alvos (decay mais agressivo).')
+            if t == 'BACK_HEAVY':
+                return ('Mais tarde (traseira)', 'Concentra mais fechamento nos últimos alvos.')
+            if ',' in (token or ''):
+                return ('Personalizada', 'Usa seus valores como âncoras; o bot extrapola e normaliza para os demais alvos.')
+            return (token, 'Usa a estratégia configurada.')
+
+        label, info = _tp_label_and_info(token)
         header = (
-            "🎯 **Estratégia de Take Profit**\n\n"
-            "Defina como o bot deve distribuir o fechamento da sua posição entre os alvos de um sinal."
+            "🎯 <b>Estratégia de Take Profit</b>\n\n"
+            f"<b>Estratégia Atual:</b> {label}\n\n"
+            f"{info}"
         )
-        await query.edit_message_text(
-            text=header,
-            reply_markup=tp_strategy_menu_keyboard(user),
-            parse_mode="Markdown",
-        )
+        await query.edit_message_text(text=header, reply_markup=tp_strategy_menu_keyboard(user), parse_mode='HTML')
     finally:
         db.close()
 
@@ -3264,17 +3278,12 @@ async def ask_tp_distribution(update: Update, context: ContextTypes.DEFAULT_TYPE
     context.user_data['settings_message_id'] = query.message.message_id
     
     text = (
-        "**Como você quer distribuir seus Take Profits?**\n\n"
-        "1. **Divisão Igual (Padrão)**\n"
-        "   - O bot divide o volume total igualmente por todos os alvos.\n"
-        "   - Para usar, digite: `igual`\n\n"
-        "2. **Distribuição Personalizada**\n"
-        "   - Você define a porcentagem a ser fechada em cada alvo.\n"
-        "   - A soma deve ser 100%.\n"
-        "   - Exemplo para um sinal com 3 alvos: `50, 30, 20`\n\n"
-        "Envie sua nova estratégia."
+        "🎯 <b>Personalizar Estratégia de TP</b>\n\n"
+        "Envie uma lista de valores (ex.: <code>50,30,20</code>).\n"
+        "Esses valores serão usados como <i>âncoras</i>: se houver mais alvos, o bot extrapola a cauda e normaliza para somar 100%.\n"
+        "Se quiser voltar ao padrão igualitário, digite <code>igual</code>."
     )
-    await query.edit_message_text(text, parse_mode="Markdown")
+    await query.edit_message_text(text, parse_mode='HTML')
     return ASKING_TP_DISTRIBUTION
 
 async def receive_tp_distribution(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -3295,42 +3304,82 @@ async def receive_tp_distribution(update: Update, context: ContextTypes.DEFAULT_
         if user_input.lower() == 'igual':
             user.tp_distribution = 'EQUAL'
             db.commit()
-            feedback_text = "✅ Estratégia de TP atualizada para **Divisão Igual**."
+            feedback_text = "✅ Estratégia de TP atualizada para <b>Divisão Igual</b>."
         else:
             try:
-                percentages = [float(p.strip()) for p in user_input.replace('%', '').split(',')]
-                if not all(p > 0 for p in percentages):
-                    raise ValueError("Porcentagens devem ser positivas.")
-                if sum(percentages) != 100:
-                    raise ValueError(f"A soma das porcentagens deve ser 100, mas foi {sum(percentages)}.")
-                
-                # Salva a string limpa no banco
-                distribution_str = ",".join(map(str, percentages))
+                anchors = [float(p.strip()) for p in user_input.replace('%', '').split(',') if p.strip()]
+                if not anchors or not all(a > 0 for a in anchors):
+                    raise ValueError("Valores precisam ser positivos (ex.: 50,30,20).")
+                distribution_str = ",".join(map(str, anchors))
                 user.tp_distribution = distribution_str
                 db.commit()
-                feedback_text = f"✅ Estratégia de TP salva: **{distribution_str}%**."
+                feedback_text = (
+                    "✅ Estratégia de TP personalizada salva. Usando seus valores como âncoras; "
+                    "normalização e extrapolação serão aplicadas conforme o número de alvos."
+                )
             except (ValueError, TypeError) as e:
                 await context.bot.edit_message_text(
                     chat_id=update.effective_chat.id,
                     message_id=message_id_to_edit,
-                    text=f"❌ **Entrada inválida:** {e}\n\nPor favor, tente novamente. Ex: `50,30,20` ou `igual`",
-                    parse_mode="Markdown"
+                    text=f"❌ <b>Entrada inválida:</b> {e}\n\nPor favor, tente novamente. Ex.: <code>50,30,20</code> ou <code>igual</code>",
+                    parse_mode='HTML'
                 )
                 return ASKING_TP_DISTRIBUTION # Mantém o usuário na conversa para tentar de novo
 
         # Se chegou aqui, a entrada foi válida e salva.
+        # Reconstrói header com a estratégia atual e descrição
+        token = (getattr(user, 'tp_distribution', 'EQUAL') or 'EQUAL')
+        def _tp_label_and_info(token: str):
+            t = (token or 'EQUAL').upper()
+            if t == 'EQUAL':
+                return ('Divisão Igual', 'Divide igualmente o volume entre todos os alvos.')
+            if t == 'FRONT_HEAVY':
+                return ('Mais cedo (frente)', 'Concentra mais fechamento nos primeiros alvos.')
+            if t == 'EXP_FRONT':
+                return ('Exponencial cedo', 'Concentra fortemente nos primeiros alvos (decay mais agressivo).')
+            if t == 'BACK_HEAVY':
+                return ('Mais tarde (traseira)', 'Concentra mais fechamento nos últimos alvos.')
+            if ',' in (token or ''):
+                return ('Personalizada', 'Usa seus valores como âncoras; o bot extrapola e normaliza para os demais alvos.')
+            return (token, 'Usa a estratégia configurada.')
+        label, info = _tp_label_and_info(token)
         header = (
-            "🎯 **Estratégia de Take Profit**\n\n"
-            f"{feedback_text}"
+            "🎯 <b>Estratégia de Take Profit</b>\n\n"
+            f"{feedback_text}\n\n"
+            f"<b>Estratégia Atual:</b> {label}\n\n{info}"
         )
         await context.bot.edit_message_text(
             chat_id=update.effective_chat.id,
             message_id=message_id_to_edit,
             text=header,
             reply_markup=tp_strategy_menu_keyboard(user),
-            parse_mode="Markdown"
+            parse_mode='HTML'
         )
     finally:
         db.close()
         
     return ConversationHandler.END
+
+async def cycle_tp_preset_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Alterna entre presets de TP a cada clique: EQUAL → FRONT_HEAVY → BACK_HEAVY → EXP_FRONT → EQUAL."""
+    query = update.callback_query
+    await query.answer()
+    order = ["EQUAL", "FRONT_HEAVY", "BACK_HEAVY", "EXP_FRONT"]
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.telegram_id == query.from_user.id).first()
+        if not user:
+            await query.edit_message_text("Usuário não encontrado. Use /start.")
+            return
+        cur = (getattr(user, 'tp_distribution', 'EQUAL') or 'EQUAL').upper()
+        try:
+            idx = order.index(cur)
+        except ValueError:
+            idx = 0
+        nxt = order[(idx + 1) % len(order)]
+        user.tp_distribution = nxt
+        db.commit()
+        # Reapresenta o menu principal com rótulo e descrição atualizados
+        await show_tp_strategy_menu_handler(update, context)
+    finally:
+        db.close()
