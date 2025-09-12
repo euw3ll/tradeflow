@@ -3,7 +3,7 @@ import asyncio
 import pytz
 from database.models import PendingSignal
 from services.signal_parser import SignalType
-from services.bybit_service import get_account_info, cancel_order 
+from services.bybit_service import get_account_info, cancel_order, get_order_status 
 from datetime import datetime, time, timedelta 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 import os, re, subprocess
@@ -1061,7 +1061,11 @@ async def my_positions_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 live_pnl_data[pos["symbol"]] = pos
 
         lines = ["<b>📊 Suas Posições Ativas (Gerenciadas pelo Bot)</b>", ""]
-        keyboard_rows = []
+        # Abas de navegação: Ativas | Pendentes
+        keyboard_rows = [[
+            InlineKeyboardButton("Ativas", callback_data='user_positions'),
+            InlineKeyboardButton("Pendentes", callback_data='user_pending_positions')
+        ]]
         
         if not canonical_trades:
              lines.append("Nenhuma posição encontrada na Bybit.")
@@ -1121,6 +1125,186 @@ async def my_positions_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 reply_markup=InlineKeyboardMarkup(keyboard_rows)
             )
 
+    finally:
+        db.close()
+
+async def pending_positions_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lista ordens limite pendentes do usuário com opção de cancelamento e sincronização com a corretora."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except BadRequest:
+        return
+
+    try:
+        await query.edit_message_text("Buscando suas ordens pendentes...")
+    except BadRequest:
+        pass
+
+    user_id = update.effective_user.id
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter_by(telegram_id=user_id).first()
+        if not user or not user.api_key_encrypted:
+            await query.edit_message_text("Você ainda não configurou suas chaves de API.")
+            return
+
+        api_key = decrypt_data(user.api_key_encrypted)
+        api_secret = decrypt_data(user.api_secret_encrypted)
+
+        pendentes = db.query(PendingSignal).filter_by(user_telegram_id=user_id).order_by(PendingSignal.id.desc()).all()
+
+        lines = ["<b>⏳ Suas Ordens Pendentes</b>", ""]
+        # Abas de navegação: Ativas | Pendentes
+        keyboard_rows = [[
+            InlineKeyboardButton("Ativas", callback_data='user_positions'),
+            InlineKeyboardButton("Pendentes", callback_data='user_pending_positions')
+        ]]
+
+        cleaned_any = False
+        for p in list(pendentes):
+            # Sincroniza rapidamente o status antes de exibir
+            status_str = "Pendente"
+            created_str = ""
+            try:
+                st = await get_order_status(api_key, api_secret, p.order_id, p.symbol)
+                if st.get("success"):
+                    od = st.get("data") or {}
+                    status_raw = (od.get("orderStatus") or "").strip()
+                    status_str = status_raw or status_str
+                    # Remove da lista local se estiver cancelada/expirada/rejeitada ou totalmente executada
+                    status_upper = status_raw.upper() if status_raw else ""
+                    if status_upper in ("CANCELLED", "CANCELED", "REJECTED", "EXPIRED", "DEACTIVATED"):
+                        db.delete(p)
+                        cleaned_any = True
+                        await send_user_alert(context.application, user_id,
+                                              f"ℹ️ Sua ordem limite para <b>{p.symbol}</b> não está mais aberta (status: {status_raw}). Removida da lista de pendentes.")
+                        continue
+                    if status_upper == "FILLED":
+                        # Será promovida pelo tracker; não exibir aqui
+                        db.delete(p)
+                        cleaned_any = True
+                        continue
+
+                    # Tenta ler timestamp de criação
+                    ts_ms = od.get("createdTime") or od.get("createTime") or od.get("createdAt") or od.get("createdAtTs")
+                    try:
+                        if ts_ms is not None:
+                            ts_ms_f = float(ts_ms)
+                            import datetime
+                            dt = datetime.datetime.fromtimestamp(ts_ms_f / 1000.0)
+                            created_str = dt.strftime("%d/%m %H:%M")
+                    except Exception:
+                        created_str = ""
+            except Exception:
+                pass
+
+            side = (p.signal_data or {}).get('order_type') or '—'
+            limit_price = (p.signal_data or {}).get('limit_price')
+            price_txt = f"${float(limit_price):,.4f}" if isinstance(limit_price, (int, float)) else str(limit_price or '—')
+
+            # Monta as linhas
+            lines.append(
+                f"- <b>{p.symbol}</b> ({side})\n"
+                f"  Preço: {price_txt} | Status: <b>{status_str}</b>\n"
+                f"  ID Corretora: <code>{p.order_id}</code>"
+                + (f"\n  Criada: {created_str}" if created_str else "")
+            )
+
+            keyboard_rows.append([
+                InlineKeyboardButton(f"Cancelar {p.symbol} #{p.id} ❌", callback_data=f"confirm_cancel_pending_{p.id}")
+            ])
+
+        if not pendentes or cleaned_any:
+            # Recarrega se houve limpeza de itens para refletir o estado final
+            pendentes = db.query(PendingSignal).filter_by(user_telegram_id=user_id).order_by(PendingSignal.id.desc()).all()
+            if not pendentes:
+                lines.append("Nenhuma ordem limite pendente.")
+
+        keyboard_rows.append([InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data='back_to_main_menu')])
+
+        try:
+            await query.edit_message_text(
+                "\n".join(lines), parse_mode='HTML', reply_markup=InlineKeyboardMarkup(keyboard_rows)
+            )
+        except BadRequest as e:
+            logger.warning(f"Falha ao editar lista de pendentes: {e}. Enviando nova mensagem.")
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="\n".join(lines),
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup(keyboard_rows)
+            )
+    finally:
+        db.close()
+
+async def cancel_pending_prompt_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Confirma cancelamento de uma ordem limite pendente."""
+    query = update.callback_query
+    await query.answer()
+    ps_id_str = query.data.split('_')[-1]
+    if not ps_id_str.isdigit():
+        await query.edit_message_text("Este botão é de uma versão antiga. Volte e abra o menu novamente.")
+        return
+    ps_id = int(ps_id_str)
+
+    db = SessionLocal()
+    try:
+        p = db.query(PendingSignal).filter_by(id=ps_id, user_telegram_id=update.effective_user.id).first()
+        if not p:
+            await query.edit_message_text("Erro: ordem pendente não encontrada.")
+            return
+        msg = (
+            f"⚠️ <b>Confirmar Cancelamento</b> ⚠️\n\n"
+            f"Cancelar sua ordem limite para <b>{p.symbol}</b>?\n"
+            f"<i>ID:</i> <code>{p.order_id}</code>"
+        )
+        kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Sim, cancelar", callback_data=f"execute_cancel_pending_{p.id}"),
+                InlineKeyboardButton("❌ Não, voltar", callback_data='user_pending_positions'),
+            ]
+        ])
+        await query.edit_message_text(msg, parse_mode='HTML', reply_markup=kb)
+    finally:
+        db.close()
+
+async def execute_cancel_pending_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Executa o cancelamento na corretora e remove localmente."""
+    query = update.callback_query
+    await query.answer("Cancelando...")
+    ps_id = int(query.data.split('_')[-1])
+    user_id = update.effective_user.id
+
+    db = SessionLocal()
+    try:
+        p = db.query(PendingSignal).filter_by(id=ps_id, user_telegram_id=user_id).first()
+        if not p:
+            await query.edit_message_text("Ordem já não está mais pendente.")
+            return
+
+        user = db.query(User).filter_by(telegram_id=user_id).first()
+        api_key = decrypt_data(user.api_key_encrypted)
+        api_secret = decrypt_data(user.api_secret_encrypted)
+
+        resp = await cancel_order(api_key, api_secret, p.order_id, p.symbol)
+        if not resp.get("success"):
+            # Trata erros idempotentes como sucesso
+            err = (resp.get("error") or "").lower()
+            if any(s in err for s in ("already", "not found", "canceled", "cancelled")):
+                pass
+            else:
+                await query.edit_message_text(f"❌ Falha ao cancelar: {resp.get('error', 'erro desconhecido')}\nTente novamente.")
+                return
+
+        db.delete(p)
+        db.commit()
+
+        await send_user_alert(context.application, user_id,
+                              f"✅ Sua ordem limite para <b>{p.symbol}</b> foi cancelada.")
+
+        # Volta para a lista de pendentes atualizada
+        await pending_positions_handler(update, context)
     finally:
         db.close()
 

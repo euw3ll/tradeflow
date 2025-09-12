@@ -1,4 +1,5 @@
 import asyncio
+import os
 import logging
 import time
 import math
@@ -201,6 +202,40 @@ async def check_pending_orders_for_user(application: Application, user: User, db
 
         order_data = status_result.get("data") or {}
         order_status = (order_data.get("orderStatus") or "").strip()
+
+        # Limpeza de estados não-abertos: cancelada/rejeitada/expirada
+        status_upper = order_status.upper() if order_status else ""
+        if status_upper in ("CANCELLED", "CANCELED", "REJECTED", "EXPIRED", "DEACTIVATED"):
+            logger.info(f"[pending:cleanup] Removendo {order.order_id} ({order.symbol}) com status={order_status}.")
+            db.delete(order)
+            await send_user_alert(application, user.telegram_id,
+                                  f"ℹ️ Sua ordem limite para <b>{order.symbol}</b> não está mais aberta (status: {order_status}). Removida da lista de pendentes.")
+            continue
+
+        # Expiração opcional de pendentes por tempo
+        try:
+            expiry_min = int(os.getenv("TF_PENDING_EXPIRY_MINUTES", "0") or "0")
+        except Exception:
+            expiry_min = 0
+        if expiry_min > 0 and status_upper not in ("FILLED",):
+            created_ms = order_data.get("createdTime") or order_data.get("createTime") or order_data.get("createdAt") or order_data.get("createdAtTs")
+            try:
+                if created_ms is not None:
+                    created_ms_f = float(created_ms)
+                    now_ms = time.time() * 1000.0
+                    age_min = (now_ms - created_ms_f) / 60000.0
+                    if age_min >= float(expiry_min):
+                        logger.info(f"[pending:expire] Cancelando {order.order_id} ({order.symbol}) por expiração ({age_min:.1f} min >= {expiry_min} min)")
+                        try:
+                            await cancel_order(api_key, api_secret, order.order_id, order.symbol)
+                        except Exception:
+                            logger.exception(f"[pending:expire] Falha ao cancelar {order.order_id} ({order.symbol})")
+                        db.delete(order)
+                        await send_user_alert(application, user.telegram_id,
+                                              f"⌛ Sua ordem limite para <b>{order.symbol}</b> foi expirada após {int(age_min)} min.")
+                        continue
+            except Exception:
+                logger.exception(f"[pending:expire] Falha ao calcular idade da ordem {order.order_id} ({order.symbol})")
 
         if order_status == 'Filled':
             logger.info(f"Ordem Limite {order.order_id} EXECUTADA para o usuário {user.telegram_id}.")

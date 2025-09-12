@@ -12,7 +12,8 @@ from bot.handlers import (
     show_no_invite_info_handler, back_to_invite_welcome_handler, enter_invite_handler,
     config_api, receive_api_key, receive_api_secret, WAITING_API_KEY, WAITING_API_SECRET,
     remove_api_prompt, remove_api_action, CONFIRM_REMOVE_API,
-    my_positions_handler, user_dashboard_handler, user_settings_handler,
+    my_positions_handler, pending_positions_handler, cancel_pending_prompt_handler, execute_cancel_pending_handler,
+    user_dashboard_handler, user_settings_handler,
     back_to_main_menu_handler,
     ask_entry_percent, receive_entry_percent, ASKING_ENTRY_PERCENT,
     ask_max_leverage, receive_max_leverage, ASKING_MAX_LEVERAGE,
@@ -264,6 +265,9 @@ async def main():
     application.add_handler(CallbackQueryHandler(back_to_invite_welcome_handler, pattern='^back_to_invite_welcome$'))
     
     application.add_handler(CallbackQueryHandler(my_positions_handler, pattern='^user_positions$'))
+    application.add_handler(CallbackQueryHandler(pending_positions_handler, pattern='^user_pending_positions$'))
+    application.add_handler(CallbackQueryHandler(cancel_pending_prompt_handler, pattern='^confirm_cancel_pending_'))
+    application.add_handler(CallbackQueryHandler(execute_cancel_pending_handler, pattern='^execute_cancel_pending_'))
     application.add_handler(CallbackQueryHandler(user_settings_handler, pattern='^user_settings$'))
     application.add_handler(CallbackQueryHandler(user_dashboard_handler, pattern='^user_dashboard$'))
     application.add_handler(CallbackQueryHandler(toggle_bot_status_handler, pattern='^toggle_bot_status$'))
