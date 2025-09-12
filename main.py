@@ -38,6 +38,9 @@ from bot.handlers import (
     ask_stop_gain_lock, receive_stop_gain_lock, ASKING_STOP_GAIN_LOCK,
     ask_be_trigger, receive_be_trigger, ASKING_BE_TRIGGER,
     ask_ts_trigger, receive_ts_trigger, ASKING_TS_TRIGGER,
+    show_initial_stop_menu_handler, toggle_initial_sl_mode_handler,
+    ask_initial_sl_fixed, receive_initial_sl_fixed, ASKING_INITIAL_SL_FIXED,
+    ask_risk_per_trade, receive_risk_per_trade, ASKING_RISK_PER_TRADE,
     ask_circuit_threshold, receive_circuit_threshold, ASKING_CIRCUIT_THRESHOLD,
     ask_circuit_pause, receive_circuit_pause, ASKING_CIRCUIT_PAUSE,
     ask_ma_timeframe, set_ma_timeframe,
@@ -335,6 +338,21 @@ async def main():
 
     application.add_handler(CallbackQueryHandler(show_risk_menu_handler, pattern='^settings_risk$'))
     application.add_handler(CallbackQueryHandler(show_stopgain_menu_handler, pattern='^settings_stopgain$'))
+    application.add_handler(CallbackQueryHandler(show_initial_stop_menu_handler, pattern='^settings_initial_stop$'))
+    application.add_handler(CallbackQueryHandler(toggle_initial_sl_mode_handler, pattern='^toggle_initial_sl_mode$'))
+    # Conversas para Stop Inicial
+    initial_sl_fixed_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(ask_initial_sl_fixed, pattern='^ask_initial_sl_fixed$')],
+        states={ ASKING_INITIAL_SL_FIXED: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_initial_sl_fixed)] },
+        fallbacks=[CommandHandler("cancel", cancel)], per_message=False, per_user=True,
+    )
+    application.add_handler(initial_sl_fixed_conv)
+    risk_per_trade_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(ask_risk_per_trade, pattern='^ask_risk_per_trade$')],
+        states={ ASKING_RISK_PER_TRADE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_risk_per_trade)] },
+        fallbacks=[CommandHandler("cancel", cancel)], per_message=False, per_user=True,
+    )
+    application.add_handler(risk_per_trade_conv)
     application.add_handler(CallbackQueryHandler(show_circuit_menu_handler, pattern='^settings_circuit$'))
     application.add_handler(CallbackQueryHandler(back_to_settings_menu_handler, pattern='^back_to_settings_menu$'))
     application.add_handler(CallbackQueryHandler(show_tp_strategy_menu_handler, pattern='^show_tp_strategy$'))

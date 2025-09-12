@@ -13,6 +13,82 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 logger = logging.getLogger(__name__)
 INSTRUMENT_INFO_CACHE: Dict[str, Any] = {}
 
+def _compute_initial_sl_price(
+    *,
+    mode: str,
+    side: str,  # 'Buy' or 'Sell'
+    entry_price: Decimal,
+    tick: Decimal,
+    user: User,
+    signal_sl: Optional[Decimal] = None,
+) -> Optional[Decimal]:
+    """
+    Calcula o Stop Inicial conforme a configuração do usuário.
+
+    - FIXED: aplica percentual fixo sobre o preço de entrada.
+    - FOLLOW_SIGNAL: segue o SL informado no sinal (apenas alinha no tick e valida o lado).
+    - ADAPTIVE: usa o SL do sinal, limitado por um risco por trade (% do equity) considerando
+      entrada (% do equity) e alavancagem. Se o sinal não trouxer SL, aplica limite permitido.
+
+    Retorna preço já alinhado ao tick (down p/ LONG, up p/ SHORT).
+    """
+    try:
+        mode = (mode or '').strip().upper()
+        is_long = (side == 'Buy')
+        entry = Decimal(str(entry_price))
+        if entry <= 0:
+            return None
+
+        def _align(price: Decimal) -> Decimal:
+            return _round_down_to_tick(price, tick) if is_long else _round_up_to_tick(price, tick)
+
+        if mode == 'FIXED':
+            pct = Decimal(str(getattr(user, 'initial_sl_fixed_pct', 1.0) or 1.0)) / Decimal('100')
+            if pct <= 0:
+                return None
+            price = entry * (Decimal('1') - pct) if is_long else entry * (Decimal('1') + pct)
+            return _align(price)
+
+        if mode in ('FOLLOW', 'FOLLOW_SIGNAL', 'SIGNAL'):
+            if signal_sl is None:
+                return None
+            sl = Decimal(str(signal_sl))
+            # valida lado correto
+            if is_long and sl >= entry:
+                return None
+            if (not is_long) and sl <= entry:
+                return None
+            return _align(sl)
+
+        # ADAPTIVE (default)
+        entry_pct = Decimal(str(getattr(user, 'entry_size_percent', 0) or 0)) / Decimal('100')
+        lev = Decimal(str(getattr(user, 'max_leverage', 0) or 0))
+        risk_pct = Decimal(str(getattr(user, 'risk_per_trade_pct', 1.0) or 1.0)) / Decimal('100')
+
+        allowed_pct = None
+        if entry_pct > 0 and lev > 0:
+            # risk$ = equity * entry_pct * lev * sl_pct  <= equity * risk_pct  => sl_pct <= risk_pct/(entry_pct*lev)
+            allowed_pct = risk_pct / (entry_pct * lev)
+        # fallback: 1% se não computável
+        if not allowed_pct or allowed_pct <= 0:
+            allowed_pct = Decimal('0.01')
+
+        # Distância do SL do sinal (se houver)
+        dist_signal = None
+        if signal_sl is not None and signal_sl > 0:
+            sl = Decimal(str(signal_sl))
+            if is_long and sl < entry:
+                dist_signal = (entry - sl) / entry
+            elif (not is_long) and sl > entry:
+                dist_signal = (sl - entry) / entry
+
+        use_pct = allowed_pct if dist_signal is None else min(allowed_pct, dist_signal)
+        price = entry * (Decimal('1') - use_pct) if is_long else entry * (Decimal('1') + use_pct)
+        return _align(price)
+    except Exception:
+        logger.exception("[sl:init] falha ao calcular SL inicial")
+        return None
+
 def _round_down_to_step(value: Decimal, step: Decimal) -> Decimal:
     """Arredonda para BAIXO no múltiplo de 'step' (quantidade)."""
     if step <= 0:
@@ -253,12 +329,6 @@ async def place_order(api_key: str, api_secret: str, signal_data: dict, user_set
     current_market_price = Decimal(str(price_check["price"]))
     
     side = "Buy" if (signal_data.get('order_type') or '').upper() == 'LONG' else "Sell"
-    stop_loss_price = Decimal(str(signal_data.get('stop_loss')))
-
-    if side == 'Buy' and stop_loss_price >= current_market_price:
-        return {"success": False, "error": f"Stop Loss ({stop_loss_price}) inválido para LONG. Deve ser menor que o preço atual ({current_market_price})."}
-    if side == 'Sell' and stop_loss_price <= current_market_price:
-        return {"success": False, "error": f"Stop Loss ({stop_loss_price}) inválido para SHORT. Deve ser maior que o preço atual ({current_market_price})."}
     
     async def pre_flight_checks():
         if symbol not in INSTRUMENT_INFO_CACHE: await get_instrument_info(symbol)
@@ -286,12 +356,36 @@ async def place_order(api_key: str, api_secret: str, signal_data: dict, user_set
             if final_notional_value < instrument_rules["minNotionalValue"]:
                 return {"success": False, "error": f"Valor total da ordem (${final_notional_value:.2f}) é menor que o mínimo permitido de ${instrument_rules['minNotionalValue']:.2f}."}
             
-            # --- INÍCIO DA MODIFICAÇÃO: Lógica de Take Profit Condicional ---
+            # SL inicial conforme configuração do usuário
+            tick = instrument_rules["tickSize"]
+            signal_sl_val = signal_data.get('stop_loss')
+            try:
+                signal_sl_dec = Decimal(str(signal_sl_val)) if signal_sl_val is not None else None
+            except Exception:
+                signal_sl_dec = None
+            eff_sl = _compute_initial_sl_price(
+                mode=str(getattr(user_settings, 'initial_sl_mode', 'ADAPTIVE')),
+                side=side,
+                entry_price=entry_price,
+                tick=tick,
+                user=user_settings,
+                signal_sl=signal_sl_dec,
+            )
+            if eff_sl is None:
+                return {"success": False, "error": "Não foi possível calcular o Stop Loss inicial."}
+
+            # Valida posição relativa ao preço atual
+            if side == 'Buy' and eff_sl >= entry_price:
+                return {"success": False, "error": f"Stop Loss ({eff_sl}) inválido para LONG. Deve ser menor que o preço atual ({entry_price})."}
+            if side == 'Sell' and eff_sl <= entry_price:
+                return {"success": False, "error": f"Stop Loss ({eff_sl}) inválido para SHORT. Deve ser maior que o preço atual ({entry_price})."}
+
+            # --- TP Condicional (lógica existente) ---
             all_targets = signal_data.get('targets') or []
             
             payload = {
                 "category": "linear", "symbol": symbol, "side": side, "orderType": "Market", "qty": str(qty_adj),
-                "stopLoss": str(stop_loss_price),
+                "stopLoss": str(eff_sl),
             }
 
             # Só enviamos o takeProfit para a Bybit se houver EXATAMENTE UM alvo.
@@ -308,7 +402,9 @@ async def place_order(api_key: str, api_secret: str, signal_data: dict, user_set
             
             _safe_log_order_payload("place_order:market_entry", payload)
             response = session.place_order(**{k: v for k, v in payload.items() if v is not None})
-            if response.get('retCode') == 0: return {"success": True, "data": response['result']}
+            if response.get('retCode') == 0:
+                res = {"success": True, "data": response['result'], "effective_stop_loss": float(eff_sl)}
+                return res
             return {"success": False, "error": response.get('retMsg')}
         except Exception as e:
             logger.error(f"Exceção ao abrir ordem (Market): {e}", exc_info=True)
@@ -738,7 +834,7 @@ async def place_limit_order(api_key: str, api_secret: str, signal_data: dict, us
             if final_notional_value < instrument_rules["minNotionalValue"]:
                 return {"success": False, "error": f"Valor total da ordem (${final_notional_value:.2f}) é menor que o mínimo permitido de ${instrument_rules['minNotionalValue']:.2f}."}
 
-            # --- INÍCIO DA MODIFICAÇÃO: Lógica de Take Profit e Stop Loss Condicional ---
+            # --- Stop Loss Inicial (FIXED/ADAPTIVE) ---
             all_targets = signal_data.get('targets') or []
             sl_raw = signal_data.get('stop_loss')
 
@@ -747,21 +843,27 @@ async def place_limit_order(api_key: str, api_secret: str, signal_data: dict, us
                 "orderType": "Limit", "qty": str(qty_adj), "price": str(price_adj),
             }
 
-            # Adiciona TP apenas se houver EXATAMENTE UM alvo.
+            # TP: manda apenas se houver um alvo
             if len(all_targets) == 1:
                 tp_adj = _round_down_to_tick(Decimal(str(all_targets[0])), tick)
                 payload["takeProfit"] = str(tp_adj)
 
-            # Adiciona SL se existir no sinal, com arredondamento correto por lado.
-            if sl_raw is not None:
-                sl_decimal = Decimal(str(sl_raw))
-                if side == "Buy":  # LONG, SL é mais baixo
-                    sl_adj = _round_down_to_tick(sl_decimal, tick)
-                else:  # SHORT, SL é mais alto
-                    sl_adj = _round_up_to_tick(sl_decimal, tick)
-                payload["stopLoss"] = str(sl_adj)
-            # --- FIM DA MODIFICAÇÃO ---
-            
+            # SL inicial conforme configuração do usuário
+            try:
+                signal_sl_dec = Decimal(str(sl_raw)) if sl_raw is not None else None
+            except Exception:
+                signal_sl_dec = None
+            eff_sl = _compute_initial_sl_price(
+                mode=str(getattr(user_settings, 'initial_sl_mode', 'ADAPTIVE')),
+                side=side,
+                entry_price=price_adj,
+                tick=tick,
+                user=user_settings,
+                signal_sl=signal_sl_dec,
+            )
+            if eff_sl is not None:
+                payload["stopLoss"] = str(eff_sl)
+
             try:
                 session.set_leverage(category="linear", symbol=symbol, buyLeverage=str(leverage), sellLeverage=str(leverage))
             except InvalidRequestError as e:
@@ -773,7 +875,7 @@ async def place_limit_order(api_key: str, api_secret: str, signal_data: dict, us
             _safe_log_order_payload("place_limit_order:first_try", payload)
             response = session.place_order(**{k: v for k, v in payload.items() if v is not None})
             if response.get('retCode') == 0:
-                return {"success": True, "data": response['result']}
+                return {"success": True, "data": response['result'], "effective_stop_loss": float(eff_sl) if eff_sl is not None else None}
             return {"success": False, "error": response.get('retMsg')}
 
         except Exception as e:

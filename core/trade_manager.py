@@ -158,7 +158,8 @@ async def _execute_trade(signal_data: dict, user: User, application: Application
             return
             
         margin = (qty * entry_price) / leverage if leverage > 0 else 0
-        stop_loss = signal_data['stop_loss']
+        # Usa o SL efetivo retornado pela camada de exchange, se disponível
+        stop_loss = float(order_result.get('effective_stop_loss')) if order_result.get('effective_stop_loss') is not None else signal_data.get('stop_loss')
         
         all_targets = signal_data.get('targets') or []
         num_targets = len(all_targets)
@@ -218,8 +219,8 @@ async def _execute_trade(signal_data: dict, user: User, application: Application
             new_trade = Trade(
                 user_telegram_id=user.telegram_id, order_id=order_id,
                 notification_message_id=sent_message.message_id,
-                symbol=symbol, side=side, qty=qty, entry_price=entry_price,
-                stop_loss=stop_loss, current_stop_loss=stop_loss,
+                    symbol=symbol, side=side, qty=qty, entry_price=entry_price,
+                    stop_loss=stop_loss, current_stop_loss=stop_loss,
                 initial_targets=all_targets,
                 total_initial_targets=num_targets,
                 status='ACTIVE',
@@ -434,6 +435,13 @@ async def _execute_limit_order_for_user(signal_data: dict, user: User, applicati
 
     if limit_order_result.get("success"):
         order_id = limit_order_result["data"]["orderId"]
+        # Atualiza o SL do sinal para refletir o valor efetivo aplicado, se disponível
+        eff_sl = limit_order_result.get("effective_stop_loss")
+        if eff_sl is not None:
+            try:
+                signal_data['stop_loss'] = float(eff_sl)
+            except Exception:
+                pass
         
         # COMENTÁRIO: Lógica de formatação dos TPs foi refatorada para listar todos os alvos.
         all_targets = signal_data.get('targets') or []

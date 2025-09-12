@@ -20,6 +20,7 @@ from .keyboards import (
     invite_welcome_keyboard, invite_info_keyboard,
     onboarding_risk_keyboard, onboarding_terms_keyboard,
     settings_root_keyboard, notifications_menu_keyboard, info_menu_keyboard,
+    initial_stop_menu_keyboard,
 )
 from utils.security import encrypt_data, decrypt_data
 from services.bybit_service import (
@@ -49,6 +50,8 @@ ASKING_TS_TRIGGER = 27
 ASKING_CLEANUP_MINUTES = 28
 ASKING_ALERT_CLEANUP_MINUTES = 29
 ASKING_PENDING_EXPIRY_MINUTES = 30
+ASKING_INITIAL_SL_FIXED = 31
+ASKING_RISK_PER_TRADE = 32
 
 logger = logging.getLogger(__name__)
 
@@ -2517,6 +2520,137 @@ async def ask_circuit_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['settings_message_id'] = query.message.message_id
     await query.edit_message_text("⏸️ Envie a <b>pausa</b> após disparo (minutos, ex.: 120)", parse_mode="HTML")
     return ASKING_CIRCUIT_PAUSE
+
+# ---- Stop Inicial (UI) ----
+async def show_initial_stop_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = get_user_by_id(update.effective_user.id)
+    header = (
+        "🛑 <b>Stop Inicial</b>\n"
+        "<i>Defina o SL inicial: Fixo (%) ou Adaptativo (risco por trade).</i>"
+    )
+    await query.edit_message_text(text=header, parse_mode='HTML', reply_markup=initial_stop_menu_keyboard(user))
+
+async def toggle_initial_sl_mode_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.telegram_id == query.from_user.id).first()
+        if not user:
+            await query.edit_message_text("Usuário não encontrado. Use /start para registrar.")
+            return
+        cur = (getattr(user, 'initial_sl_mode', 'ADAPTIVE') or 'ADAPTIVE').upper()
+        # Ciclo de 3 estados: ADAPTIVE -> FOLLOW_SIGNAL -> FIXED -> ADAPTIVE
+        if cur == 'ADAPTIVE':
+            nxt = 'FOLLOW_SIGNAL'
+        elif cur in ('FOLLOW', 'FOLLOW_SIGNAL', 'SIGNAL'):
+            nxt = 'FIXED'
+        else:
+            nxt = 'ADAPTIVE'
+        user.initial_sl_mode = nxt
+        db.commit()
+        header = (
+            "🛑 <b>Stop Inicial</b>\n"
+            "<i>Defina o SL inicial: Fixo (%) ou Adaptativo (risco por trade).</i>"
+        )
+        await query.edit_message_text(text=header, parse_mode='HTML', reply_markup=initial_stop_menu_keyboard(user))
+    except Exception as e:
+        db.rollback(); logger.error(f"[settings] toggle_initial_sl_mode erro: {e}", exc_info=True)
+        await query.edit_message_text("Erro ao alternar o modo de Stop Inicial.")
+    finally:
+        db.close()
+
+async def ask_initial_sl_fixed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data['settings_message_id'] = query.message.message_id
+    await query.edit_message_text("🛑 Envie o <b>percentual fixo</b> do Stop Inicial (ex.: 1.5)", parse_mode='HTML')
+    return ASKING_INITIAL_SL_FIXED
+
+async def receive_initial_sl_fixed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message_id_to_edit = context.user_data.get('settings_message_id')
+    text = (update.message.text or "").strip().replace('%', '').replace(',', '.')
+    db = SessionLocal()
+    try:
+        value = float(text)
+        if value <= 0 or value > 50:
+            try: await update.message.delete()
+            except Exception: pass
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text="❌ Valor inválido. Envie > 0 e <= 50 (ex.: 1.5).")
+            return ASKING_INITIAL_SL_FIXED
+        user = db.query(User).filter_by(telegram_id=update.effective_user.id).first()
+        if not user:
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text="Usuário não encontrado. Use /start para registrar.")
+            return ConversationHandler.END
+        user.initial_sl_fixed_pct = value; db.commit()
+        try: await update.message.delete()
+        except Exception: pass
+        header = (
+            "🛑 <b>Stop Inicial</b>\n<i>Defina o SL inicial: Fixo (%) ou Adaptativo (risco por trade).</i>\n\n"
+            f"✅ Percentual fixo salvo: <b>{value:.2f}%</b>"
+        )
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text=header, reply_markup=initial_stop_menu_keyboard(user), parse_mode='HTML')
+    except ValueError:
+        try: await update.message.delete()
+        except Exception: pass
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text="❌ Não entendi. Envie um número (ex.: 1.5).")
+        return ASKING_INITIAL_SL_FIXED
+    except Exception as e:
+        db.rollback(); logger.error(f"[settings] initial_sl_fixed_pct: {e}", exc_info=True)
+        try: await update.message.delete()
+        except Exception: pass
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text="Erro ao salvar. Tente novamente.")
+        return ASKING_INITIAL_SL_FIXED
+    finally:
+        db.close()
+    return ConversationHandler.END
+
+async def ask_risk_per_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data['settings_message_id'] = query.message.message_id
+    await query.edit_message_text("🛑 Envie o <b>risco por trade</b> em % do equity (ex.: 1)", parse_mode='HTML')
+    return ASKING_RISK_PER_TRADE
+
+async def receive_risk_per_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message_id_to_edit = context.user_data.get('settings_message_id')
+    text = (update.message.text or "").strip().replace('%', '').replace(',', '.')
+    db = SessionLocal()
+    try:
+        value = float(text)
+        if value <= 0 or value > 10:
+            try: await update.message.delete()
+            except Exception: pass
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text="❌ Valor inválido. Envie > 0 e <= 10 (ex.: 1).")
+            return ASKING_RISK_PER_TRADE
+        user = db.query(User).filter_by(telegram_id=update.effective_user.id).first()
+        if not user:
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text="Usuário não encontrado. Use /start para registrar.")
+            return ConversationHandler.END
+        user.risk_per_trade_pct = value; db.commit()
+        try: await update.message.delete()
+        except Exception: pass
+        header = (
+            "🛑 <b>Stop Inicial</b>\n<i>Defina o SL inicial: Fixo (%) ou Adaptativo (risco por trade).</i>\n\n"
+            f"✅ Risco por trade salvo: <b>{value:.2f}%</b>"
+        )
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text=header, reply_markup=initial_stop_menu_keyboard(user), parse_mode='HTML')
+    except ValueError:
+        try: await update.message.delete()
+        except Exception: pass
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text="❌ Não entendi. Envie um número (ex.: 1).")
+        return ASKING_RISK_PER_TRADE
+    except Exception as e:
+        db.rollback(); logger.error(f"[settings] risk_per_trade_pct: {e}", exc_info=True)
+        try: await update.message.delete()
+        except Exception: pass
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text="Erro ao salvar. Tente novamente.")
+        return ASKING_RISK_PER_TRADE
+    finally:
+        db.close()
+    return ConversationHandler.END
 
 # ---- STOP-GAIN ----
 async def receive_stop_gain_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):

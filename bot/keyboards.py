@@ -76,6 +76,10 @@ def settings_menu_keyboard(user) -> InlineKeyboardMarkup:
             InlineKeyboardButton("🛡️ Stop-Gain", callback_data="settings_stopgain"),
         ],
         [
+            InlineKeyboardButton("🛑 Stop Inicial", callback_data="settings_initial_stop"),
+            InlineKeyboardButton("🤖 Bot", callback_data="bot_config"),
+        ],
+        [
             InlineKeyboardButton("🚫 Disjuntor", callback_data="settings_circuit"),
             InlineKeyboardButton("✅ Whitelist", callback_data="set_coin_whitelist"),
         ],
@@ -84,6 +88,24 @@ def settings_menu_keyboard(user) -> InlineKeyboardMarkup:
             InlineKeyboardButton("🎯 Estratégia de TP", callback_data="show_tp_strategy"),
         ],
         [InlineKeyboardButton("⬅️ Voltar", callback_data="open_settings_root")],
+    ]
+    return InlineKeyboardMarkup(kb)
+
+def initial_stop_menu_keyboard(user) -> InlineKeyboardMarkup:
+    mode_raw = (getattr(user, 'initial_sl_mode', 'ADAPTIVE') or 'ADAPTIVE').upper()
+    if mode_raw == 'FIXED':
+        mode_text = "Modo: Fixo (%)"
+    elif mode_raw in ('FOLLOW', 'FOLLOW_SIGNAL', 'SIGNAL'):
+        mode_text = "Modo: Seguir SL do Sinal"
+    else:
+        mode_text = "Modo: Adaptativo"
+    fixed_pct = float(getattr(user, 'initial_sl_fixed_pct', 1.0) or 1.0)
+    risk_pct = float(getattr(user, 'risk_per_trade_pct', 1.0) or 1.0)
+    kb = [
+        [InlineKeyboardButton(mode_text, callback_data='toggle_initial_sl_mode')],
+        [InlineKeyboardButton(f"% Fixo: {fixed_pct:.2f}%", callback_data='ask_initial_sl_fixed')],
+        [InlineKeyboardButton(f"Risco por Trade: {risk_pct:.2f}%", callback_data='ask_risk_per_trade')],
+        [InlineKeyboardButton("⬅️ Voltar", callback_data='back_to_settings_menu')],
     ]
     return InlineKeyboardMarkup(kb)
 
@@ -168,8 +190,8 @@ def bot_config_keyboard(user_settings):
     pend_text = f"⏱️ Expirar Pendentes: {pend_exp} min" if pend_exp > 0 else "⏱️ Expirar Pendentes: Desativado"
 
     keyboard = [
-        [InlineKeyboardButton(approval_button_text, callback_data='toggle_approval_mode')],
         [InlineKeyboardButton(bot_toggle_text, callback_data='toggle_bot_status')],
+        [InlineKeyboardButton(approval_button_text, callback_data='toggle_approval_mode')],
         [InlineKeyboardButton(pend_text, callback_data='set_pending_expiry')],
         [InlineKeyboardButton(profit_text, callback_data='set_profit_target')],
         [InlineKeyboardButton(loss_text, callback_data='set_loss_limit')],

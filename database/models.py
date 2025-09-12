@@ -38,6 +38,10 @@ class User(Base):
     rsi_oversold_threshold = Column(Integer, default=30, nullable=False)
     rsi_overbought_threshold = Column(Integer, default=70, nullable=False)
     tp_distribution = Column(String, default='EQUAL', nullable=False)
+    # Stop Inicial: modo e parâmetros
+    initial_sl_mode = Column(String(20), default='ADAPTIVE', nullable=False)  # FIXED or ADAPTIVE
+    initial_sl_fixed_pct = Column(Float, default=1.0, nullable=False)         # % do preço de entrada
+    risk_per_trade_pct = Column(Float, default=1.0, nullable=False)           # % do equity por operação (para ADAPTIVE)
     # Ordens pendentes: expiração automática (minutos). 0 = desativado
     pending_expiry_minutes = Column(Integer, default=0, nullable=False)
     # Notificações: política de limpeza das mensagens de trades fechados
