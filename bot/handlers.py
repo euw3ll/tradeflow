@@ -1075,12 +1075,21 @@ async def my_positions_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         ).order_by(Trade.created_at.desc()).all()
 
         if not active_trades:
+            # Mesmo sem posições ativas, exibe as abas para permitir navegar até Pendentes
+            lines = [
+                "<b>📊 Suas Posições Ativas (Gerenciadas pelo Bot)</b>",
+                "",
+                "Nenhuma posição sendo gerenciada."
+            ]
+            keyboard_rows = [[
+                InlineKeyboardButton("Ativas", callback_data='user_positions'),
+                InlineKeyboardButton("Pendentes", callback_data='user_pending_positions')
+            ]]
+            keyboard_rows.append([InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data='back_to_main_menu')])
             await query.edit_message_text(
-                "<b>📊 Suas Posições Ativas</b>\n\nNenhuma posição sendo gerenciada.",
+                "\n".join(lines),
                 parse_mode='HTML',
-                reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data='back_to_main_menu')]]
-                )
+                reply_markup=InlineKeyboardMarkup(keyboard_rows)
             )
             return
 
