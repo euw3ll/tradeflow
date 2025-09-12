@@ -2526,9 +2526,35 @@ async def show_initial_stop_menu_handler(update: Update, context: ContextTypes.D
     query = update.callback_query
     await query.answer()
     user = get_user_by_id(update.effective_user.id)
+    # Mensagem mais informativa com detalhes do modo atual
+    mode = (getattr(user, 'initial_sl_mode', 'ADAPTIVE') or 'ADAPTIVE').upper()
+    entry_pct = float(getattr(user, 'entry_size_percent', 0) or 0)
+    lev = float(getattr(user, 'max_leverage', 0) or 0)
+    risk = float(getattr(user, 'risk_per_trade_pct', 1.0) or 1.0)
+    info = ""
+    if mode == 'FIXED':
+        info = "Usa um percentual fixo sobre o preço de entrada."
+    elif mode in ('FOLLOW', 'FOLLOW_SIGNAL', 'SIGNAL'):
+        info = "Segue o SL informado no sinal (apenas alinhado ao tick)."
+    else:
+        # ADAPTIVE
+        try:
+            max_sl = (risk / 100.0) / ((entry_pct / 100.0) * lev) * 100.0 if entry_pct > 0 and lev > 0 else None
+        except Exception:
+            max_sl = None
+        if max_sl is not None:
+            info = (
+                "Limita a distância do SL para respeitar o seu risco por trade (% do equity).\n"
+                f"Fórmula: sl% ≤ risco% / (entrada% × alavancagem) → ~{max_sl:.2f}% agora."
+            )
+        else:
+            info = (
+                "Limita a distância do SL para respeitar o seu risco por trade (% do equity).\n"
+                "Defina 'Tamanho de Entrada' e 'Alavancagem' para ver o limite estimado."
+            )
     header = (
-        "🛑 <b>Stop Inicial</b>\n"
-        "<i>Defina o SL inicial: Fixo (%) ou Adaptativo (risco por trade).</i>"
+        "🛑 <b>Stop Inicial</b>\n\n"
+        f"{info}"
     )
     await query.edit_message_text(text=header, parse_mode='HTML', reply_markup=initial_stop_menu_keyboard(user))
 
@@ -2551,9 +2577,33 @@ async def toggle_initial_sl_mode_handler(update: Update, context: ContextTypes.D
             nxt = 'ADAPTIVE'
         user.initial_sl_mode = nxt
         db.commit()
+        # Recalcula header com base no modo após alternar
+        mode = (getattr(user, 'initial_sl_mode', 'ADAPTIVE') or 'ADAPTIVE').upper()
+        entry_pct = float(getattr(user, 'entry_size_percent', 0) or 0)
+        lev = float(getattr(user, 'max_leverage', 0) or 0)
+        risk = float(getattr(user, 'risk_per_trade_pct', 1.0) or 1.0)
+        if mode == 'FIXED':
+            info = "Usa um percentual fixo sobre o preço de entrada."
+        elif mode in ('FOLLOW', 'FOLLOW_SIGNAL', 'SIGNAL'):
+            info = "Segue o SL informado no sinal (apenas alinhado ao tick)."
+        else:
+            try:
+                max_sl = (risk / 100.0) / ((entry_pct / 100.0) * lev) * 100.0 if entry_pct > 0 and lev > 0 else None
+            except Exception:
+                max_sl = None
+            if max_sl is not None:
+                info = (
+                    "Limita a distância do SL para respeitar o seu risco por trade (% do equity).\n"
+                    f"Fórmula: sl% ≤ risco% / (entrada% × alavancagem) → ~{max_sl:.2f}% agora."
+                )
+            else:
+                info = (
+                    "Limita a distância do SL para respeitar o seu risco por trade (% do equity).\n"
+                    "Defina 'Tamanho de Entrada' e 'Alavancagem' para ver o limite estimado."
+                )
         header = (
-            "🛑 <b>Stop Inicial</b>\n"
-            "<i>Defina o SL inicial: Fixo (%) ou Adaptativo (risco por trade).</i>"
+            "🛑 <b>Stop Inicial</b>\n\n"
+            f"{info}"
         )
         await query.edit_message_text(text=header, parse_mode='HTML', reply_markup=initial_stop_menu_keyboard(user))
     except Exception as e:

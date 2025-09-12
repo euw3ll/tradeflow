@@ -95,15 +95,29 @@ def initial_stop_menu_keyboard(user) -> InlineKeyboardMarkup:
     elif mode_raw in ('FOLLOW', 'FOLLOW_SIGNAL', 'SIGNAL'):
         mode_text = "Modo: Seguir SL do Sinal"
     else:
-        mode_text = "Modo: Adaptativo"
+        mode_text = "Modo: Adaptativo (Risco por Trade)"
     fixed_pct = float(getattr(user, 'initial_sl_fixed_pct', 1.0) or 1.0)
     risk_pct = float(getattr(user, 'risk_per_trade_pct', 1.0) or 1.0)
-    kb = [
-        [InlineKeyboardButton(mode_text, callback_data='toggle_initial_sl_mode')],
-        [InlineKeyboardButton(f"% Fixo: {fixed_pct:.2f}%", callback_data='ask_initial_sl_fixed')],
-        [InlineKeyboardButton(f"Risco por Trade: {risk_pct:.2f}%", callback_data='ask_risk_per_trade')],
-        [InlineKeyboardButton("⬅️ Voltar", callback_data='back_to_settings_menu')],
-    ]
+
+    try:
+        entry_pct = float(getattr(user, 'entry_size_percent', 0) or 0) / 100.0
+        lev = float(getattr(user, 'max_leverage', 0) or 0)
+        max_sl_pct = (risk_pct / 100.0) / (entry_pct * lev) * 100.0 if entry_pct > 0 and lev > 0 else None
+    except Exception:
+        max_sl_pct = None
+
+    kb = []
+    kb.append([InlineKeyboardButton(mode_text, callback_data='toggle_initial_sl_mode')])
+    if mode_raw == 'FIXED':
+        kb.append([InlineKeyboardButton(f"% Fixo: {fixed_pct:.2f}%", callback_data='ask_initial_sl_fixed')])
+    elif mode_raw not in ('FOLLOW', 'FOLLOW_SIGNAL', 'SIGNAL'):
+        # ADAPTIVE
+        if max_sl_pct is not None and max_sl_pct > 0:
+            label = f"Risco por Trade: {risk_pct:.2f}% (SL máx ~ {max_sl_pct:.2f}%)"
+        else:
+            label = f"Risco por Trade: {risk_pct:.2f}% (SL máx ~ —)"
+        kb.append([InlineKeyboardButton(label, callback_data='ask_risk_per_trade')])
+    kb.append([InlineKeyboardButton("⬅️ Voltar", callback_data='back_to_settings_menu')])
     return InlineKeyboardMarkup(kb)
 
 
@@ -134,14 +148,14 @@ def stopgain_menu_keyboard(user) -> InlineKeyboardMarkup:
     ts_trig = f"{float(getattr(user, 'ts_trigger_pct', 0) or 0):.2f}%"
     strategy_label = _read_stop_strategy_label(user)
 
-    kb = [
-        [InlineKeyboardButton(f"🧭 Estratégia: {strategy_label}", callback_data="set_stop_strategy")],
-        [InlineKeyboardButton(f"🎯 Gatilho BE por PnL ({be_trig})", callback_data="set_be_trigger")],
-        [InlineKeyboardButton(f"📈 Gatilho TS por PnL ({ts_trig})", callback_data="set_ts_trigger")],
-        [InlineKeyboardButton(f"🚀 Gatilho Stop-Gain ({trigger})", callback_data="set_stop_gain_trigger")],
-        [InlineKeyboardButton(f"🔒 Trava Stop-Gain ({lock})", callback_data="set_stop_gain_lock")],
-        [InlineKeyboardButton("⬅️ Voltar", callback_data="back_to_settings_menu")],
-    ]
+    kb = [[InlineKeyboardButton(f"🧭 Estratégia: {strategy_label}", callback_data="set_stop_strategy")]]
+    if strategy_label == 'Breakeven':
+        kb.append([InlineKeyboardButton(f"🎯 Gatilho BE por PnL ({be_trig})", callback_data="set_be_trigger")])
+    else:
+        kb.append([InlineKeyboardButton(f"📈 Gatilho TS por PnL ({ts_trig})", callback_data="set_ts_trigger")])
+    kb.append([InlineKeyboardButton(f"🚀 Gatilho Stop-Gain ({trigger})", callback_data="set_stop_gain_trigger")])
+    kb.append([InlineKeyboardButton(f"🔒 Trava Stop-Gain ({lock})", callback_data="set_stop_gain_lock")])
+    kb.append([InlineKeyboardButton("⬅️ Voltar", callback_data="back_to_settings_menu")])
     return InlineKeyboardMarkup(kb)
 
 def circuit_menu_keyboard(user) -> InlineKeyboardMarkup:
@@ -248,21 +262,22 @@ def signal_filters_keyboard(user_settings):
     rsi_status_icon = "✅" if user_settings.is_rsi_filter_enabled else "❌"
     rsi_text = f"{rsi_status_icon} Filtro de RSI"
     
-    keyboard = [
-        [InlineKeyboardButton("Voltar para Configurações ⬅️", callback_data='user_settings')],
-        [
-            InlineKeyboardButton(ma_text, callback_data='toggle_ma_filter'),
-            InlineKeyboardButton(f"Período MA: {user_settings.ma_period}", callback_data='set_ma_period')
-        ],
-        [
-            InlineKeyboardButton(rsi_text, callback_data='toggle_rsi_filter'),
-            InlineKeyboardButton(f"Sobrecompra: {user_settings.rsi_overbought_threshold}", callback_data='set_rsi_overbought')
-        ],
-        [
-            InlineKeyboardButton(f"Timeframe: {user_settings.ma_timeframe} min", callback_data='ask_ma_timeframe'),
-            InlineKeyboardButton(f"Sobrevenda: {user_settings.rsi_oversold_threshold}", callback_data='set_rsi_oversold')
-        ],
-    ]
+    keyboard: list[list[InlineKeyboardButton]] = []
+    keyboard.append([InlineKeyboardButton("Voltar para Configurações ⬅️", callback_data='user_settings')])
+
+    # Toggle MA e parâmetros somente quando habilitado
+    keyboard.append([InlineKeyboardButton(ma_text, callback_data='toggle_ma_filter')])
+    if user_settings.is_ma_filter_enabled:
+        keyboard.append([InlineKeyboardButton(f"Período MA: {user_settings.ma_period}", callback_data='set_ma_period')])
+
+    # Toggle RSI e parâmetros somente quando habilitado
+    keyboard.append([InlineKeyboardButton(rsi_text, callback_data='toggle_rsi_filter')])
+    if user_settings.is_rsi_filter_enabled:
+        keyboard.append([InlineKeyboardButton(f"Sobrecompra: {user_settings.rsi_overbought_threshold}", callback_data='set_rsi_overbought')])
+        keyboard.append([InlineKeyboardButton(f"Sobrevenda: {user_settings.rsi_oversold_threshold}", callback_data='set_rsi_oversold')])
+
+    # Timeframe útil para ambos – mantém acessível
+    keyboard.append([InlineKeyboardButton(f"Timeframe: {user_settings.ma_timeframe} min", callback_data='ask_ma_timeframe')])
     return InlineKeyboardMarkup(keyboard)
 
 def ma_timeframe_keyboard(user_settings):
