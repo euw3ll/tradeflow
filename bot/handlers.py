@@ -374,7 +374,19 @@ async def open_information_handler(update: Update, context: ContextTypes.DEFAULT
         if getattr(user, 'is_rsi_filter_enabled', False): filters.append("RSI")
         filters_text = ", ".join(filters) if filters else "Nenhum"
         whitelist = getattr(user, 'coin_whitelist', '') or 'todas'
-        tp_distribution = getattr(user, 'tp_distribution', 'EQUAL')
+        tp_token = (getattr(user, 'tp_distribution', 'EQUAL') or 'EQUAL').upper()
+        if tp_token == 'EQUAL':
+            tp_distribution = 'Divisão Igual'
+        elif tp_token == 'FRONT_HEAVY':
+            tp_distribution = 'Mais cedo (frente)'
+        elif tp_token == 'BACK_HEAVY':
+            tp_distribution = 'Mais tarde (traseira)'
+        elif tp_token == 'EXP_FRONT':
+            tp_distribution = 'Exponencial cedo'
+        elif ',' in (getattr(user, 'tp_distribution', '') or ''):
+            tp_distribution = 'Personalizada'
+        else:
+            tp_distribution = tp_token
         be_trg = float(getattr(user, 'be_trigger_pct', 0) or 0)
         ts_trg = float(getattr(user, 'ts_trigger_pct', 0) or 0)
         ma_period = int(getattr(user, 'ma_period', 0) or 0)
@@ -386,6 +398,17 @@ async def open_information_handler(update: Update, context: ContextTypes.DEFAULT
         circuit_th = int(getattr(user, 'circuit_breaker_threshold', 0) or 0)
         circuit_pause = int(getattr(user, 'circuit_breaker_pause_minutes', 0) or 0)
         bybit_link = "Conectado" if getattr(user, 'api_key_encrypted', None) else "Não conectado"
+        # Stop Inicial
+        sl_mode = (getattr(user, 'initial_sl_mode', 'ADAPTIVE') or 'ADAPTIVE').upper()
+        if sl_mode == 'FIXED':
+            sl_text = f"Fixo ({float(getattr(user, 'initial_sl_fixed_pct', 1.0) or 1.0):.2f}%)"
+        elif sl_mode in ('FOLLOW', 'FOLLOW_SIGNAL', 'SIGNAL'):
+            sl_text = "Seguir SL do Sinal"
+        else:
+            sl_text = f"Adaptativo (risco {float(getattr(user, 'risk_per_trade_pct', 1.0) or 1.0):.2f}% por trade)"
+        # Expiração de Pendentes
+        pend_exp = int(getattr(user, 'pending_expiry_minutes', 0) or 0)
+        pend_text = f"{pend_exp} min" if pend_exp > 0 else "Desativado"
 
         status_lines += [
             f"• Bot: <b>{bot_state}{sleep}</b>",
@@ -395,6 +418,8 @@ async def open_information_handler(update: Update, context: ContextTypes.DEFAULT
             f"• Stop‑Gain: <b>{stopgain}</b>",
             f"• Gatilhos BE/TS: <b>{be_trg:.2f}% / {ts_trg:.2f}%</b>",
             f"• TP: <b>{tp_distribution}</b>",
+            f"• Stop Inicial: <b>{sl_text}</b>",
+            f"• Pendentes: expirar <b>{pend_text}</b>",
             f"• Metas do dia: lucro <b>${daily_p:,.2f}</b> / perda <b>${daily_l:,.2f}</b>",
             f"• Filtros: <b>{filters_text}</b> (MA {ma_period}/{ma_timeframe}, RSI {rsi_oversold}/{rsi_overbought})",
             f"• Whitelist: <code>{whitelist}</code>",
@@ -877,6 +902,25 @@ def _compute_recommendations(equity: float) -> dict:
 async def show_onboarding_risk_options(update: Update, context: ContextTypes.DEFAULT_TYPE, equity: float):
     chat_id = update.effective_user.id
     recs = _compute_recommendations(equity)
+    # Lê algumas configs atuais do usuário para exibir
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.telegram_id == chat_id).first()
+    finally:
+        db.close()
+    if user is not None:
+        sl_mode = (getattr(user, 'initial_sl_mode', 'ADAPTIVE') or 'ADAPTIVE').upper()
+        if sl_mode == 'FIXED':
+            sl_text = f"Fixo ({float(getattr(user, 'initial_sl_fixed_pct', 1.0) or 1.0):.2f}%)"
+        elif sl_mode in ('FOLLOW', 'FOLLOW_SIGNAL', 'SIGNAL'):
+            sl_text = "Seguir SL do Sinal"
+        else:
+            sl_text = f"Adaptativo (risco {float(getattr(user, 'risk_per_trade_pct', 1.0) or 1.0):.2f}% por trade)"
+        pend_exp = int(getattr(user, 'pending_expiry_minutes', 0) or 0)
+        pend_text = f"{pend_exp} min" if pend_exp > 0 else "Desativado"
+    else:
+        sl_text = "Adaptativo (risco 1.00% por trade)"
+        pend_text = "Desativado"
     def line(name, r):
         approx_entry = equity * (r["entry_size_percent"]/100.0)
         return (
@@ -893,6 +937,8 @@ async def show_onboarding_risk_options(update: Update, context: ContextTypes.DEF
         f"{line('🟢 Conservador', recs['conservative'])}\n"
         f"{line('🟠 Mediano', recs['moderate'])}\n"
         f"{line('🔴 Agressivo', recs['aggressive'])}\n"
+        f"• Stop Inicial: <b>{sl_text}</b>\n"
+        f"• Pendentes: expirar <b>{pend_text}</b>\n\n"
         "Você pode alterar tudo depois em Configurações.\n\n"
         "Ou escolha <b>Configuração Manual</b> para ajustar do zero."
     )
