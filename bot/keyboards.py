@@ -75,10 +75,7 @@ def settings_menu_keyboard(user) -> InlineKeyboardMarkup:
             InlineKeyboardButton("🧮 Risco & Tamanho", callback_data="settings_risk"),
             InlineKeyboardButton("🛡️ Stop-Gain", callback_data="settings_stopgain"),
         ],
-        [
-            InlineKeyboardButton("🛑 Stop Inicial", callback_data="settings_initial_stop"),
-            InlineKeyboardButton("🤖 Bot", callback_data="bot_config"),
-        ],
+        [InlineKeyboardButton("🛑 Stop Inicial", callback_data="settings_initial_stop")],
         [
             InlineKeyboardButton("🚫 Disjuntor", callback_data="settings_circuit"),
             InlineKeyboardButton("✅ Whitelist", callback_data="set_coin_whitelist"),
