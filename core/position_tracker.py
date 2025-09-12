@@ -28,44 +28,62 @@ logger = logging.getLogger(__name__)
 _SYNC_CACHE = {}
 
 def _compute_tp_distribution(strategy: str, total_tps: int) -> list[float]:
-    """Gera uma distribuição de porcentagens (soma ~100) para N TPs.
-    - 'EQUAL' => divide igualmente.
-    - Lista (ex.: "50,30,20"): usa como âncoras e extrapola cauda em ordem decrescente,
-      normalizando para 100% mesmo quando houver mais TPs que âncoras.
+    """Gera uma distribuição de percentuais (soma 100) para N TPs.
+    Suporta:
+      - 'EQUAL'          → igualitária
+      - 'FRONT_HEAVY'    → mais pesado nos primeiros TPs (decay exponencial leve)
+      - 'BACK_HEAVY'     → mais pesado nos últimos TPs (crescente linear)
+      - 'EXP_FRONT'      → mais pesado cedo (decay exponencial forte)
+      - Lista 'a,b,c,...'→ âncoras personalizadas (interpretação original)
     """
     if total_tps <= 0:
         return []
-    # Equal simples
-    if not strategy or str(strategy).strip().upper() == 'EQUAL':
+
+    sraw = (strategy or '').strip()
+    token = sraw.upper()
+
+    # Igualitária
+    if token == 'EQUAL' or token == '':
         return [100.0 / total_tps] * total_tps
 
-    # Parseia lista de âncoras
+    # Presets
+    if ',' not in sraw:
+        if token == 'FRONT_HEAVY':
+            r = 0.75  # decay moderado
+            weights = [r ** i for i in range(total_tps)]
+            s = sum(weights) or 1.0
+            return [w * (100.0 / s) for w in weights]
+        if token == 'EXP_FRONT':
+            r = 0.6  # decay mais agressivo (primeiros TPs mais pesados)
+            weights = [r ** i for i in range(total_tps)]
+            s = sum(weights) or 1.0
+            return [w * (100.0 / s) for w in weights]
+        if token == 'BACK_HEAVY':
+            # Crescente linear: 1,2,3,...,N (últimos TPs mais pesados)
+            weights = [i + 1 for i in range(total_tps)]
+            s = sum(weights) or 1.0
+            return [w * (100.0 / s) for w in weights]
+
+    # Custom anchors "50,30,20" (compatível com comportamento anterior)
     try:
-        anchors = [max(0.0, float(x)) for x in str(strategy).replace('%', '').split(',') if x.strip()]
+        anchors = [max(0.0, float(x)) for x in sraw.replace('%', '').split(',') if x.strip()]
     except Exception:
         return [100.0 / total_tps] * total_tps
     if not anchors:
         return [100.0 / total_tps] * total_tps
 
-    # Garante monotonicidade decrescente nas âncoras
-    for i in range(1, len(anchors)):
-        if anchors[i] > anchors[i-1]:
-            anchors[i] = anchors[i-1]
-
-    # Define fator de decaimento da cauda baseado nas duas últimas âncoras se possível, senão 0.66
+    # Normaliza âncoras (permite perfil arbitrário; mantém ordem e decai a cauda por estabilidade)
     if len(anchors) >= 2 and anchors[-2] > 0:
-        decay = min(0.95, max(0.3, anchors[-1] / anchors[-2]))  # clamp para estabilidade
+        decay = min(0.95, max(0.3, anchors[-1] / anchors[-2]))
     else:
         decay = 0.66
 
-    # Constrói sequência base (monótona decrescente)
     base = []
     for i in range(total_tps):
         if i < len(anchors):
             base.append(anchors[i])
         else:
             nxt = base[-1] * decay if base else 1.0
-            # Evita estagnar muito perto de zero com muitos TPs
             if nxt < 1e-6:
                 nxt = 1e-6
             base.append(nxt)
@@ -73,16 +91,10 @@ def _compute_tp_distribution(strategy: str, total_tps: int) -> list[float]:
     s = sum(base)
     if s <= 0:
         return [100.0 / total_tps] * total_tps
-    # Normaliza para 100 e preserva ordem
     dist = [x * (100.0 / s) for x in base]
-    # Pequena correção para somar exatamente 100: ajusta o último
     total = sum(dist)
     if total != 100.0:
         dist[-1] += (100.0 - total)
-    # Garante não-crescente por segurança
-    for i in range(1, len(dist)):
-        if dist[i] > dist[i-1]:
-            dist[i] = dist[i-1]
     return dist
 
 def _generate_trade_status_message(trade: Trade, status_title: str, pnl_data: dict = None, current_price: float = None) -> str:

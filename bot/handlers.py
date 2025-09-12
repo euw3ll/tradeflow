@@ -21,6 +21,7 @@ from .keyboards import (
     onboarding_risk_keyboard, onboarding_terms_keyboard,
     settings_root_keyboard, notifications_menu_keyboard, info_menu_keyboard,
     initial_stop_menu_keyboard,
+    tp_presets_keyboard,
 )
 from utils.security import encrypt_data, decrypt_data
 from services.bybit_service import (
@@ -1972,6 +1973,39 @@ async def receive_profit_target(update: Update, context: ContextTypes.DEFAULT_TY
         return ASKING_PROFIT_TARGET
 
     return ConversationHandler.END
+
+# --- TP Strategy: presets ---
+async def show_tp_presets_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        text=(
+            "🎯 <b>Estratégias de Take Profit</b>\n\n"
+            "Escolha um preset ou personalize sua distribuição."
+        ),
+        parse_mode='HTML',
+        reply_markup=tp_presets_keyboard()
+    )
+
+async def set_tp_preset_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    token = query.data.split('set_tp_preset_')[-1]
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.telegram_id == query.from_user.id).first()
+        if not user:
+            await query.edit_message_text("Usuário não encontrado. Use /start.")
+            return
+        allowed = {"EQUAL", "FRONT_HEAVY", "BACK_HEAVY", "EXP_FRONT"}
+        if token not in allowed:
+            await query.edit_message_text("Preset inválido.")
+            return
+        user.tp_distribution = token
+        db.commit()
+        await show_tp_strategy_menu_handler(update, context)
+    finally:
+        db.close()
 
 async def ask_loss_limit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Pergunta ao usuário o novo limite de perda diário."""

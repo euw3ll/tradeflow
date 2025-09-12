@@ -301,16 +301,36 @@ def ma_timeframe_keyboard(user_settings):
 
 def tp_strategy_menu_keyboard(user) -> InlineKeyboardMarkup:
     """Retorna o teclado para o menu de estratégia de Take Profit."""
-    current_strategy = getattr(user, 'tp_distribution', 'EQUAL')
-    if current_strategy == 'EQUAL':
+    current_strategy = (getattr(user, 'tp_distribution', 'EQUAL') or 'EQUAL')
+    token = current_strategy.upper()
+    if token == 'EQUAL':
         strategy_text = "Divisão Igual"
+    elif token == 'FRONT_HEAVY':
+        strategy_text = "Mais cedo (frente)"
+    elif token == 'BACK_HEAVY':
+        strategy_text = "Mais tarde (traseira)"
+    elif token == 'EXP_FRONT':
+        strategy_text = "Exponencial cedo"
+    elif ',' in current_strategy:
+        strategy_text = "Personalizada"
     else:
-        strategy_text = f"Personalizado ({current_strategy}%)"
+        strategy_text = current_strategy
 
     kb = [
-        [InlineKeyboardButton(f"Estratégia Atual: {strategy_text}", callback_data="noop")], # Botão apenas visual
-        [InlineKeyboardButton("✏️ Alterar Estratégia", callback_data="ask_tp_distribution")],
+        [InlineKeyboardButton(f"Estratégia Atual: {strategy_text}", callback_data="noop")],
+        [InlineKeyboardButton("📋 Escolher Preset", callback_data="show_tp_presets")],
+        [InlineKeyboardButton("✏️ Personalizar (lista)", callback_data="ask_tp_distribution")],
         [InlineKeyboardButton("⬅️ Voltar para Configurações", callback_data="back_to_settings_menu")],
+    ]
+    return InlineKeyboardMarkup(kb)
+
+def tp_presets_keyboard() -> InlineKeyboardMarkup:
+    kb = [
+        [InlineKeyboardButton("Divisão Igual", callback_data="set_tp_preset_EQUAL")],
+        [InlineKeyboardButton("Mais cedo (frente)", callback_data="set_tp_preset_FRONT_HEAVY")],
+        [InlineKeyboardButton("Mais tarde (traseira)", callback_data="set_tp_preset_BACK_HEAVY")],
+        [InlineKeyboardButton("Exponencial cedo", callback_data="set_tp_preset_EXP_FRONT")],
+        [InlineKeyboardButton("⬅️ Voltar", callback_data="show_tp_strategy")],
     ]
     return InlineKeyboardMarkup(kb)
 
