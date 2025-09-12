@@ -263,7 +263,6 @@ def signal_filters_keyboard(user_settings):
     rsi_text = f"{rsi_status_icon} Filtro de RSI"
     
     keyboard: list[list[InlineKeyboardButton]] = []
-    keyboard.append([InlineKeyboardButton("Voltar para Configurações ⬅️", callback_data='user_settings')])
 
     # Toggle MA e parâmetros somente quando habilitado
     keyboard.append([InlineKeyboardButton(ma_text, callback_data='toggle_ma_filter')])
@@ -278,6 +277,8 @@ def signal_filters_keyboard(user_settings):
 
     # Timeframe útil para ambos – mantém acessível
     keyboard.append([InlineKeyboardButton(f"Timeframe: {user_settings.ma_timeframe} min", callback_data='ask_ma_timeframe')])
+    # Voltar sempre por último
+    keyboard.append([InlineKeyboardButton("Voltar para Configurações ⬅️", callback_data='user_settings')])
     return InlineKeyboardMarkup(keyboard)
 
 def ma_timeframe_keyboard(user_settings):
