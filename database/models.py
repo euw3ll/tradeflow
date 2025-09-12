@@ -38,6 +38,8 @@ class User(Base):
     rsi_oversold_threshold = Column(Integer, default=30, nullable=False)
     rsi_overbought_threshold = Column(Integer, default=70, nullable=False)
     tp_distribution = Column(String, default='EQUAL', nullable=False)
+    # Ordens pendentes: expiração automática (minutos). 0 = desativado
+    pending_expiry_minutes = Column(Integer, default=0, nullable=False)
     # Notificações: política de limpeza das mensagens de trades fechados
     msg_cleanup_mode = Column(String(20), default='OFF', nullable=False)  # OFF | AFTER | EOD
     msg_cleanup_delay_minutes = Column(Integer, default=30, nullable=False)

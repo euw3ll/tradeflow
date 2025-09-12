@@ -38,21 +38,8 @@ def invite_info_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 def dashboard_menu_keyboard(user):
-    """Retorna o teclado para o painel do usuário, com a opção de remover a API e ligar/desligar o bot."""
-    
-    # Lógica do botão único de 3 estados
-    if not user.is_active:
-        # Estado 1: Pausado
-        toggle_button_text = "Bot: Pausado ⏸️"
-    elif user.is_active and not user.is_sleep_mode_enabled:
-        # Estado 2: Ativo 24h
-        toggle_button_text = "Bot: Ativo ☀️"
-    else: # user.is_active and user.is_sleep_mode_enabled
-        # Estado 3: Ativo com Modo Dormir
-        toggle_button_text = "Bot: Ativo com Modo Dormir 😴"
-    
+    """Retorna o teclado para o painel do usuário (sem o toggle do bot)."""
     keyboard = [
-        [InlineKeyboardButton(toggle_button_text, callback_data='toggle_bot_status')],
         [InlineKeyboardButton("🗑️ Remover API", callback_data='remove_api_prompt')],
         [InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data='back_to_main_menu')]
     ]
@@ -168,9 +155,22 @@ def bot_config_keyboard(user_settings):
     loss_limit = user_settings.daily_loss_limit
     loss_text = f"Limite de Perda Diário: ${loss_limit:.2f}" if loss_limit > 0 else "Limite de Perda Diário: Desativado"
 
+    # Status do bot (3 estados)
+    if not user_settings.is_active:
+        bot_toggle_text = "Bot: Pausado ⏸️"
+    elif user_settings.is_active and not user_settings.is_sleep_mode_enabled:
+        bot_toggle_text = "Bot: Ativo ☀️"
+    else:
+        bot_toggle_text = "Bot: Ativo com Modo Dormir 😴"
+
+    # Expiração de pendentes
+    pend_exp = int(getattr(user_settings, 'pending_expiry_minutes', 0) or 0)
+    pend_text = f"⏱️ Expirar Pendentes: {pend_exp} min" if pend_exp > 0 else "⏱️ Expirar Pendentes: Desativado"
+
     keyboard = [
         [InlineKeyboardButton(approval_button_text, callback_data='toggle_approval_mode')],
-        # --- NOVAS LINHAS ADICIONADAS AO TECLADO ---
+        [InlineKeyboardButton(bot_toggle_text, callback_data='toggle_bot_status')],
+        [InlineKeyboardButton(pend_text, callback_data='set_pending_expiry')],
         [InlineKeyboardButton(profit_text, callback_data='set_profit_target')],
         [InlineKeyboardButton(loss_text, callback_data='set_loss_limit')],
         [InlineKeyboardButton("⬅️ Voltar", callback_data='open_settings_root')]

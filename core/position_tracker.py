@@ -213,10 +213,17 @@ async def check_pending_orders_for_user(application: Application, user: User, db
             continue
 
         # Expiração opcional de pendentes por tempo
+        # Expiração específica do usuário (config), fallback para env var
+        expiry_min = 0
         try:
-            expiry_min = int(os.getenv("TF_PENDING_EXPIRY_MINUTES", "0") or "0")
+            expiry_min = int(getattr(user, 'pending_expiry_minutes', 0) or 0)
         except Exception:
             expiry_min = 0
+        if expiry_min <= 0:
+            try:
+                expiry_min = int(os.getenv("TF_PENDING_EXPIRY_MINUTES", "0") or "0")
+            except Exception:
+                expiry_min = 0
         if expiry_min > 0 and status_upper not in ("FILLED",):
             created_ms = order_data.get("createdTime") or order_data.get("createTime") or order_data.get("createdAt") or order_data.get("createdAtTs")
             try:

@@ -48,6 +48,7 @@ ASKING_BE_TRIGGER = 26
 ASKING_TS_TRIGGER = 27
 ASKING_CLEANUP_MINUTES = 28
 ASKING_ALERT_CLEANUP_MINUTES = 29
+ASKING_PENDING_EXPIRY_MINUTES = 30
 
 logger = logging.getLogger(__name__)
 
@@ -2027,6 +2028,53 @@ async def receive_loss_limit(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 # --- MENU DE DESEMPENHO ---
 
+async def receive_pending_expiry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Recebe e salva o tempo de expiração de ordens pendentes (minutos)."""
+    user_id = update.effective_user.id
+    message_id_to_edit = context.user_data.get('settings_message_id')
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+    try:
+        raw = (update.message.text or '').strip().replace(',', '.')
+        minutes = int(float(raw))
+        if minutes < 0:
+            raise ValueError("negativo")
+
+        db = SessionLocal()
+        try:
+            user = db.query(User).filter_by(telegram_id=user_id).first()
+            if not user:
+                raise ValueError("user not found")
+            user.pending_expiry_minutes = minutes
+            db.commit()
+
+            feedback = (
+                f"✅ Expiração de pendentes definida para <b>{minutes} min</b>."
+                if minutes > 0 else
+                "✅ Expiração de pendentes <b>desativada</b>."
+            )
+            await context.bot.edit_message_text(
+                chat_id=update.effective_chat.id,
+                message_id=message_id_to_edit,
+                text=f"{feedback}\n\nAjuste outra configuração ou volte.",
+                parse_mode='HTML',
+                reply_markup=bot_config_keyboard(user)
+            )
+        finally:
+            db.close()
+    except Exception:
+        await context.bot.edit_message_text(
+            chat_id=update.effective_chat.id,
+            message_id=message_id_to_edit,
+            text="❌ Valor inválido. Envie um inteiro >= 0 (ex.: 0, 60, 120)."
+        )
+        return ASKING_PENDING_EXPIRY_MINUTES
+
+    return ConversationHandler.END
+
 async def performance_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Exibe o painel de desempenho e lida com a seleção de período, usando o fuso horário de SP."""
     query = update.callback_query
@@ -2388,8 +2436,15 @@ async def toggle_bot_status_handler(update: Update, context: ContextTypes.DEFAUL
         db.commit()
         await query.answer(alert_message, show_alert=True)
 
-        # Atualiza o teclado do painel para refletir o novo estado
-        await query.edit_message_reply_markup(reply_markup=dashboard_menu_keyboard(user))
+        # Re-renderiza a tela de Configuração do Bot (toggle foi movido para lá)
+        try:
+            await query.edit_message_text(
+                text="<b>🤖 Configuração do Bot</b>\n\nAjuste o comportamento geral do bot.",
+                parse_mode='HTML',
+                reply_markup=bot_config_keyboard(user)
+            )
+        except BadRequest as e:
+            logger.warning(f"Falha ao atualizar menu do bot após toggle: {e}")
 
     finally:
         db.close()
@@ -2435,6 +2490,19 @@ async def ask_ts_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     await query.edit_message_text("📈 Envie o <b>gatilho opcional</b> do Trailing Stop por PnL em % (ex.: 3). Use 0 para desativar.", parse_mode="HTML")
     return ASKING_TS_TRIGGER
+
+async def ask_pending_expiry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Pergunta o tempo (em minutos) para expirar ordens pendentes."""
+    query = update.callback_query
+    await query.answer()
+    context.user_data['settings_message_id'] = query.message.message_id
+    await query.edit_message_text(
+        "Envie o <b>tempo em minutos</b> para expirar ordens <i>pendentes</i>.\n\n"
+        "- Envie <code>0</code> para desativar.\n"
+        "- Ex.: <code>120</code> para 2 horas.",
+        parse_mode='HTML'
+    )
+    return ASKING_PENDING_EXPIRY_MINUTES
 
 async def ask_circuit_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query

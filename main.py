@@ -26,6 +26,7 @@ from bot.handlers import (
     bot_config_handler, toggle_approval_mode_handler, handle_signal_approval, 
     ask_profit_target, receive_profit_target, ASKING_PROFIT_TARGET,
     ask_loss_limit, receive_loss_limit, ASKING_LOSS_LIMIT, 
+    ask_pending_expiry, receive_pending_expiry, ASKING_PENDING_EXPIRY_MINUTES,
     ask_coin_whitelist, receive_coin_whitelist, ASKING_COIN_WHITELIST,
     performance_menu_handler, list_closed_trades_handler,
     prompt_manual_close_handler, execute_manual_close_handler,
@@ -307,6 +308,14 @@ async def main():
     application.add_handler(stop_gain_lock_conv)
     application.add_handler(circuit_threshold_conv)
     application.add_handler(circuit_pause_conv)
+
+    # Expiração de pendentes
+    pending_expiry_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(ask_pending_expiry, pattern='^set_pending_expiry$')],
+        states={ ASKING_PENDING_EXPIRY_MINUTES: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_pending_expiry)] },
+        fallbacks=[CommandHandler("cancel", cancel)], per_message=False, per_user=True,
+    )
+    application.add_handler(pending_expiry_conv)
 
     application.add_handler(CallbackQueryHandler(signal_filters_menu_handler, pattern='^signal_filters_menu$'))
     application.add_handler(CallbackQueryHandler(toggle_ma_filter_handler, pattern='^toggle_ma_filter$'))
