@@ -27,6 +27,10 @@ class User(Base):
     ts_trigger_pct = Column(Float, default=0.0, nullable=False)
     circuit_breaker_threshold = Column(Integer, default=0, nullable=False)
     circuit_breaker_pause_minutes = Column(Integer, default=60, nullable=False)
+    circuit_breaker_scope = Column(String(10), default='SIDE', nullable=False)  # SIDE | GLOBAL | SYMBOL
+    reversal_override_enabled = Column(Boolean, default=False, nullable=False)
+    probe_size_factor = Column(Float, default=0.5, nullable=False)
+    backoff_escalation = Column(Boolean, default=False, nullable=False)
     long_trades_paused_until = Column(DateTime(timezone=True), nullable=True)
     short_trades_paused_until = Column(DateTime(timezone=True), nullable=True)
     is_sleep_mode_enabled = Column(Boolean, default=False, nullable=False)

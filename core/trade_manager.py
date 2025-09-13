@@ -25,6 +25,56 @@ from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
+# --- Disjuntor: estado em memória por símbolo (escopo SYMBOL) ---
+_SYMBOL_BREAKER: dict[int, dict[str, datetime]] = {}
+
+def _is_symbol_paused(user_id: int, symbol: str) -> bool:
+    d = _SYMBOL_BREAKER.get(user_id) or {}
+    until = d.get(symbol)
+    if not until:
+        return False
+    now = datetime.now(pytz.utc)
+    return now < until
+
+def _pause_symbol(user_id: int, symbol: str, minutes: int) -> None:
+    d = _SYMBOL_BREAKER.setdefault(user_id, {})
+    d[symbol] = datetime.now(pytz.utc) + timedelta(minutes=minutes)
+
+async def _reversal_confirmed(symbol: str, side: str, user: User) -> bool:
+    """Confirma reversão simples via MA/RSI (último candle):
+    - LONG: close > SMA e RSI abaixo de sobrecompra (se disponível)
+    - SHORT: close < SMA e RSI acima de sobrevenda (se disponível)
+    """
+    try:
+        tf = str(getattr(user, 'ma_timeframe', '60') or '60')
+        period = int(getattr(user, 'ma_period', 50) or 50)
+        ob = int(getattr(user, 'rsi_overbought_threshold', 70) or 70)
+        os_ = int(getattr(user, 'rsi_oversold_threshold', 30) or 30)
+
+        kl = await get_historical_klines(symbol=symbol, interval=tf, limit=200)
+        if not kl.get('success'):
+            return False
+        df = pd.DataFrame(kl['data'], columns=['startTime','open','high','low','close','volume','turnover'])
+        df['close'] = pd.to_numeric(df['close'], errors='coerce')
+        df = df.sort_values('startTime').reset_index(drop=True)
+        df.ta.sma(length=period, append=True)
+        df.ta.rsi(append=True)
+        sma_col = f'SMA_{period}'
+        rsi_col = 'RSI_14'
+        idx = df[sma_col].last_valid_index()
+        if idx is None:
+            return False
+        close = float(df.loc[idx, 'close'])
+        sma = float(df.loc[idx, sma_col])
+        rsi = float(df.loc[idx, rsi_col]) if rsi_col in df.columns and pd.notna(df.loc[idx, rsi_col]) else None
+        if side == 'LONG':
+            return (close > sma) and (rsi is None or rsi < ob)
+        else:
+            return (close < sma) and (rsi is None or rsi > os_)
+    except Exception:
+        logger.exception('[breaker] falha em _reversal_confirmed')
+        return False
+
 
 async def _avaliar_sinal(signal_data: dict, user_settings: User) -> Tuple[bool, str]:
     """
@@ -308,43 +358,80 @@ async def process_new_signal(signal_data: dict, application: Application, source
                 if short_paused is not None and getattr(short_paused, 'tzinfo', None) is None:
                     short_paused = short_paused.replace(tzinfo=pytz.utc)
 
-                if signal_side == 'LONG' and long_paused and now_utc < long_paused:
-                    is_paused = True
-                elif signal_side == 'SHORT' and short_paused and now_utc < short_paused:
-                    is_paused = True
+                scope = (getattr(user, 'circuit_breaker_scope', 'SIDE') or 'SIDE').upper()
+                if scope == 'GLOBAL':
+                    if (long_paused and now_utc < long_paused) or (short_paused and now_utc < short_paused):
+                        is_paused = True
+                elif scope == 'SYMBOL':
+                    if _is_symbol_paused(user.telegram_id, symbol):
+                        is_paused = True
+                else:
+                    if signal_side == 'LONG' and long_paused and now_utc < long_paused:
+                        is_paused = True
+                    elif signal_side == 'SHORT' and short_paused and now_utc < short_paused:
+                        is_paused = True
                 
                 if is_paused:
-                    logger.info(f"Sinal de {signal_side} para {symbol} ignorado para o usuário {user.telegram_id} devido à pausa do disjuntor.")
-                    continue
+                    # Override por reversão (probe trade)
+                    if getattr(user, 'reversal_override_enabled', False):
+                        ok = await _reversal_confirmed(symbol, signal_side, user)
+                        if ok:
+                            probe_factor = float(getattr(user, 'probe_size_factor', 0.5) or 0.5)
+                            signal_data = dict(signal_data)
+                            signal_data['size_factor'] = max(0.1, min(1.0, probe_factor))
+                            await send_user_alert(application, user.telegram_id,
+                                f"⚠️ Disjuntor ativo, mas reversão confirmada. Abrindo <b>probe</b> com {int(signal_data['size_factor']*100)}% do tamanho.")
+                        else:
+                            logger.info(f"Sinal de {signal_side} para {symbol} ignorado (disjuntor ativo, sem reversão).")
+                            continue
+                    else:
+                        logger.info(f"Sinal de {signal_side} para {symbol} ignorado para o usuário {user.telegram_id} devido à pausa do disjuntor.")
+                        continue
 
                 # 2. Se não estiver pausado, verifica se o gatilho de perdas é atingido
                 if user.circuit_breaker_threshold > 0:
-                    losing_trades_count = db.query(Trade).filter(
-                        Trade.user_telegram_id == user.telegram_id,
-                        Trade.side == signal_side,
-                        Trade.status == 'ACTIVE',
-                        Trade.unrealized_pnl_pct < 0
-                    ).count()
+                    scope = (getattr(user, 'circuit_breaker_scope', 'SIDE') or 'SIDE').upper()
+                    if scope == 'GLOBAL':
+                        losing_trades_count = db.query(Trade).filter(
+                            Trade.user_telegram_id == user.telegram_id,
+                            Trade.status == 'ACTIVE',
+                            Trade.unrealized_pnl_pct < 0
+                        ).count()
+                    elif scope == 'SYMBOL':
+                        losing_trades_count = db.query(Trade).filter(
+                            Trade.user_telegram_id == user.telegram_id,
+                            Trade.symbol == symbol,
+                            Trade.status == 'ACTIVE',
+                            Trade.unrealized_pnl_pct < 0
+                        ).count()
+                    else:
+                        losing_trades_count = db.query(Trade).filter(
+                            Trade.user_telegram_id == user.telegram_id,
+                            Trade.side == signal_side,
+                            Trade.status == 'ACTIVE',
+                            Trade.unrealized_pnl_pct < 0
+                        ).count()
 
                     if losing_trades_count >= user.circuit_breaker_threshold:
-                        logger.warning(f"DISJUNTOR ATIVADO para {signal_side} para o usuário {user.telegram_id}. ({losing_trades_count} perdas ativas)")
-                        
-                        # Ativa a pausa
+                        logger.warning(f"DISJUNTOR ATIVADO ({scope}) para {symbol}/{signal_side} user={user.telegram_id} perdas={losing_trades_count}")
                         pause_until = datetime.now(pytz.utc) + timedelta(minutes=user.circuit_breaker_pause_minutes)
-                        if signal_side == 'LONG':
+                        if scope == 'GLOBAL':
                             user.long_trades_paused_until = pause_until
-                        else: # SHORT
                             user.short_trades_paused_until = pause_until
-                        
-                        # Notifica o usuário
-                        await application.bot.send_message(
-                            chat_id=user.telegram_id,
-                            text=f"🚨 <b>Disjuntor de Performance Ativado!</b> 🚨\n\n"
-                                 f"Detectamos {losing_trades_count} operações de <b>{signal_side}</b> em prejuízo.\n"
-                                 f"Para sua segurança, novas operações de <b>{signal_side}</b> estão pausadas por {user.circuit_breaker_pause_minutes} minutos.",
-                            parse_mode='HTML'
-                        )
-                        continue # Rejeita o sinal atual
+                            await send_user_alert(application, user.telegram_id,
+                                f"🚨 <b>Disjuntor GLOBAL</b> ativado ({losing_trades_count} perdas). Pausa {user.circuit_breaker_pause_minutes} min.")
+                        elif scope == 'SYMBOL':
+                            _pause_symbol(user.telegram_id, symbol, user.circuit_breaker_pause_minutes)
+                            await send_user_alert(application, user.telegram_id,
+                                f"🚨 <b>Disjuntor por Símbolo</b> em <b>{symbol}</b> ({losing_trades_count} perdas). Pausa {user.circuit_breaker_pause_minutes} min.")
+                        else:
+                            if signal_side == 'LONG':
+                                user.long_trades_paused_until = pause_until
+                            else: # SHORT
+                                user.short_trades_paused_until = pause_until
+                            await send_user_alert(application, user.telegram_id,
+                                f"🚨 <b>Disjuntor</b> ativado para {signal_side} ({losing_trades_count} perdas). Pausa {user.circuit_breaker_pause_minutes} min.")
+                        continue
 
                 # Adiciona uma verificação para ver se o bot do usuário está ativo.
                 if not user.is_active:

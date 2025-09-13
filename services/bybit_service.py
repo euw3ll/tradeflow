@@ -343,7 +343,12 @@ async def place_order(api_key: str, api_secret: str, signal_data: dict, user_set
             leverage = Decimal(str(user_settings.max_leverage))
             entry_price = current_market_price
             
-            margin_in_dollars = Decimal(str(balance)) * (Decimal(str(user_settings.entry_size_percent)) / Decimal("100"))
+            size_factor = Decimal(str(signal_data.get('size_factor', 1)))
+            if size_factor <= 0:
+                size_factor = Decimal('1')
+            margin_in_dollars = (Decimal(str(balance))
+                                  * (Decimal(str(user_settings.entry_size_percent)) / Decimal("100"))
+                                  * size_factor)
             notional_value = margin_in_dollars * leverage
             
             if entry_price <= 0: return {"success": False, "error": f"Preço de entrada inválido: {entry_price}"}
@@ -819,7 +824,12 @@ async def place_limit_order(api_key: str, api_secret: str, signal_data: dict, us
             price = Decimal(str(signal_data.get('limit_price')))
             price_adj = _round_down_to_tick(price, tick)
 
-            margin_in_dollars = Decimal(str(balance)) * (Decimal(str(user_settings.entry_size_percent)) / Decimal("100"))
+            size_factor = Decimal(str(signal_data.get('size_factor', 1)))
+            if size_factor <= 0:
+                size_factor = Decimal('1')
+            margin_in_dollars = (Decimal(str(balance))
+                                  * (Decimal(str(user_settings.entry_size_percent)) / Decimal("100"))
+                                  * size_factor)
             notional_value = margin_in_dollars * leverage
 
             if price_adj <= 0:
