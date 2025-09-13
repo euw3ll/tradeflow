@@ -374,7 +374,8 @@ async def open_information_handler(update: Update, context: ContextTypes.DEFAULT
         if getattr(user, 'is_rsi_filter_enabled', False): filters.append("RSI")
         filters_text = ", ".join(filters) if filters else "Nenhum"
         whitelist = getattr(user, 'coin_whitelist', '') or 'todas'
-        tp_token = (getattr(user, 'tp_distribution', 'EQUAL') or 'EQUAL').upper()
+        tp_raw = getattr(user, 'tp_distribution', 'EQUAL') or 'EQUAL'
+        tp_token = tp_raw.upper()
         if tp_token == 'EQUAL':
             tp_distribution = 'Divisão Igual'
         elif tp_token == 'FRONT_HEAVY':
@@ -383,7 +384,7 @@ async def open_information_handler(update: Update, context: ContextTypes.DEFAULT
             tp_distribution = 'Mais tarde (traseira)'
         elif tp_token == 'EXP_FRONT':
             tp_distribution = 'Exponencial cedo'
-        elif ',' in (getattr(user, 'tp_distribution', '') or ''):
+        elif ',' in (tp_raw or ''):
             tp_distribution = 'Personalizada'
         else:
             tp_distribution = tp_token
@@ -410,6 +411,23 @@ async def open_information_handler(update: Update, context: ContextTypes.DEFAULT
         pend_exp = int(getattr(user, 'pending_expiry_minutes', 0) or 0)
         pend_text = f"{pend_exp} min" if pend_exp > 0 else "Desativado"
 
+        # TP display: inclui âncoras quando personalizada
+        tp_line = f"• TP: <b>{tp_distribution}</b>"
+        if tp_distribution == 'Personalizada':
+            try:
+                parts = [p.strip() for p in (tp_raw or '').split(',') if p.strip()]
+                fmt_list = []
+                for p in parts:
+                    v = float(p)
+                    if abs(v - round(v)) < 1e-9:
+                        fmt_list.append(str(int(round(v))))
+                    else:
+                        s = (f"{v:.2f}").rstrip('0').rstrip('.')
+                        fmt_list.append(s)
+                tp_line = f"• TP: <b>Personalizada</b> ({','.join(fmt_list)})"
+            except Exception:
+                pass
+
         status_lines += [
             f"• Bot: <b>{bot_state}{sleep}</b>",
             f"• Aprovação: <b>{approval}</b>",
@@ -417,7 +435,7 @@ async def open_information_handler(update: Update, context: ContextTypes.DEFAULT
             f"• Risco: <b>{risk}</b>",
             f"• Stop‑Gain: <b>{stopgain}</b>",
             f"• Gatilhos BE/TS: <b>{be_trg:.2f}% / {ts_trg:.2f}%</b>",
-            f"• TP: <b>{tp_distribution}</b>",
+            tp_line,
             f"• Stop Inicial: <b>{sl_text}</b>",
             f"• Pendentes: expirar <b>{pend_text}</b>",
             f"• Metas do dia: lucro <b>${daily_p:,.2f}</b> / perda <b>${daily_l:,.2f}</b>",
@@ -3316,6 +3334,20 @@ async def show_tp_strategy_menu_handler(update: Update, context: ContextTypes.DE
             return (token, 'Usa a estratégia configurada.')
 
         label, info = _tp_label_and_info(token)
+        if ',' in (token or ''):
+            try:
+                parts = [p.strip() for p in token.split(',') if p.strip()]
+                fmt = []
+                for p in parts:
+                    v = float(p)
+                    if abs(v - round(v)) < 1e-9:
+                        fmt.append(str(int(round(v))))
+                    else:
+                        s = (f"{v:.2f}").rstrip('0').rstrip('.')
+                        fmt.append(s)
+                label = f"{label} ({','.join(fmt)})"
+            except Exception:
+                pass
         header = (
             "🎯 <b>Estratégia de Take Profit</b>\n\n"
             f"<b>Estratégia Atual:</b> {label}\n\n"
