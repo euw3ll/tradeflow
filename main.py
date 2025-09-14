@@ -1,5 +1,7 @@
 import logging
 import asyncio
+import os
+from logging.handlers import RotatingFileHandler
 from telegram import Update
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters, 
@@ -55,7 +57,7 @@ from bot.handlers import (
 )
 from services.telethon_service import start_signal_monitor
 from core.position_tracker import run_tracker
-from services.notification_service import send_user_alert
+from services.notification_service import send_user_alert, send_error_report
 
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="telegram.ext.conversationhandler")
@@ -67,6 +69,25 @@ logging.basicConfig(
     format="%(asctime)s - [%(levelname)s] - %(name)s - %(message)s",
     level=logging.INFO
 )
+# Handlers de arquivo (rotativos)
+try:
+    logs_dir = os.getenv('LOGS_DIR', 'logs')
+    os.makedirs(logs_dir, exist_ok=True)
+    app_log = os.path.join(logs_dir, 'app.log')
+    err_log = os.path.join(logs_dir, 'errors.log')
+    fh_all = RotatingFileHandler(app_log, maxBytes=1_000_000, backupCount=5)
+    fh_err = RotatingFileHandler(err_log, maxBytes=1_000_000, backupCount=5)
+    fh_all.setLevel(logging.INFO)
+    fh_err.setLevel(logging.ERROR)
+    fmt = logging.Formatter("%(asctime)s - [%(levelname)s] - %(name)s - %(message)s")
+    fh_all.setFormatter(fmt)
+    fh_err.setFormatter(fmt)
+    root = logging.getLogger()
+    root.addHandler(fh_all)
+    root.addHandler(fh_err)
+except Exception:
+    pass
+
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
@@ -103,6 +124,22 @@ async def on_error(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "message_text": getattr(getattr(update, "message", None), "text", None),
         }
         logger.error("Unhandled error | context=%s", ctx, exc_info=context.error)
+        # Também envia para canal de erros (se configurado)
+        try:
+            import traceback
+            tb = ''.join(traceback.format_exception(None, context.error, context.error.__traceback__)) if context.error else ''
+            summary = (
+                "🚨 <b>Erro não tratado</b>\n"
+                f"<b>Chat:</b> {ctx.get('chat_id')} ({ctx.get('chat_type')})\n"
+                f"<b>User:</b> {ctx.get('user_id')}\n"
+                f"<b>Callback:</b> <code>{str(ctx.get('callback_data'))[:200]}</code>\n"
+                f"<b>Msg:</b> <code>{str(ctx.get('message_text'))[:200]}</code>\n"
+                f"<b>Exceção:</b> <code>{str(err)[:400]}</code>\n\n"
+                f"<b>Traceback:</b>\n<code>{tb[-3500:]}</code>"
+            )
+            await send_error_report(context.application, summary)
+        except Exception:
+            pass
     except Exception:
         logger.error("Unhandled error (failed to log context)", exc_info=context.error)
     try:

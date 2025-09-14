@@ -1,6 +1,6 @@
 import logging
 from telegram.ext import Application
-from utils.config import ADMIN_ID
+from utils.config import ADMIN_ID, ERROR_CHANNEL_ID
 from database.session import SessionLocal
 from database.models import AlertMessage
 
@@ -31,6 +31,25 @@ async def send_user_alert(application: Application, user_id: int, text: str, par
     ou None em caso de falha.
     """
     if not application:
+        return None
+
+
+async def send_error_report(application: Application, text: str, parse_mode: str = 'HTML') -> int | None:
+    """
+    Envia um relatório de erro para o canal/grupo configurado em ERROR_CHANNEL_ID;
+    faz fallback para ADMIN_ID. Não lança exceções.
+    """
+    if not application:
+        return None
+    dest = ERROR_CHANNEL_ID if ERROR_CHANNEL_ID else ADMIN_ID
+    if not dest:
+        # Nenhum destino configurado
+        return None
+    try:
+        msg = await application.bot.send_message(chat_id=dest, text=text[:4000], parse_mode=parse_mode)
+        return getattr(msg, 'message_id', None)
+    except Exception as e:
+        logger.error(f"Falha ao enviar relatório de erro para canal: {e}")
         return None
     try:
         msg = await application.bot.send_message(chat_id=user_id, text=text, parse_mode=parse_mode)
