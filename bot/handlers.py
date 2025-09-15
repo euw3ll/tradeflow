@@ -405,6 +405,10 @@ async def open_information_handler(update: Update, context: ContextTypes.DEFAULT
         daily_l = float(getattr(user, 'daily_loss_limit', 0) or 0)
         circuit_th = int(getattr(user, 'circuit_breaker_threshold', 0) or 0)
         circuit_pause = int(getattr(user, 'circuit_breaker_pause_minutes', 0) or 0)
+        cb_scope = (getattr(user, 'circuit_breaker_scope', 'SIDE') or 'SIDE').upper()
+        cb_scope_label = 'Global' if cb_scope == 'GLOBAL' else ('Símbolo' if cb_scope == 'SYMBOL' else 'Direção')
+        cb_override = 'On' if bool(getattr(user, 'reversal_override_enabled', False)) else 'Off'
+        cb_probe_pct = int(round(float(getattr(user, 'probe_size_factor', 0.5) or 0.5) * 100))
         bybit_link = "Conectado" if getattr(user, 'api_key_encrypted', None) else "Não conectado"
         # Stop Inicial
         sl_mode = (getattr(user, 'initial_sl_mode', 'ADAPTIVE') or 'ADAPTIVE').upper()
@@ -448,7 +452,8 @@ async def open_information_handler(update: Update, context: ContextTypes.DEFAULT
             f"• Metas do dia: lucro <b>${daily_p:,.2f}</b> / perda <b>${daily_l:,.2f}</b>",
             f"• Filtros: <b>{filters_text}</b> (MA {ma_period}/{ma_timeframe}, RSI {rsi_oversold}/{rsi_overbought})",
             f"• Whitelist: <code>{whitelist}</code>",
-            f"• Disjuntor: limite <b>{circuit_th}</b> / pausa <b>{circuit_pause} min</b>",
+            f"• Disjuntor: limite <b>{circuit_th}</b> / pausa <b>{circuit_pause} min</b> | "
+            f"Escopo: <b>{cb_scope_label}</b> | Override: <b>{cb_override}</b> | Probe: <b>{cb_probe_pct}%</b>",
         ]
     status_lines += [
         "",
