@@ -786,6 +786,16 @@ async def run_tracker(application: Application):
 
         except Exception as e:
             logger.critical(f"Erro crítico no loop do rastreador: {e}", exc_info=True)
+            try:
+                import traceback
+                tb = traceback.format_exc()
+                await send_error_report(application, (
+                    "🚨 <b>Tracker crash</b>\n"
+                    f"<b>Exceção:</b> <code>{str(e)[:400]}</code>\n\n"
+                    f"<b>Traceback:</b>\n<code>{tb[-3500:]}</code>"
+                ))
+            except Exception:
+                pass
             db.rollback()
         finally:
             db.close()

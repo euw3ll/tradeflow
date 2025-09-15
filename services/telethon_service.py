@@ -10,6 +10,7 @@ from telethon.errors.rpcerrorlist import ChannelForumMissingError, ChannelInvali
 from telethon.tl.functions.channels import GetForumTopicsRequest
 from utils.config import API_ID, API_HASH
 from database.session import SessionLocal
+from services.notification_service import send_error_report
 from database.models import MonitoredTarget
 from .signal_parser import parse_signal
 
@@ -226,6 +227,17 @@ async def queue_processor(queue: asyncio.Queue, ptb_app: Application):
 
         except Exception as e:
             logger.error(f"Erro CRÍTICO no processador da fila ao manusear a ação '{action}': {e}", exc_info=True)
+            try:
+                import traceback
+                tb = traceback.format_exc()
+                await send_error_report(ptb_app, (
+                    "🚨 <b>Queue Processor crash</b>\n"
+                    f"<b>Ação:</b> {action}\n"
+                    f"<b>Exceção:</b> <code>{str(e)[:400]}</code>\n\n"
+                    f"<b>Traceback:</b>\n<code>{tb[-3500:]}</code>"
+                ))
+            except Exception:
+                pass
         finally:
             queue.task_done()
             logger.info(f"[Queue Processor] <== Pedido '{action}' finalizado.")
