@@ -45,6 +45,8 @@ from bot.handlers import (
     ask_risk_per_trade, receive_risk_per_trade, ASKING_RISK_PER_TRADE,
     ask_circuit_threshold, receive_circuit_threshold, ASKING_CIRCUIT_THRESHOLD,
     ask_circuit_pause, receive_circuit_pause, ASKING_CIRCUIT_PAUSE,
+    toggle_circuit_scope_handler, toggle_reversal_override_handler,
+    ask_probe_size, receive_probe_size, ASKING_PROBE_SIZE,
     ask_ma_timeframe, set_ma_timeframe,
     ask_rsi_oversold, receive_rsi_oversold, ASKING_RSI_OVERSOLD,
     ask_rsi_overbought, receive_rsi_overbought, ASKING_RSI_OVERBOUGHT,
@@ -392,6 +394,14 @@ async def main():
     )
     application.add_handler(risk_per_trade_conv)
     application.add_handler(CallbackQueryHandler(show_circuit_menu_handler, pattern='^settings_circuit$'))
+    application.add_handler(CallbackQueryHandler(toggle_circuit_scope_handler, pattern='^toggle_circuit_scope$'))
+    application.add_handler(CallbackQueryHandler(toggle_reversal_override_handler, pattern='^toggle_reversal_override$'))
+    probe_size_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(ask_probe_size, pattern='^ask_probe_size$')],
+        states={ ASKING_PROBE_SIZE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_probe_size)] },
+        fallbacks=[CommandHandler("cancel", cancel)], per_message=False, per_user=True,
+    )
+    application.add_handler(probe_size_conv)
     application.add_handler(CallbackQueryHandler(back_to_settings_menu_handler, pattern='^back_to_settings_menu$'))
     application.add_handler(CallbackQueryHandler(show_tp_strategy_menu_handler, pattern='^show_tp_strategy$'))
     application.add_handler(CallbackQueryHandler(cycle_tp_preset_handler, pattern='^cycle_tp_preset$'))

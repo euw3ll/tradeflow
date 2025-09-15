@@ -161,9 +161,17 @@ def stopgain_menu_keyboard(user) -> InlineKeyboardMarkup:
 def circuit_menu_keyboard(user) -> InlineKeyboardMarkup:
     threshold = f"{int(getattr(user, 'circuit_breaker_threshold', 0) or 0)}"
     pause     = f"{int(getattr(user, 'circuit_breaker_pause_minutes', 0) or 0)} min"
+    scope = (getattr(user,'circuit_breaker_scope','SIDE') or 'SIDE').upper()
+    scope_label = 'Global' if scope == 'GLOBAL' else ('Símbolo' if scope == 'SYMBOL' else 'Direção')
+    override_on = bool(getattr(user,'reversal_override_enabled', False))
+    override_label = 'On' if override_on else 'Off'
+    probe_pct = int(round(float(getattr(user,'probe_size_factor',0.5) or 0.5) * 100))
     kb = [
         [InlineKeyboardButton(f"⚡ Limite do Disjuntor ({threshold})", callback_data="set_circuit_threshold")],
         [InlineKeyboardButton(f"⏸️ Pausa após Disparo ({pause})", callback_data="set_circuit_pause")],
+        [InlineKeyboardButton(f"🛰️ Escopo ({scope_label})", callback_data="toggle_circuit_scope")],
+        [InlineKeyboardButton(f"🔁 Override Reversão ({override_label})", callback_data="toggle_reversal_override")],
+        [InlineKeyboardButton(f"🧪 Probe Size ({probe_pct}%)", callback_data="ask_probe_size")],
         [InlineKeyboardButton("⬅️ Voltar", callback_data="back_to_settings_menu")],
     ]
     return InlineKeyboardMarkup(kb)

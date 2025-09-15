@@ -53,6 +53,7 @@ ASKING_ALERT_CLEANUP_MINUTES = 29
 ASKING_PENDING_EXPIRY_MINUTES = 30
 ASKING_INITIAL_SL_FIXED = 31
 ASKING_RISK_PER_TRADE = 32
+ASKING_PROBE_SIZE = 33
 
 logger = logging.getLogger(__name__)
 
@@ -78,9 +79,15 @@ def _stopgain_summary(user) -> str:
 
 def _circuit_summary(user) -> str:
     try:
+        scope = (getattr(user,'circuit_breaker_scope','SIDE') or 'SIDE').upper()
+        scope_label = 'Global' if scope == 'GLOBAL' else ('Símbolo' if scope == 'SYMBOL' else 'Direção')
+        override = 'On' if bool(getattr(user,'reversal_override_enabled', False)) else 'Off'
+        probe = float(getattr(user,'probe_size_factor', 0.5) or 0.5)
+        probe_pct = int(round(probe * 100))
         return (
             f"• Limite: {int(getattr(user,'circuit_breaker_threshold',0) or 0)}  |  "
-            f"Pausa: {int(getattr(user,'circuit_breaker_pause_minutes',0) or 0)} min"
+            f"Pausa: {int(getattr(user,'circuit_breaker_pause_minutes',0) or 0)} min\n"
+            f"• Escopo: {scope_label}  |  Override: {override}  |  Probe: {probe_pct}%"
         )
     except Exception:
         return "• Parâmetros indisponíveis"
@@ -3272,6 +3279,75 @@ async def show_circuit_menu_handler(update: Update, context: ContextTypes.DEFAUL
         await query.edit_message_text("Não foi possível abrir o submenu de Disjuntor agora.")
     finally:
         db.close()
+
+async def toggle_circuit_scope_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.telegram_id == query.from_user.id).first()
+        if not user:
+            await query.edit_message_text("Usuário não encontrado. Use /start para registrar.")
+            return
+        cur = (getattr(user,'circuit_breaker_scope','SIDE') or 'SIDE').upper()
+        nxt = 'GLOBAL' if cur == 'SIDE' else ('SYMBOL' if cur == 'GLOBAL' else 'SIDE')
+        user.circuit_breaker_scope = nxt
+        db.commit()
+        header = ("🚫 <b>Disjuntor</b>\n<i>Defina limite e pausa após disparo.</i>\n\n"
+                  f"{_circuit_summary(user)}")
+        await query.edit_message_text(text=header, reply_markup=circuit_menu_keyboard(user), parse_mode="HTML")
+    finally:
+        db.close()
+
+async def toggle_reversal_override_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.telegram_id == query.from_user.id).first()
+        if not user:
+            await query.edit_message_text("Usuário não encontrado. Use /start para registrar.")
+            return
+        user.reversal_override_enabled = not bool(getattr(user,'reversal_override_enabled', False))
+        db.commit()
+        header = ("🚫 <b>Disjuntor</b>\n<i>Defina limite e pausa após disparo.</i>\n\n"
+                  f"{_circuit_summary(user)}")
+        await query.edit_message_text(text=header, reply_markup=circuit_menu_keyboard(user), parse_mode="HTML")
+    finally:
+        db.close()
+
+async def ask_probe_size(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    context.user_data['settings_message_id'] = query.message.message_id
+    await query.edit_message_text("🧪 Envie o <b>tamanho do probe</b> em % (10–100). Ex.: 50", parse_mode='HTML')
+    return ASKING_PROBE_SIZE
+
+async def receive_probe_size(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.effective_user.id
+    message_id_to_edit = context.user_data.get('settings_message_id')
+    try:
+        value = float((update.message.text or '').replace('%','').replace(',','.'))
+        if value < 10 or value > 100:
+            raise ValueError('range')
+        factor = round(value/100.0, 4)
+        db = SessionLocal()
+        try:
+            user = db.query(User).filter(User.telegram_id == user_id).first()
+            if not user:
+                await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text="Usuário não encontrado.")
+                return ConversationHandler.END
+            user.probe_size_factor = factor
+            db.commit()
+            header = ("🚫 <b>Disjuntor</b>\n<i>Defina limite e pausa após disparo.</i>\n\n"
+                      f"{_circuit_summary(user)}")
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text=header, parse_mode='HTML', reply_markup=circuit_menu_keyboard(user))
+        finally:
+            db.close()
+    except Exception:
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text="❌ Valor inválido. Envie um inteiro entre 10 e 100.")
+        return ASKING_PROBE_SIZE
+    return ConversationHandler.END
 
 async def back_to_settings_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
