@@ -1035,11 +1035,17 @@ async def confirm_and_close_trade(
         # Cabeçalho claro: LUCRO / PREJUÍZO
         result_emoji = "✅" if (pnl is not None and float(pnl) >= 0) else "🔻"
         result_label = "LUCRO" if (pnl is not None and float(pnl) >= 0) else "PREJUÍZO"
-        reason = (
-            "Take Profit" if str(exit_type).lower().startswith("take") else
-            "Stop" if str(exit_type).lower().startswith("stop") else
-            "Fechamento"
-        )
+        et_lower = str(exit_type).lower()
+        if et_lower.startswith("take"):
+            reason = "Take Profit"
+        elif et_lower.startswith("stop"):
+            reason = "Stop Loss"
+        else:
+            # Fallback heurístico: usa sinal do PnL
+            try:
+                reason = "Take Profit" if (pnl is not None and float(pnl) >= 0) else "Stop Loss"
+            except Exception:
+                reason = "Fechamento"
         lines = [f"{result_emoji} <b>{result_label}</b> — <b>{trade.symbol}</b> {side}", f"• Tipo: <b>{reason}</b>"]
         if qty is not None:
             lines.append(f"• Quantidade: <b>{qty:g}</b>")
@@ -1080,9 +1086,15 @@ async def confirm_and_close_trade(
                 lines.append(f"• Horário: <b>{closed_at_val}</b>")
         final_text = "\n".join(lines)
     else:
-        lines = [
-            f"ℹ️ <b>Posição Encerrada</b> — <b>{trade.symbol}</b> {side}",
-        ]
+        lines = [f"ℹ️ <b>Posição Encerrada</b> — <b>{trade.symbol}</b> {side}"]
+        su = (getattr(trade, 'status', '') or '').upper()
+        if su:
+            if 'MANUAL' in su:
+                lines.append("• Tipo: <b>Fechamento manual</b>")
+            elif 'PROFIT' in su:
+                lines.append("• Tipo: <b>Take Profit</b>")
+            elif 'LOSS' in su or 'STOP' in su:
+                lines.append("• Tipo: <b>Stop Loss</b>")
         if qty is not None:
             lines.append(f"• Quantidade: <b>{qty:g}</b>")
         if entry is not None:

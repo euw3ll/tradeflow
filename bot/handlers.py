@@ -2453,9 +2453,20 @@ async def list_closed_trades_handler(update: Update, context: ContextTypes.DEFAU
                     user_id, getattr(trade, "id", None), trade.symbol, trade.status, str(trade.closed_pnl), render_mode
                 )
 
+                # Razão/Tipo do fechamento (heurística por status)
+                reason = "Fechamento"
+                su = (trade.status or "").upper()
+                if "MANUAL" in su:
+                    reason = "Fechamento manual"
+                elif "PROFIT" in su:
+                    reason = "Take Profit"
+                elif "LOSS" in su or "STOP" in su:
+                    reason = "Stop Loss"
+
                 message += (
                     f"{emoji} <b>{trade.symbol}</b> ({trade.side})\n"
                     f"  - Fechado em: {data_fechamento}\n"
+                    f"  - Tipo: <b>{reason}</b>\n"
                     f"  - {resultado_str}\n\n"
                 )
 
