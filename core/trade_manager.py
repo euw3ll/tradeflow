@@ -13,7 +13,8 @@ from services.bybit_service import (
     place_order, get_account_info,
     place_limit_order, cancel_order,
     get_order_history,
-    get_historical_klines
+    get_historical_klines,
+    get_daily_pnl,
 )
 from services.notification_service import send_notification, send_user_alert
 from utils.security import decrypt_data
@@ -22,8 +23,28 @@ from bot.keyboards import signal_approval_keyboard
 from services.signal_parser import SignalType
 from core.whitelist_service import is_coin_in_whitelist
 from datetime import datetime, timedelta
+import time
 
 logger = logging.getLogger(__name__)
+
+_DAILY_PNL_CACHE: dict[int, tuple[float, float]] = {}
+
+async def _get_daily_pnl_cached(api_key: str, api_secret: str, user_id: int, ttl_seconds: int = 60) -> tuple[bool, float]:
+    """Retorna (success, pnl_realizado_do_dia). Usa cache de curto prazo por usuário para reduzir chamadas."""
+    now = time.time()
+    cached = _DAILY_PNL_CACHE.get(user_id)
+    if cached and (now - cached[0] < ttl_seconds):
+        return True, cached[1]
+    try:
+        res = await get_daily_pnl(api_key, api_secret)
+        if res.get("success"):
+            pnl = float(res.get("pnl", 0.0) or 0.0)
+            _DAILY_PNL_CACHE[user_id] = (now, pnl)
+            return True, pnl
+        return False, 0.0
+    except Exception:
+        logger.exception("[daily-pnl] falha ao obter PnL do dia para user_id=%s", user_id)
+        return False, 0.0
 
 # --- Disjuntor: estado em memória por símbolo (escopo SYMBOL) ---
 _SYMBOL_BREAKER: dict[int, dict[str, datetime]] = {}
@@ -432,6 +453,30 @@ async def process_new_signal(signal_data: dict, application: Application, source
                             await send_user_alert(application, user.telegram_id,
                                 f"🚨 <b>Disjuntor</b> ativado para {signal_side} ({losing_trades_count} perdas). Pausa {user.circuit_breaker_pause_minutes} min.")
                         continue
+
+                # 1.1. Guard-rail diário (Meta de lucro / Limite de perda)
+                try:
+                    target = float(getattr(user, 'daily_profit_target', 0) or 0)
+                    limit_loss = float(getattr(user, 'daily_loss_limit', 0) or 0)
+                except Exception:
+                    target = 0.0; limit_loss = 0.0
+                if target > 0 or limit_loss > 0:
+                    api_key = decrypt_data(user.api_key_encrypted)
+                    api_secret = decrypt_data(user.api_secret_encrypted)
+                    ok, pnl_today = await _get_daily_pnl_cached(api_key, api_secret, user.telegram_id)
+                    if ok:
+                        # Lucro alvo atingido?
+                        if target > 0 and pnl_today >= target:
+                            await send_user_alert(application, user.telegram_id,
+                                f"✅ <b>Meta diária</b> atingida (P/L do dia: <b>${pnl_today:,.2f}</b>).\n"
+                                "Novas entradas estão bloqueadas hoje.")
+                            continue
+                        # Limite de perda estourado?
+                        if limit_loss > 0 and pnl_today <= -limit_loss:
+                            await send_user_alert(application, user.telegram_id,
+                                f"⛔ <b>Limite de perda diário</b> atingido (P/L do dia: <b>${pnl_today:,.2f}</b>).\n"
+                                "Novas entradas estão bloqueadas hoje.")
+                            continue
 
                 # Adiciona uma verificação para ver se o bot do usuário está ativo.
                 if not user.is_active:
