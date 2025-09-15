@@ -2585,42 +2585,49 @@ async def toggle_bot_status_handler(update: Update, context: ContextTypes.DEFAUL
 async def ask_entry_percent(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    context.user_data['settings_message_id'] = query.message.message_id
     await query.edit_message_text("📥 Envie o <b>tamanho de entrada</b> em % (ex.: 3.5)", parse_mode="HTML")
     return ASKING_ENTRY_PERCENT
 
 async def ask_max_leverage(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    context.user_data['settings_message_id'] = query.message.message_id
     await query.edit_message_text("⚙️ Envie a <b>alavancagem máxima</b> (ex.: 5, 10, 20)", parse_mode="HTML")
     return ASKING_MAX_LEVERAGE
 
 async def ask_min_confidence(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    context.user_data['settings_message_id'] = query.message.message_id
     await query.edit_message_text("🎯 Envie a <b>confiança mínima</b> em % (ex.: 70)", parse_mode="HTML")
     return ASKING_MIN_CONFIDENCE
 
 async def ask_stop_gain_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    context.user_data['settings_message_id'] = query.message.message_id
     await query.edit_message_text("🚀 Envie o <b>gatilho</b> do Stop-Gain em % (ex.: 3)", parse_mode="HTML")
     return ASKING_STOP_GAIN_TRIGGER
 
 async def ask_stop_gain_lock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    context.user_data['settings_message_id'] = query.message.message_id
     await query.edit_message_text("🔒 Envie a <b>trava</b> do Stop-Gain em % (ex.: 1)", parse_mode="HTML")
     return ASKING_STOP_GAIN_LOCK
 
 async def ask_be_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    context.user_data['settings_message_id'] = query.message.message_id
     await query.edit_message_text("🎯 Envie o <b>gatilho opcional</b> do Break‑Even por PnL em % (ex.: 2). Use 0 para desativar.", parse_mode="HTML")
     return ASKING_BE_TRIGGER
 
 async def ask_ts_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    context.user_data['settings_message_id'] = query.message.message_id
     await query.edit_message_text("📈 Envie o <b>gatilho opcional</b> do Trailing Stop por PnL em % (ex.: 3). Use 0 para desativar.", parse_mode="HTML")
     return ASKING_TS_TRIGGER
 
