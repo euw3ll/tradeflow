@@ -1083,7 +1083,8 @@ async def get_closed_pnl_for_trade(
             want_pos_side = "Long" if want == "LONG" else "Short"
             want_close_side = "Sell" if want == "LONG" else "Buy"
 
-            gross = 0.0
+            # Bybit's closedPnl is already net of trading fees and funding.
+            net_sum = 0.0
             fees = 0.0
             funding = 0.0
             last_exit_type = None
@@ -1100,7 +1101,7 @@ async def get_closed_pnl_for_trade(
                     if side_close != want_close_side:
                         continue
                 try:
-                    gross += float(it.get("closedPnl", 0) or 0)
+                    net_sum += float(it.get("closedPnl", 0) or 0)
                 except Exception:
                     pass
                 # taxas (melhor esforço)
@@ -1119,8 +1120,14 @@ async def get_closed_pnl_for_trade(
                     s = (it.get("stopOrderType") or it.get("orderType") or "").strip()
                     if s:
                         last_exit_type = s
+            # Recover an optional gross amount by adding back costs if available.
+            gross = net_sum
+            if fees:
+                gross += fees
+            if funding:
+                gross += funding
 
-            net = gross - fees - funding
+            net = net_sum
             return {
                 "success": True,
                 "gross_pnl": gross,
