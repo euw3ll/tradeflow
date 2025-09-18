@@ -412,6 +412,9 @@ def notifications_menu_keyboard(user=None) -> InlineKeyboardMarkup:
 def info_menu_keyboard() -> InlineKeyboardMarkup:
     """Menu para a seção Informações (status + aprender)."""
     kb = [
+        [InlineKeyboardButton("📤 Exportar Configurações", callback_data='info_export_settings')],
+        [InlineKeyboardButton("📥 Importar Configurações", callback_data='info_import_settings')],
+        [InlineKeyboardButton("🎛️ Ajustar pela Banca", callback_data='info_bankroll_wizard')],
         [InlineKeyboardButton("📖 Quero aprender", callback_data='info_learn_start')],
         [InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data='back_to_main_menu')],
     ]

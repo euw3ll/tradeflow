@@ -1,6 +1,9 @@
 import logging
 import asyncio
+import json
+import html
 import pytz
+from typing import Optional
 from database.models import PendingSignal
 from services.signal_parser import SignalType
 from services.bybit_service import get_account_info, cancel_order, get_order_status 
@@ -57,8 +60,189 @@ ASKING_PROBE_SIZE = 33
 ASKING_ADAPTIVE_SL_MAX = 34
 ASKING_ADAPTIVE_SL_TIGHTEN = 35
 ASKING_ADAPTIVE_SL_TIMEOUT = 36
+ASKING_CONFIG_IMPORT = 37
+ASKING_BANKROLL_AMOUNT = 38
 
 logger = logging.getLogger(__name__)
+
+EXPORTABLE_USER_FIELDS = [
+    "entry_size_percent",
+    "max_leverage",
+    "min_confidence",
+    "approval_mode",
+    "daily_profit_target",
+    "daily_loss_limit",
+    "coin_whitelist",
+    "stop_strategy",
+    "stop_gain_trigger_pct",
+    "stop_gain_lock_pct",
+    "be_trigger_pct",
+    "ts_trigger_pct",
+    "circuit_breaker_threshold",
+    "circuit_breaker_pause_minutes",
+    "circuit_breaker_scope",
+    "reversal_override_enabled",
+    "probe_size_factor",
+    "backoff_escalation",
+    "is_active",
+    "is_sleep_mode_enabled",
+    "is_ma_filter_enabled",
+    "ma_period",
+    "ma_timeframe",
+    "is_rsi_filter_enabled",
+    "rsi_timeframe",
+    "rsi_oversold_threshold",
+    "rsi_overbought_threshold",
+    "tp_distribution",
+    "initial_sl_mode",
+    "initial_sl_fixed_pct",
+    "risk_per_trade_pct",
+    "adaptive_sl_max_pct",
+    "adaptive_sl_tighten_pct",
+    "adaptive_sl_timeout_minutes",
+    "pending_expiry_minutes",
+    "msg_cleanup_mode",
+    "msg_cleanup_delay_minutes",
+    "alert_cleanup_mode",
+    "alert_cleanup_delay_minutes",
+]
+
+FLOAT_FIELDS = {
+    "entry_size_percent",
+    "min_confidence",
+    "daily_profit_target",
+    "daily_loss_limit",
+    "stop_gain_trigger_pct",
+    "stop_gain_lock_pct",
+    "be_trigger_pct",
+    "ts_trigger_pct",
+    "probe_size_factor",
+    "initial_sl_fixed_pct",
+    "risk_per_trade_pct",
+    "adaptive_sl_max_pct",
+    "adaptive_sl_tighten_pct",
+}
+
+INT_FIELDS = {
+    "max_leverage",
+    "circuit_breaker_threshold",
+    "circuit_breaker_pause_minutes",
+    "ma_period",
+    "pending_expiry_minutes",
+    "msg_cleanup_delay_minutes",
+    "alert_cleanup_delay_minutes",
+    "adaptive_sl_timeout_minutes",
+    "rsi_oversold_threshold",
+    "rsi_overbought_threshold",
+}
+
+BOOL_FIELDS = {
+    "reversal_override_enabled",
+    "backoff_escalation",
+    "is_active",
+    "is_sleep_mode_enabled",
+    "is_ma_filter_enabled",
+    "is_rsi_filter_enabled",
+}
+
+
+def _collect_user_config(user: User) -> dict:
+    data = {}
+    for key in EXPORTABLE_USER_FIELDS:
+        data[key] = getattr(user, key, None)
+    return data
+
+
+def _coerce_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "t", "yes", "sim", "on"}
+    return bool(value)
+
+
+def _apply_user_config(user: User, config: dict):
+    for key in EXPORTABLE_USER_FIELDS:
+        if key not in config:
+            continue
+        value = config[key]
+        if value is None:
+            setattr(user, key, None)
+            continue
+        try:
+            if key in BOOL_FIELDS:
+                setattr(user, key, _coerce_bool(value))
+            elif key in INT_FIELDS:
+                setattr(user, key, int(float(value)))
+            elif key in FLOAT_FIELDS:
+                setattr(user, key, float(value))
+            else:
+                setattr(user, key, str(value))
+        except Exception:
+            logger.warning("[config:import] falha ao aplicar %s=%s", key, value)
+
+
+def _build_bankroll_entry_text(detected_equity: float) -> str:
+    lines = [
+        "🎛️ <b>Ajustar Configurações pela Banca</b>",
+        "Escolha entre ajuste automático ou configuração manual.",
+    ]
+    if detected_equity:
+        lines.append(f"• Saldo detectado: <b>{_format_currency(detected_equity)}</b>")
+    else:
+        lines.append("• Saldo detectado indisponível (adicione suas chaves ou informe manualmente).")
+    return "\n".join(lines)
+
+
+def _build_bankroll_entry_keyboard(detected_equity: float, *, include_cancel: bool) -> InlineKeyboardMarkup:
+    buttons = []
+    if detected_equity and detected_equity > 0:
+        buttons.append([
+            InlineKeyboardButton(
+                f"Deixar o bot detectar ({_format_currency(detected_equity)})",
+                callback_data='info_bankroll_use_detected'
+            )
+        ])
+    buttons.append([InlineKeyboardButton("Informar valor da banca", callback_data='info_bankroll_manual')])
+    buttons.append([InlineKeyboardButton("Configurar manualmente", callback_data='info_bankroll_manual_config')])
+    if include_cancel:
+        buttons.append([InlineKeyboardButton("⬅️ Cancelar", callback_data='info_bankroll_cancel')])
+    return InlineKeyboardMarkup(buttons)
+
+
+async def _send_bankroll_entry_menu(context: ContextTypes.DEFAULT_TYPE, chat_id: int, detected_equity: float, *, edit_message_id: Optional[int], from_onboarding: bool) -> None:
+    context.user_data['bankroll_detected_equity'] = detected_equity
+    context.user_data['bankroll_from_onboarding'] = from_onboarding
+
+    text = _build_bankroll_entry_text(detected_equity)
+    keyboard = _build_bankroll_entry_keyboard(detected_equity, include_cancel=not from_onboarding)
+
+    if edit_message_id:
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=edit_message_id,
+            text=text,
+            parse_mode='HTML',
+            reply_markup=keyboard
+        )
+        context.user_data['bankroll_message_id'] = edit_message_id
+    else:
+        msg = await context.bot.send_message(chat_id=chat_id, text=text, parse_mode='HTML', reply_markup=keyboard)
+        context.user_data['bankroll_message_id'] = msg.message_id
+
+
+async def _send_onboarding_terms(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    terms = (
+        "📜 Termo de Responsabilidade\n\n"
+        "• Este bot NÃO promete ganhos e NÃO garante resultados.\n"
+        "• Operar mercados envolve riscos significativos, incluindo perdas parciais ou totais do capital.\n"
+        "• Você é o único responsável por suas operações e configurações.\n"
+        "• Monitoramos fontes de alta qualidade, mas risco sempre existe.\n\n"
+        "Para concluir a ativação do app, confirme que você leu e concorda."
+    )
+    await context.bot.send_message(chat_id=chat_id, text=terms, reply_markup=onboarding_terms_keyboard())
 
 # ---- helpers (resumos no topo dos submenus) ----
 def _risk_summary(user) -> str:
@@ -468,6 +652,327 @@ async def open_information_handler(update: Update, context: ContextTypes.DEFAULT
 
     await query.edit_message_text("\n".join(status_lines), parse_mode='HTML', reply_markup=info_menu_keyboard())
 
+
+async def export_settings_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.telegram_id == query.from_user.id).first()
+        if not user:
+            await query.edit_message_text(
+                "❌ Não encontrei seu usuário. Use /start para registrar.",
+                reply_markup=info_menu_keyboard()
+            )
+            return
+        payload = {
+            "version": 1,
+            "config": _collect_user_config(user),
+        }
+    finally:
+        db.close()
+
+    formatted = json.dumps(payload, ensure_ascii=False, indent=2)
+    escaped = html.escape(formatted)
+
+    await query.edit_message_text(
+        "📤 <b>Exportação de Configurações</b>\nCopie o JSON abaixo para salvar ou importar posteriormente.",
+        parse_mode='HTML',
+        reply_markup=info_menu_keyboard()
+    )
+    await query.message.reply_text(f"<code>{escaped}</code>", parse_mode='HTML')
+
+
+async def ask_import_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    context.user_data['info_settings_message_id'] = query.message.message_id
+    instructions = (
+        "📥 <b>Importar Configurações</b>\n"
+        "Envie agora o JSON exportado anteriormente (apenas texto).\n\n"
+        "Digite /cancel para desistir."
+    )
+    await query.edit_message_text(instructions, parse_mode='HTML')
+    return ASKING_CONFIG_IMPORT
+
+
+async def receive_import_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw_text = (update.message.text or '').strip()
+    message_id = context.user_data.get('info_settings_message_id')
+
+    try:
+        data = json.loads(raw_text)
+    except json.JSONDecodeError:
+        await update.message.reply_text("❌ JSON inválido. Verifique o conteúdo e tente novamente ou envie /cancel.")
+        return ASKING_CONFIG_IMPORT
+
+    if isinstance(data, dict) and 'config' in data:
+        config_payload = data.get('config')
+    else:
+        config_payload = data
+
+    if not isinstance(config_payload, dict):
+        await update.message.reply_text("❌ Estrutura inválida. Esperava um objeto JSON com os campos de configuração.")
+        return ASKING_CONFIG_IMPORT
+
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.telegram_id == update.effective_user.id).first()
+        if not user:
+            await update.message.reply_text("❌ Usuário não encontrado. Use /start para registrar.")
+            return ConversationHandler.END
+        _apply_user_config(user, config_payload)
+        db.commit()
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+        success_text = (
+            "✅ <b>Configurações importadas com sucesso!</b>\n"
+            "Você pode ajustar manualmente qualquer item nas configurações do bot."
+        )
+        if message_id:
+            await context.bot.edit_message_text(
+                chat_id=update.effective_chat.id,
+                message_id=message_id,
+                text=success_text,
+                parse_mode='HTML',
+                reply_markup=info_menu_keyboard()
+            )
+        else:
+            await update.message.reply_text(success_text, parse_mode='HTML', reply_markup=info_menu_keyboard())
+        context.user_data.pop('info_settings_message_id', None)
+        return ConversationHandler.END
+    except Exception as e:
+        db.rollback()
+        logger.error("[config:import] erro: %s", e, exc_info=True)
+        await update.message.reply_text(
+            "❌ Não foi possível importar. Revise o JSON e tente novamente ou envie /cancel."
+        )
+        return ASKING_CONFIG_IMPORT
+    finally:
+        db.close()
+
+
+async def _prompt_bankroll_profile(context, chat_id: int, message_id: int, amount: float) -> None:
+    context.user_data['bankroll_amount'] = amount
+    from_onboarding = bool(context.user_data.get('bankroll_from_onboarding', False))
+    text = (
+        "🎯 <b>Defina o perfil para a banca selecionada</b>\n\n"
+        f"Banca considerada: <b>{_format_currency(amount)}</b>\n"
+        "Escolha abaixo como deseja configurar o bot."
+    )
+    rows = [
+        [InlineKeyboardButton("🟢 Conservador", callback_data='info_bankroll_profile_conservative')],
+        [InlineKeyboardButton("🟠 Moderado", callback_data='info_bankroll_profile_moderate')],
+        [InlineKeyboardButton("🔴 Agressivo", callback_data='info_bankroll_profile_aggressive')],
+    ]
+    if not from_onboarding:
+        rows.append([InlineKeyboardButton("⬅️ Cancelar", callback_data='info_bankroll_cancel')])
+    kb = InlineKeyboardMarkup(rows)
+    await context.bot.edit_message_text(
+        chat_id=chat_id,
+        message_id=message_id,
+        text=text,
+        parse_mode='HTML',
+        reply_markup=kb
+    )
+
+
+async def start_bankroll_wizard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    detected_equity = None
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.telegram_id == query.from_user.id).first()
+        if user and user.api_key_encrypted and user.api_secret_encrypted:
+            try:
+                api_key = decrypt_data(user.api_key_encrypted)
+                api_secret = decrypt_data(user.api_secret_encrypted)
+                account = await get_account_info(api_key, api_secret)
+                if account.get('success'):
+                    detected_equity = float(account.get('data', {}).get('total_equity', 0.0) or 0.0)
+            except Exception as e:
+                logger.warning("[bankroll] falha ao obter saldo detectado: %s", e, exc_info=True)
+    finally:
+        db.close()
+
+    await _send_bankroll_entry_menu(context, query.message.chat.id, detected_equity or 0.0,
+                                    edit_message_id=query.message.message_id,
+                                    from_onboarding=False)
+
+
+async def bankroll_use_detected_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    amount = context.user_data.get('bankroll_detected_equity')
+    message_id = context.user_data.get('bankroll_message_id', query.message.message_id)
+    if not amount or amount <= 0:
+        await query.edit_message_text(
+            "❌ Não foi possível detectar o saldo. Informe o valor manualmente.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Informar valor manual", callback_data='info_bankroll_manual')],
+                [InlineKeyboardButton("⬅️ Voltar", callback_data='info_bankroll_cancel')],
+            ]),
+            parse_mode='HTML'
+        )
+        return
+    await _prompt_bankroll_profile(context, query.message.chat.id, message_id, float(amount))
+
+
+async def bankroll_manual_prompt_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data['bankroll_message_id'] = query.message.message_id
+    context.user_data.pop('bankroll_amount', None)
+    prompt = (
+        "✍️ <b>Informe o valor da sua banca</b>\n"
+        "Envie um número em USDT (ex.: 1250 ou 1250.50).\n\n"
+        "Digite /cancel para desistir."
+    )
+    await query.edit_message_text(prompt, parse_mode='HTML')
+    return ASKING_BANKROLL_AMOUNT
+
+
+async def receive_bankroll_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or '').strip().replace(',', '.')
+    message_id = context.user_data.get('bankroll_message_id')
+    try:
+        amount = float(text)
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Valor inválido. Envie apenas números maiores que zero ou /cancel.")
+        return ASKING_BANKROLL_AMOUNT
+
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+    await _prompt_bankroll_profile(context, update.effective_chat.id, message_id or update.message.message_id, amount)
+    return ConversationHandler.END
+
+
+async def bankroll_profile_choice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    choice = query.data.replace('info_bankroll_profile_', '')
+    amount = float(context.user_data.get('bankroll_amount') or 0.0)
+    if amount <= 0:
+        await query.edit_message_text(
+            "❌ Banca não informada. Reinicie o assistente.",
+            reply_markup=info_menu_keyboard(),
+            parse_mode='HTML'
+        )
+        context.user_data.pop('bankroll_amount', None)
+        return
+
+    recs = _compute_recommendations(amount).get(choice)
+    if not recs:
+        await query.edit_message_text("❌ Perfil inválido.", reply_markup=info_menu_keyboard())
+        return
+
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.telegram_id == query.from_user.id).first()
+        if not user:
+            await query.edit_message_text("❌ Usuário não encontrado.", reply_markup=info_menu_keyboard())
+            return
+        user.entry_size_percent = recs['entry_size_percent']
+        user.max_leverage = recs['max_leverage']
+        user.min_confidence = recs['min_confidence']
+        user.stop_gain_trigger_pct = recs['stop_gain_trigger_pct']
+        user.stop_gain_lock_pct = recs['stop_gain_lock_pct']
+        user.daily_loss_limit = recs['daily_loss_limit']
+        user.daily_profit_target = recs['daily_profit_target']
+        db.commit()
+    finally:
+        db.close()
+
+    label = {
+        'conservative': 'Conservador',
+        'moderate': 'Moderado',
+        'aggressive': 'Agressivo'
+    }.get(choice, choice.title())
+
+    summary = (
+        "✅ <b>Configuração aplicada!</b>\n"
+        f"Perfil escolhido: <b>{label}</b>\n"
+        f"Banca considerada: <b>{_format_currency(amount)}</b>\n\n"
+        f"• Tamanho de Entrada: {recs['entry_size_percent']:.1f}%\n"
+        f"• Alavancagem Máx.: {recs['max_leverage']}x\n"
+        f"• Confiança Mín.: {recs['min_confidence']:.0f}%\n"
+        f"• Stop-Gain: gatilho {recs['stop_gain_trigger_pct']:.2f}% | trava {recs['stop_gain_lock_pct']:.2f}%\n"
+        f"• Limite Diário de Perda: {_format_currency(recs['daily_loss_limit'])}\n"
+        f"• Meta diária de Lucro: {_format_currency(recs['daily_profit_target'])}"
+    )
+
+    context.user_data.pop('bankroll_amount', None)
+    context.user_data.pop('bankroll_detected_equity', None)
+    context.user_data.pop('bankroll_message_id', None)
+
+    from_onboarding = bool(context.user_data.pop('bankroll_from_onboarding', False))
+
+    await query.edit_message_text(
+        summary,
+        parse_mode='HTML',
+        reply_markup=info_menu_keyboard()
+    )
+
+    if from_onboarding:
+        await _send_onboarding_terms(context, query.message.chat.id)
+
+
+async def cancel_bankroll_wizard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data.pop('bankroll_amount', None)
+    context.user_data.pop('bankroll_detected_equity', None)
+    context.user_data.pop('bankroll_message_id', None)
+    context.user_data.pop('bankroll_from_onboarding', None)
+    await query.edit_message_text("ℹ️ Menu de Informações", reply_markup=info_menu_keyboard(), parse_mode='HTML')
+
+
+async def bankroll_manual_config_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    from_onboarding = bool(context.user_data.pop('bankroll_from_onboarding', False))
+    context.user_data.pop('bankroll_detected_equity', None)
+    context.user_data.pop('bankroll_amount', None)
+    context.user_data.pop('bankroll_message_id', None)
+
+    if from_onboarding:
+        db = SessionLocal()
+        try:
+            user = db.query(User).filter(User.telegram_id == query.from_user.id).first()
+            if user:
+                user.entry_size_percent = 0.0
+                user.max_leverage = 0
+                user.min_confidence = 0.0
+                db.commit()
+        finally:
+            db.close()
+
+        await query.edit_message_text(
+            "🛠️ Você optou por ajustar tudo manualmente. Use o menu de configurações para definir cada parâmetro.",
+            parse_mode='HTML',
+            reply_markup=info_menu_keyboard()
+        )
+        await _send_onboarding_terms(context, query.message.chat.id)
+    else:
+        await query.edit_message_text(
+            "🛠️ Ajuste manual: acesse Configurações › Configurações de Trade para definir cada parâmetro da sua forma.",
+            parse_mode='HTML',
+            reply_markup=info_menu_keyboard()
+        )
+
 LEARN_PAGES = [
     (
         "<b>📖 Guia — Introdução</b>\n\n"
@@ -718,8 +1223,13 @@ async def receive_api_secret(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 "Por segurança, o bot inicia PAUSADO. Você pode ativá‑lo no painel."
             ),
         )
-        # Inicia o funil de seleção de modo (conservador/mediano/agressivo/manual)
-        await show_onboarding_risk_options(update, context, total_equity)
+        await _send_bankroll_entry_menu(
+            context,
+            update.effective_user.id,
+            float(total_equity or 0.0),
+            edit_message_id=None,
+            from_onboarding=True,
+        )
     finally:
         db.close()
         # Mantém onboarding_equity, limpa o resto

@@ -33,6 +33,7 @@ from bot.handlers import (
     performance_menu_handler, list_closed_trades_handler,
     prompt_manual_close_handler, execute_manual_close_handler,
     open_settings_root_handler, notifications_settings_handler, refresh_active_messages_handler, open_information_handler,
+    export_settings_handler, ask_import_settings, receive_import_settings, ASKING_CONFIG_IMPORT,
     toggle_cleanup_mode_handler, ask_cleanup_minutes, receive_cleanup_minutes, ASKING_CLEANUP_MINUTES,
     toggle_alert_cleanup_mode_handler, ask_alert_cleanup_minutes, receive_alert_cleanup_minutes, ASKING_ALERT_CLEANUP_MINUTES,
     toggle_bot_status_handler,
@@ -46,6 +47,10 @@ from bot.handlers import (
     ask_adaptive_sl_max, receive_adaptive_sl_max, ASKING_ADAPTIVE_SL_MAX,
     ask_adaptive_sl_tighten, receive_adaptive_sl_tighten, ASKING_ADAPTIVE_SL_TIGHTEN,
     ask_adaptive_sl_timeout, receive_adaptive_sl_timeout, ASKING_ADAPTIVE_SL_TIMEOUT,
+    start_bankroll_wizard_handler, bankroll_use_detected_handler,
+    bankroll_manual_prompt_handler, receive_bankroll_amount, ASKING_BANKROLL_AMOUNT,
+    bankroll_manual_config_handler,
+    bankroll_profile_choice_handler, cancel_bankroll_wizard_handler,
     ask_circuit_threshold, receive_circuit_threshold, ASKING_CIRCUIT_THRESHOLD,
     ask_circuit_pause, receive_circuit_pause, ASKING_CIRCUIT_PAUSE,
     toggle_circuit_scope_handler, toggle_reversal_override_handler,
@@ -305,6 +310,12 @@ async def main():
     # Menus principais do /start consolidado
     application.add_handler(CallbackQueryHandler(open_settings_root_handler, pattern='^open_settings_root$'))
     application.add_handler(CallbackQueryHandler(open_information_handler, pattern='^open_info$'))
+    application.add_handler(CallbackQueryHandler(export_settings_handler, pattern='^info_export_settings$'))
+    application.add_handler(CallbackQueryHandler(start_bankroll_wizard_handler, pattern='^info_bankroll_wizard$'))
+    application.add_handler(CallbackQueryHandler(bankroll_use_detected_handler, pattern='^info_bankroll_use_detected$'))
+    application.add_handler(CallbackQueryHandler(bankroll_profile_choice_handler, pattern='^info_bankroll_profile_'))
+    application.add_handler(CallbackQueryHandler(cancel_bankroll_wizard_handler, pattern='^info_bankroll_cancel$'))
+    application.add_handler(CallbackQueryHandler(bankroll_manual_config_handler, pattern='^info_bankroll_manual_config$'))
     application.add_handler(CallbackQueryHandler(info_learn_start_handler, pattern='^info_learn_start$'))
     application.add_handler(CallbackQueryHandler(info_learn_nav_handler, pattern='^info_learn_nav_'))
     # Fluxo para usuários sem convite
@@ -339,6 +350,12 @@ async def main():
         fallbacks=[CommandHandler("cancel", cancel)], per_message=False, per_user=True,
     )
     application.add_handler(cleanup_minutes_conv)
+    config_import_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(ask_import_settings, pattern='^info_import_settings$')],
+        states={ ASKING_CONFIG_IMPORT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_import_settings)] },
+        fallbacks=[CommandHandler("cancel", cancel)], per_message=False, per_user=True,
+    )
+    application.add_handler(config_import_conv)
     # Alert cleanup
     application.add_handler(CallbackQueryHandler(toggle_alert_cleanup_mode_handler, pattern='^toggle_alert_cleanup_mode$'))
     alert_cleanup_conv = ConversationHandler(
@@ -367,6 +384,13 @@ async def main():
     application.add_handler(CallbackQueryHandler(toggle_ma_filter_handler, pattern='^toggle_ma_filter$'))
     application.add_handler(CallbackQueryHandler(toggle_rsi_filter_handler, pattern='^toggle_rsi_filter$'))
     application.add_handler(ma_period_conv)
+
+    bankroll_manual_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(bankroll_manual_prompt_handler, pattern='^info_bankroll_manual$')],
+        states={ ASKING_BANKROLL_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_bankroll_amount)] },
+        fallbacks=[CommandHandler("cancel", cancel)], per_message=False, per_user=True,
+    )
+    application.add_handler(bankroll_manual_conv)
 
     application.add_handler(CallbackQueryHandler(ask_ma_timeframe, pattern='^ask_ma_timeframe$'))
     application.add_handler(CallbackQueryHandler(set_ma_timeframe, pattern='^set_ma_timeframe_'))
