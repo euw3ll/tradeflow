@@ -69,6 +69,12 @@ def _compute_initial_sl_price(
         if entry_pct > 0 and lev > 0:
             # risk$ = equity * entry_pct * lev * sl_pct  <= equity * risk_pct  => sl_pct <= risk_pct/(entry_pct*lev)
             allowed_pct = risk_pct / (entry_pct * lev)
+        manual_ceiling = Decimal(str(getattr(user, 'adaptive_sl_max_pct', 0) or 0)) / Decimal('100')
+        if manual_ceiling > 0:
+            if allowed_pct is None or allowed_pct <= 0:
+                allowed_pct = manual_ceiling
+            else:
+                allowed_pct = min(allowed_pct, manual_ceiling)
         # fallback: 1% se não computável
         if not allowed_pct or allowed_pct <= 0:
             allowed_pct = Decimal('0.01')

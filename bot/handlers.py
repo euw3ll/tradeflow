@@ -54,6 +54,9 @@ ASKING_PENDING_EXPIRY_MINUTES = 30
 ASKING_INITIAL_SL_FIXED = 31
 ASKING_RISK_PER_TRADE = 32
 ASKING_PROBE_SIZE = 33
+ASKING_ADAPTIVE_SL_MAX = 34
+ASKING_ADAPTIVE_SL_TIGHTEN = 35
+ASKING_ADAPTIVE_SL_TIMEOUT = 36
 
 logger = logging.getLogger(__name__)
 
@@ -2835,6 +2838,204 @@ async def receive_risk_per_trade(update: Update, context: ContextTypes.DEFAULT_T
         except Exception: pass
         await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit, text="Erro ao salvar. Tente novamente.")
         return ASKING_RISK_PER_TRADE
+    finally:
+        db.close()
+    return ConversationHandler.END
+
+
+async def ask_adaptive_sl_max(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data['settings_message_id'] = query.message.message_id
+    await query.edit_message_text(
+        "📏 Envie o <b>teto manual</b> do Stop Adaptativo em % (ex.: 3).\n"
+        "Use <code>0</code> para deixar automático.",
+        parse_mode='HTML'
+    )
+    return ASKING_ADAPTIVE_SL_MAX
+
+
+async def receive_adaptive_sl_max(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message_id_to_edit = context.user_data.get('settings_message_id')
+    text = (update.message.text or "").strip().replace('%', '').replace(',', '.')
+    db = SessionLocal()
+    try:
+        value = float(text)
+        if value < 0 or value > 10:
+            try: await update.message.delete()
+            except Exception: pass
+            await context.bot.edit_message_text(
+                chat_id=update.effective_chat.id,
+                message_id=message_id_to_edit,
+                text="❌ Valor inválido. Informe entre 0 e 10 (ex.: 3)."
+            )
+            return ASKING_ADAPTIVE_SL_MAX
+        user = db.query(User).filter_by(telegram_id=update.effective_user.id).first()
+        if not user:
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit,
+                                                text="Usuário não encontrado. Use /start para registrar.")
+            return ConversationHandler.END
+        user.adaptive_sl_max_pct = value
+        db.commit()
+        try: await update.message.delete()
+        except Exception: pass
+        status = "Automático" if value == 0 else f"{value:.2f}%"
+        header = (
+            "🛑 <b>Stop Inicial</b>\n<i>Defina o SL inicial: Fixo (%) ou Adaptativo (risco por trade).</i>\n\n"
+            f"✅ Teto manual salvo: <b>{status}</b>"
+        )
+        user = db.query(User).filter(User.telegram_id == update.effective_user.id).first()
+        await context.bot.edit_message_text(
+            chat_id=update.effective_chat.id,
+            message_id=message_id_to_edit,
+            text=header,
+            reply_markup=initial_stop_menu_keyboard(user),
+            parse_mode='HTML'
+        )
+    except ValueError:
+        try: await update.message.delete()
+        except Exception: pass
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit,
+                                            text="❌ Não entendi. Envie um número (ex.: 3).")
+        return ASKING_ADAPTIVE_SL_MAX
+    except Exception as e:
+        db.rollback(); logger.error(f"[settings] adaptive_sl_max_pct: {e}", exc_info=True)
+        try: await update.message.delete()
+        except Exception: pass
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit,
+                                            text="Erro ao salvar. Tente novamente.")
+        return ASKING_ADAPTIVE_SL_MAX
+    finally:
+        db.close()
+    return ConversationHandler.END
+
+
+async def ask_adaptive_sl_tighten(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data['settings_message_id'] = query.message.message_id
+    await query.edit_message_text(
+        "🛡️ Envie o <b>corte dinâmico</b> do Stop Adaptativo em % (ex.: 1.5).\n"
+        "Use <code>0</code> para desativar.",
+        parse_mode='HTML'
+    )
+    return ASKING_ADAPTIVE_SL_TIGHTEN
+
+
+async def receive_adaptive_sl_tighten(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message_id_to_edit = context.user_data.get('settings_message_id')
+    text = (update.message.text or "").strip().replace('%', '').replace(',', '.')
+    db = SessionLocal()
+    try:
+        value = float(text)
+        if value < 0 or value > 10:
+            try: await update.message.delete()
+            except Exception: pass
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit,
+                                                text="❌ Valor inválido. Informe entre 0 e 10 (ex.: 1.5).")
+            return ASKING_ADAPTIVE_SL_TIGHTEN
+        user = db.query(User).filter_by(telegram_id=update.effective_user.id).first()
+        if not user:
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit,
+                                                text="Usuário não encontrado. Use /start para registrar.")
+            return ConversationHandler.END
+        user.adaptive_sl_tighten_pct = value
+        db.commit()
+        try: await update.message.delete()
+        except Exception: pass
+        status = "Desativado" if value == 0 else f"{value:.2f}%"
+        header = (
+            "🛑 <b>Stop Inicial</b>\n<i>Defina o SL inicial: Fixo (%) ou Adaptativo (risco por trade).</i>\n\n"
+            f"✅ Corte dinâmico salvo: <b>{status}</b>"
+        )
+        user = db.query(User).filter(User.telegram_id == update.effective_user.id).first()
+        await context.bot.edit_message_text(
+            chat_id=update.effective_chat.id,
+            message_id=message_id_to_edit,
+            text=header,
+            reply_markup=initial_stop_menu_keyboard(user),
+            parse_mode='HTML'
+        )
+    except ValueError:
+        try: await update.message.delete()
+        except Exception: pass
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit,
+                                            text="❌ Não entendi. Envie um número (ex.: 1.5).")
+        return ASKING_ADAPTIVE_SL_TIGHTEN
+    except Exception as e:
+        db.rollback(); logger.error(f"[settings] adaptive_sl_tighten_pct: {e}", exc_info=True)
+        try: await update.message.delete()
+        except Exception: pass
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit,
+                                            text="Erro ao salvar. Tente novamente.")
+        return ASKING_ADAPTIVE_SL_TIGHTEN
+    finally:
+        db.close()
+    return ConversationHandler.END
+
+
+async def ask_adaptive_sl_timeout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data['settings_message_id'] = query.message.message_id
+    await query.edit_message_text(
+        "⏱️ Envie o <b>tempo máximo</b> (minutos) para manter a posição negativa antes do ajuste dinâmico.\n"
+        "Use <code>0</code> para desativar.",
+        parse_mode='HTML'
+    )
+    return ASKING_ADAPTIVE_SL_TIMEOUT
+
+
+async def receive_adaptive_sl_timeout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message_id_to_edit = context.user_data.get('settings_message_id')
+    text = (update.message.text or "").strip()
+    db = SessionLocal()
+    try:
+        value = int(float(text))
+        if value < 0 or value > 720:
+            try: await update.message.delete()
+            except Exception: pass
+            await context.bot.edit_message_text(
+                chat_id=update.effective_chat.id,
+                message_id=message_id_to_edit,
+                text="❌ Valor inválido. Informe entre 0 e 720 minutos."
+            )
+            return ASKING_ADAPTIVE_SL_TIMEOUT
+        user = db.query(User).filter_by(telegram_id=update.effective_user.id).first()
+        if not user:
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit,
+                                                text="Usuário não encontrado. Use /start para registrar.")
+            return ConversationHandler.END
+        user.adaptive_sl_timeout_minutes = value
+        db.commit()
+        try: await update.message.delete()
+        except Exception: pass
+        status = "Desativado" if value == 0 else f"{value} min"
+        header = (
+            "🛑 <b>Stop Inicial</b>\n<i>Defina o SL inicial: Fixo (%) ou Adaptativo (risco por trade).</i>\n\n"
+            f"✅ Tempo máximo negativo salvo: <b>{status}</b>"
+        )
+        user = db.query(User).filter(User.telegram_id == update.effective_user.id).first()
+        await context.bot.edit_message_text(
+            chat_id=update.effective_chat.id,
+            message_id=message_id_to_edit,
+            text=header,
+            reply_markup=initial_stop_menu_keyboard(user),
+            parse_mode='HTML'
+        )
+    except ValueError:
+        try: await update.message.delete()
+        except Exception: pass
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit,
+                                            text="❌ Não entendi. Envie um número inteiro (ex.: 45).")
+        return ASKING_ADAPTIVE_SL_TIMEOUT
+    except Exception as e:
+        db.rollback(); logger.error(f"[settings] adaptive_sl_timeout_minutes: {e}", exc_info=True)
+        try: await update.message.delete()
+        except Exception: pass
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=message_id_to_edit,
+                                            text="Erro ao salvar. Tente novamente.")
+        return ASKING_ADAPTIVE_SL_TIMEOUT
     finally:
         db.close()
     return ConversationHandler.END

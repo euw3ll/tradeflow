@@ -43,6 +43,9 @@ from bot.handlers import (
     show_initial_stop_menu_handler, toggle_initial_sl_mode_handler,
     ask_initial_sl_fixed, receive_initial_sl_fixed, ASKING_INITIAL_SL_FIXED,
     ask_risk_per_trade, receive_risk_per_trade, ASKING_RISK_PER_TRADE,
+    ask_adaptive_sl_max, receive_adaptive_sl_max, ASKING_ADAPTIVE_SL_MAX,
+    ask_adaptive_sl_tighten, receive_adaptive_sl_tighten, ASKING_ADAPTIVE_SL_TIGHTEN,
+    ask_adaptive_sl_timeout, receive_adaptive_sl_timeout, ASKING_ADAPTIVE_SL_TIMEOUT,
     ask_circuit_threshold, receive_circuit_threshold, ASKING_CIRCUIT_THRESHOLD,
     ask_circuit_pause, receive_circuit_pause, ASKING_CIRCUIT_PAUSE,
     toggle_circuit_scope_handler, toggle_reversal_override_handler,
@@ -393,6 +396,24 @@ async def main():
         fallbacks=[CommandHandler("cancel", cancel)], per_message=False, per_user=True,
     )
     application.add_handler(risk_per_trade_conv)
+    adaptive_sl_max_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(ask_adaptive_sl_max, pattern='^ask_adaptive_sl_max$')],
+        states={ ASKING_ADAPTIVE_SL_MAX: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_adaptive_sl_max)] },
+        fallbacks=[CommandHandler("cancel", cancel)], per_message=False, per_user=True,
+    )
+    application.add_handler(adaptive_sl_max_conv)
+    adaptive_sl_tighten_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(ask_adaptive_sl_tighten, pattern='^ask_adaptive_sl_tighten$')],
+        states={ ASKING_ADAPTIVE_SL_TIGHTEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_adaptive_sl_tighten)] },
+        fallbacks=[CommandHandler("cancel", cancel)], per_message=False, per_user=True,
+    )
+    application.add_handler(adaptive_sl_tighten_conv)
+    adaptive_sl_timeout_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(ask_adaptive_sl_timeout, pattern='^ask_adaptive_sl_timeout$')],
+        states={ ASKING_ADAPTIVE_SL_TIMEOUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_adaptive_sl_timeout)] },
+        fallbacks=[CommandHandler("cancel", cancel)], per_message=False, per_user=True,
+    )
+    application.add_handler(adaptive_sl_timeout_conv)
     application.add_handler(CallbackQueryHandler(show_circuit_menu_handler, pattern='^settings_circuit$'))
     application.add_handler(CallbackQueryHandler(toggle_circuit_scope_handler, pattern='^toggle_circuit_scope$'))
     application.add_handler(CallbackQueryHandler(toggle_reversal_override_handler, pattern='^toggle_reversal_override$'))

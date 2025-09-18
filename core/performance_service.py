@@ -6,6 +6,7 @@ from database.models import Trade, User
 from datetime import datetime
 import logging
 import asyncio
+import pytz
 
 logger = logging.getLogger(__name__)
 
@@ -32,22 +33,40 @@ async def generate_performance_report(user_id: int, start_dt: datetime, end_dt: 
         api_key = decrypt_data(user.api_key_encrypted)
         api_secret = decrypt_data(user.api_secret_encrypted)
 
-        # Busca os dados de P/L e o saldo da conta em paralelo
-        pnl_result, account_info, fx_rate = await asyncio.gather(
-            get_closed_pnl_breakdown(api_key, api_secret, start_dt, end_dt),
-            get_account_info(api_key, api_secret),
-            get_usd_to_brl_rate(),
-        )
+        account_task = asyncio.create_task(get_account_info(api_key, api_secret))
+        fx_task = asyncio.create_task(get_usd_to_brl_rate())
 
-        if not pnl_result.get("success"):
-            return f"Não foi possível calcular seu desempenho: {pnl_result.get('error')}"
+        # Primeiro tenta usar os trades consolidados do banco (agregados por posição).
+        start_utc = start_dt.astimezone(pytz.utc) if start_dt.tzinfo else pytz.utc.localize(start_dt)
+        end_utc = end_dt.astimezone(pytz.utc) if end_dt.tzinfo else pytz.utc.localize(end_dt)
 
-        total_pnl = pnl_result["total_pnl"]
-        wins = pnl_result["wins"]
-        losses = pnl_result["losses"]
-        trades = pnl_result["trades"]
+        closed_trades = db.query(Trade).filter(
+            Trade.user_telegram_id == user_id,
+            Trade.closed_at.isnot(None),
+            Trade.closed_at >= start_utc,
+            Trade.closed_at <= end_utc,
+            Trade.status.like('CLOSED%')
+        ).all()
+
+        if closed_trades:
+            total_pnl = sum(float(getattr(t, 'closed_pnl', 0.0) or 0.0) for t in closed_trades)
+            wins = sum(1 for t in closed_trades if float(getattr(t, 'closed_pnl', 0.0) or 0.0) > 0)
+            losses = sum(1 for t in closed_trades if float(getattr(t, 'closed_pnl', 0.0) or 0.0) < 0)
+            trades = len(closed_trades)
+        else:
+            pnl_result = await get_closed_pnl_breakdown(api_key, api_secret, start_dt, end_dt)
+            if not pnl_result.get("success"):
+                return f"Não foi possível calcular seu desempenho: {pnl_result.get('error')}"
+            total_pnl = pnl_result["total_pnl"]
+            wins = pnl_result["wins"]
+            losses = pnl_result["losses"]
+            trades = pnl_result["trades"]
+
         hit_rate = (wins / trades * 100.0) if trades else 0.0
-        
+
+        account_info = await account_task
+        fx_rate = await fx_task
+
         # --- NOVO CÁLCULO DE RENTABILIDADE ---
         rentabilidade_str = ""
         if account_info.get("success"):

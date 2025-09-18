@@ -12,6 +12,7 @@ from services.bybit_service import (
     modify_position_stop_loss, get_order_status,
     get_specific_position_size, modify_position_take_profit,
     get_last_closed_trade_info, get_open_positions_with_pnl,
+    get_historical_klines,
     cancel_order
 )
 from services.notification_service import send_notification, send_user_alert
@@ -376,6 +377,162 @@ async def check_active_trades_for_user(application: Application, user: User, db:
 
     live_pnl_map = {p['symbol']: p for p in (live_pnl_result.get('data') or [])}
 
+    klines_cache: Dict[str, List[float]] = {}
+
+    async def _get_recent_closes(symbol: str) -> Optional[List[float]]:
+        if symbol in klines_cache:
+            return klines_cache[symbol]
+        try:
+            res = await get_historical_klines(symbol, '1', limit=5)
+            if res.get("success"):
+                closes = [float(row[4]) for row in (res.get("data") or []) if len(row) >= 5]
+                if closes:
+                    klines_cache[symbol] = closes
+                    return closes
+        except Exception:
+            logger.exception("[adaptive-sl] falha ao buscar candles recentes para %s", symbol)
+        return None
+
+    async def _apply_dynamic_stop(
+        *,
+        trade: Trade,
+        user: User,
+        current_price: float,
+        effective_entry: float,
+        pnl_pct: float,
+        live_position_size: float,
+        api_key: str,
+        api_secret: str,
+        application,
+    ) -> Tuple[bool, Optional[str]]:
+        tighten_cfg = float(getattr(user, 'adaptive_sl_tighten_pct', 0.0) or 0.0)
+        timeout_minutes = int(getattr(user, 'adaptive_sl_timeout_minutes', 0) or 0)
+        if tighten_cfg <= 0 and timeout_minutes <= 0:
+            return False, None
+        if live_position_size <= 0 or effective_entry <= 0:
+            return False, None
+
+        try:
+            current_sl = float(trade.current_stop_loss) if trade.current_stop_loss is not None else None
+        except Exception:
+            current_sl = None
+
+        distance_pct = None
+        if current_sl and current_sl > 0:
+            try:
+                if trade.side == 'LONG':
+                    distance_pct = max(0.0, ((effective_entry - current_sl) / effective_entry) * 100.0)
+                else:
+                    distance_pct = max(0.0, ((current_sl - effective_entry) / effective_entry) * 100.0)
+            except Exception:
+                distance_pct = None
+
+        desired_pct = tighten_cfg if tighten_cfg > 0 else None
+        if desired_pct is None:
+            if distance_pct is not None and distance_pct > 0:
+                desired_pct = max(distance_pct * 0.5, 0.1)
+            else:
+                desired_pct = 0.5
+        elif distance_pct is not None and distance_pct > 0:
+            desired_pct = min(desired_pct, distance_pct)
+
+        if desired_pct <= 0:
+            return False, None
+
+        should_tighten = False
+        reason = ''
+
+        if tighten_cfg > 0:
+            closes = await _get_recent_closes(trade.symbol)
+            if closes and len(closes) >= 4:
+                if trade.side == 'LONG':
+                    moves = sum(1 for i in range(1, len(closes)) if closes[i] < closes[i - 1])
+                    momentum_bad = moves >= 3 and closes[-1] < closes[0]
+                    if momentum_bad and pnl_pct <= -(desired_pct / 2.0):
+                        should_tighten = True
+                        reason = 'momentum'
+                else:
+                    moves = sum(1 for i in range(1, len(closes)) if closes[i] > closes[i - 1])
+                    momentum_bad = moves >= 3 and closes[-1] > closes[0]
+                    if momentum_bad and pnl_pct <= -(desired_pct / 2.0):
+                        should_tighten = True
+                        reason = 'momentum'
+
+        if not should_tighten and timeout_minutes > 0 and getattr(trade, 'created_at', None):
+            try:
+                created = trade.created_at
+                if created is not None:
+                    if getattr(created, 'tzinfo', None) is None:
+                        created = pytz.utc.localize(created)
+                    from datetime import datetime
+                    now_utc = datetime.utcnow().replace(tzinfo=pytz.utc)
+                    age_minutes = (now_utc - created.astimezone(pytz.utc)).total_seconds() / 60.0
+                    if age_minutes >= timeout_minutes and pnl_pct <= 0.0:
+                        should_tighten = True
+                        reason = 'timeout'
+            except Exception:
+                pass
+
+        if not should_tighten:
+            return False, None
+
+        desired_pct = max(desired_pct, 0.05)
+        if trade.side == 'LONG':
+            new_sl = effective_entry * (1.0 - desired_pct / 100.0)
+            improvement = current_sl is None or new_sl > current_sl + 1e-6
+            valid = new_sl < current_price
+        else:
+            new_sl = effective_entry * (1.0 + desired_pct / 100.0)
+            improvement = current_sl is None or new_sl < current_sl - 1e-6
+            valid = new_sl > current_price
+
+        if not improvement:
+            return False, None
+
+        reason_label = 'Momento' if reason == 'momentum' else 'Tempo'
+
+        if not valid:
+            qty_to_close = float(live_position_size)
+            if qty_to_close <= 0:
+                return False, None
+            position_idx = 1 if trade.side == 'LONG' else 2
+            close_result = await close_partial_position(api_key, api_secret, trade.symbol, qty_to_close, trade.side, position_idx)
+            if close_result.get('success'):
+                remaining = trade.remaining_qty if trade.remaining_qty is not None else trade.qty
+                trade.remaining_qty = max(0.0, (remaining or 0.0) - qty_to_close)
+                await send_user_alert(
+                    application,
+                    user.telegram_id,
+                    (
+                        f"⛔ <b>Stop Dinâmico</b> acionado em <b>{trade.symbol}</b> {trade.side}.\n"
+                        f"Motivo: {reason_label}. Posição fechada antes do SL máximo."
+                    )
+                )
+                logger.info("[adaptive-sl] %s %s fechamento dinâmico qty=%.6f", trade.symbol, trade.side, qty_to_close)
+                return True, "⛔ Corte Dinâmico Executado"
+            logger.error("[adaptive-sl] falha ao fechar %s: %s", trade.symbol, close_result.get('error'))
+            return False, None
+
+        sl_result = await modify_position_stop_loss(api_key, api_secret, trade.symbol, new_sl, reason="adaptive")
+        if sl_result.get('success'):
+            trade.current_stop_loss = new_sl
+            await send_user_alert(
+                application,
+                user.telegram_id,
+                (
+                    f"🛡️ <b>Stop Dinâmico Ajustado</b>\n"
+                    f"Ativo: <b>{trade.symbol}</b> {trade.side}\n"
+                    f"Motivo: {reason_label}\n"
+                    f"Novo SL: <b>{new_sl:.4f}</b>"
+                )
+            )
+            logger.info("[adaptive-sl] %s %s SL ajustado para %.6f (%s)", trade.symbol, trade.side, new_sl, reason_label)
+            return True, "🛡️ Stop Ajustado (Dinâmico)"
+
+        logger.error("[adaptive-sl] falha ao mover SL para %s: %s", trade.symbol, sl_result.get('error'))
+        return False, None
+
+
     be_trigger_pct = float(getattr(user, "be_trigger_pct", 0) or 0.0)
     ts_trigger_pct = float(getattr(user, "ts_trigger_pct", 0) or 0.0)
 
@@ -415,6 +572,28 @@ async def check_active_trades_for_user(application: Application, user: User, db:
 
             # Entrada efetiva (sempre que possível, a entrada atual reportada pela corretora)
             effective_entry = float(position_data.get("entry") or trade.entry_price or 0.0)
+
+            dyn_changed, dyn_status = await _apply_dynamic_stop(
+                trade=trade,
+                user=user,
+                current_price=current_price,
+                effective_entry=effective_entry,
+                pnl_pct=pnl_pct,
+                live_position_size=live_position_size,
+                api_key=api_key,
+                api_secret=api_secret,
+                application=application,
+            )
+
+            if dyn_changed:
+                message_was_edited = True
+                if dyn_status and not status_title_update:
+                    status_title_update = dyn_status
+                if dyn_status and dyn_status.startswith("⛔"):
+                    pnl_data_for_msg = live_pnl_map.get(trade.symbol)
+                    msg_text = _generate_trade_status_message(trade, status_title_update, pnl_data_for_msg, current_price)
+                    await _send_or_edit_trade_message(application, user, trade, db, msg_text)
+                    continue
 
             # --- Stop-Gain com degraus (ladder) ---
             sg_trig = float(getattr(user, 'stop_gain_trigger_pct', 0) or 0.0)
@@ -1065,6 +1244,19 @@ async def confirm_and_close_trade(
             lines.append(f"• Saída: <b>{_fmt_money(exit_price)}</b>")
         if pnl is not None:
             lines.append(f"• P/L: <b>{_fmt_money_signed(pnl)}</b>")
+        total_tps = int(getattr(trade, "total_initial_targets", 0) or 0)
+        if total_tps > 0:
+            remaining_tps = len(getattr(trade, "initial_targets", []) or [])
+            hit_tps = max(0, total_tps - remaining_tps)
+            if hit_tps >= total_tps:
+                tp_status = "todos os alvos concluídos"
+            elif hit_tps > 0:
+                tp_status = "parciais executados"
+            else:
+                tp_status = "nenhum alvo"
+            lines.append(
+                f"• Alvos: <b>{hit_tps}/{total_tps}</b> ({tp_status})"
+            )
         if closed_at_val:
             # Tenta converter para America/Sao_Paulo
             from datetime import datetime

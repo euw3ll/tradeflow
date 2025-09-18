@@ -98,6 +98,9 @@ def initial_stop_menu_keyboard(user) -> InlineKeyboardMarkup:
         mode_text = "Modo: Adaptativo (Risco por Trade)"
     fixed_pct = float(getattr(user, 'initial_sl_fixed_pct', 1.0) or 1.0)
     risk_pct = float(getattr(user, 'risk_per_trade_pct', 1.0) or 1.0)
+    max_manual = float(getattr(user, 'adaptive_sl_max_pct', 0.0) or 0.0)
+    tighten_pct = float(getattr(user, 'adaptive_sl_tighten_pct', 0.0) or 0.0)
+    timeout_min = int(getattr(user, 'adaptive_sl_timeout_minutes', 0) or 0)
 
     try:
         entry_pct = float(getattr(user, 'entry_size_percent', 0) or 0) / 100.0
@@ -117,6 +120,21 @@ def initial_stop_menu_keyboard(user) -> InlineKeyboardMarkup:
         else:
             label = f"Risco por Trade: {risk_pct:.2f}% (SL máx ~ —)"
         kb.append([InlineKeyboardButton(label, callback_data='ask_risk_per_trade')])
+
+        if max_manual > 0:
+            manual_label = f"SL Máx Manual: {max_manual:.2f}%"
+        else:
+            manual_label = "SL Máx Manual: Automático"
+        kb.append([InlineKeyboardButton(manual_label, callback_data='ask_adaptive_sl_max')])
+
+        if tighten_pct > 0:
+            tighten_label = f"Corte Dinâmico: {tighten_pct:.2f}%"
+        else:
+            tighten_label = "Corte Dinâmico: Desativado"
+        kb.append([InlineKeyboardButton(tighten_label, callback_data='ask_adaptive_sl_tighten')])
+
+        timeout_label = "Tempo Máx. Negativo: Desativado" if timeout_min <= 0 else f"Tempo Máx. Negativo: {timeout_min} min"
+        kb.append([InlineKeyboardButton(timeout_label, callback_data='ask_adaptive_sl_timeout')])
     kb.append([InlineKeyboardButton("⬅️ Voltar", callback_data='back_to_settings_menu')])
     return InlineKeyboardMarkup(kb)
 
