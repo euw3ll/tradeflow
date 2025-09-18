@@ -25,7 +25,7 @@ from bot.handlers import (
     ask_ma_period, receive_ma_period, ASKING_MA_PERIOD,
     admin_menu, list_channels_handler, select_channel_to_monitor, select_topic_to_monitor,
     admin_view_targets_handler, back_to_admin_menu_handler,
-    bot_config_handler, toggle_approval_mode_handler, handle_signal_approval, 
+    bot_config_handler, bot_general_settings_handler, toggle_approval_mode_handler, handle_signal_approval, 
     ask_profit_target, receive_profit_target, ASKING_PROFIT_TARGET,
     ask_loss_limit, receive_loss_limit, ASKING_LOSS_LIMIT, 
     ask_pending_expiry, receive_pending_expiry, ASKING_PENDING_EXPIRY_MINUTES,
@@ -33,7 +33,7 @@ from bot.handlers import (
     performance_menu_handler, list_closed_trades_handler,
     prompt_manual_close_handler, execute_manual_close_handler,
     open_settings_root_handler, notifications_settings_handler, refresh_active_messages_handler, open_information_handler,
-    export_settings_handler, ask_import_settings, receive_import_settings, ASKING_CONFIG_IMPORT,
+    settings_presets_menu_handler, export_settings_handler, ask_import_settings, receive_import_settings, ASKING_CONFIG_IMPORT,
     toggle_cleanup_mode_handler, ask_cleanup_minutes, receive_cleanup_minutes, ASKING_CLEANUP_MINUTES,
     toggle_alert_cleanup_mode_handler, ask_alert_cleanup_minutes, receive_alert_cleanup_minutes, ASKING_ALERT_CLEANUP_MINUTES,
     toggle_bot_status_handler,
@@ -310,11 +310,13 @@ async def main():
     # Menus principais do /start consolidado
     application.add_handler(CallbackQueryHandler(open_settings_root_handler, pattern='^open_settings_root$'))
     application.add_handler(CallbackQueryHandler(open_information_handler, pattern='^open_info$'))
-    application.add_handler(CallbackQueryHandler(export_settings_handler, pattern='^info_export_settings$'))
-    application.add_handler(CallbackQueryHandler(start_bankroll_wizard_handler, pattern='^info_bankroll_wizard$'))
+    application.add_handler(CallbackQueryHandler(settings_presets_menu_handler, pattern='^settings_presets$'))
+    application.add_handler(CallbackQueryHandler(export_settings_handler, pattern='^(info_export_settings|settings_presets_export)$'))
+    application.add_handler(CallbackQueryHandler(start_bankroll_wizard_handler, pattern='^(info_bankroll_wizard|settings_presets_bankroll)$'))
     application.add_handler(CallbackQueryHandler(bankroll_use_detected_handler, pattern='^info_bankroll_use_detected$'))
     application.add_handler(CallbackQueryHandler(bankroll_profile_choice_handler, pattern='^info_bankroll_profile_'))
     application.add_handler(CallbackQueryHandler(cancel_bankroll_wizard_handler, pattern='^info_bankroll_cancel$'))
+    application.add_handler(CallbackQueryHandler(bankroll_manual_config_handler, pattern='^info_bankroll_manual_config$'))
     application.add_handler(CallbackQueryHandler(bankroll_manual_config_handler, pattern='^info_bankroll_manual_config$'))
     application.add_handler(CallbackQueryHandler(info_learn_start_handler, pattern='^info_learn_start$'))
     application.add_handler(CallbackQueryHandler(info_learn_nav_handler, pattern='^info_learn_nav_'))
@@ -340,9 +342,10 @@ async def main():
     application.add_handler(CallbackQueryHandler(list_closed_trades_handler, pattern='^list_closed_trades$'))
 
     application.add_handler(CallbackQueryHandler(bot_config_handler, pattern='^bot_config$'))
+    application.add_handler(CallbackQueryHandler(bot_general_settings_handler, pattern='^bot_config_submenu_general$'))
     application.add_handler(CallbackQueryHandler(toggle_approval_mode_handler, pattern='^toggle_approval_mode$'))
     # Notificações
-    application.add_handler(CallbackQueryHandler(notifications_settings_handler, pattern='^notifications_settings$'))
+    application.add_handler(CallbackQueryHandler(notifications_settings_handler, pattern='^(notifications_settings|bot_config_notifications)$'))
     application.add_handler(CallbackQueryHandler(toggle_cleanup_mode_handler, pattern='^toggle_cleanup_mode$'))
     cleanup_minutes_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(ask_cleanup_minutes, pattern='^ask_cleanup_minutes$')],
@@ -351,7 +354,7 @@ async def main():
     )
     application.add_handler(cleanup_minutes_conv)
     config_import_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(ask_import_settings, pattern='^info_import_settings$')],
+        entry_points=[CallbackQueryHandler(ask_import_settings, pattern='^(info_import_settings|settings_presets_import)$')],
         states={ ASKING_CONFIG_IMPORT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_import_settings)] },
         fallbacks=[CommandHandler("cancel", cancel)], per_message=False, per_user=True,
     )

@@ -23,6 +23,7 @@ from .keyboards import (
     invite_welcome_keyboard, invite_info_keyboard,
     onboarding_risk_keyboard, onboarding_terms_keyboard,
     settings_root_keyboard, notifications_menu_keyboard, info_menu_keyboard,
+    presets_menu_keyboard, bot_settings_keyboard,
     initial_stop_menu_keyboard,
     tp_presets_keyboard,
 )
@@ -373,6 +374,21 @@ async def open_settings_root_handler(update: Update, context: ContextTypes.DEFAU
         reply_markup=settings_root_keyboard()
     )
 
+async def settings_presets_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Exibe menu com opções de exportação/importação e assistentes."""
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        text=(
+            "⚡ <b>Padrões & Assistentes</b>\n\n"
+            "• Exporte suas configurações atuais para backup ou compartilhamento.\n"
+            "• Importe um JSON previamente salvo para aplicar um conjunto completo.\n"
+            "• Use o assistente por banca para aplicar rapidamente perfis conservador, moderado ou agressivo."
+        ),
+        parse_mode='HTML',
+        reply_markup=presets_menu_keyboard()
+    )
+
 async def notifications_settings_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Abre a seção de Configurações de Notificações."""
     query = update.callback_query
@@ -393,10 +409,10 @@ async def notifications_settings_handler(update: Update, context: ContextTypes.D
 
     await query.edit_message_text(
         text=(
-            "🔔 <b>Configurações de Notificações</b>\n\n"
-            "• Fechados: <b>" + mode_human + "</b>\n"
-            "• Alertas gerais: <b>" + alert_human + "</b>\n"
-            "• Dica: mensagens ativas podem ser recriadas abaixo."
+            "🔔 <b>Notificações</b>\n\n"
+            f"• Fechados: <b>{mode_human}</b>\n"
+            f"• Alertas: <b>{alert_human}</b>\n\n"
+            "Use as opções abaixo para ajustar os tempos ou recriar mensagens."
         ),
         parse_mode='HTML',
         reply_markup=notifications_menu_keyboard(user)
@@ -679,7 +695,7 @@ async def export_settings_handler(update: Update, context: ContextTypes.DEFAULT_
     await query.edit_message_text(
         "📤 <b>Exportação de Configurações</b>\nCopie o JSON abaixo para salvar ou importar posteriormente.",
         parse_mode='HTML',
-        reply_markup=info_menu_keyboard()
+        reply_markup=presets_menu_keyboard()
     )
     await query.message.reply_text(f"<code>{escaped}</code>", parse_mode='HTML')
 
@@ -739,10 +755,10 @@ async def receive_import_settings(update: Update, context: ContextTypes.DEFAULT_
                 message_id=message_id,
                 text=success_text,
                 parse_mode='HTML',
-                reply_markup=info_menu_keyboard()
+                reply_markup=presets_menu_keyboard()
             )
         else:
-            await update.message.reply_text(success_text, parse_mode='HTML', reply_markup=info_menu_keyboard())
+            await update.message.reply_text(success_text, parse_mode='HTML', reply_markup=presets_menu_keyboard())
         context.user_data.pop('info_settings_message_id', None)
         return ConversationHandler.END
     except Exception as e:
@@ -922,7 +938,7 @@ async def bankroll_profile_choice_handler(update: Update, context: ContextTypes.
     await query.edit_message_text(
         summary,
         parse_mode='HTML',
-        reply_markup=info_menu_keyboard()
+        reply_markup=presets_menu_keyboard()
     )
 
     if from_onboarding:
@@ -935,8 +951,12 @@ async def cancel_bankroll_wizard_handler(update: Update, context: ContextTypes.D
     context.user_data.pop('bankroll_amount', None)
     context.user_data.pop('bankroll_detected_equity', None)
     context.user_data.pop('bankroll_message_id', None)
-    context.user_data.pop('bankroll_from_onboarding', None)
-    await query.edit_message_text("ℹ️ Menu de Informações", reply_markup=info_menu_keyboard(), parse_mode='HTML')
+    from_onboarding = bool(context.user_data.pop('bankroll_from_onboarding', None))
+    if from_onboarding:
+        await query.edit_message_text("Configuração manual selecionada.", reply_markup=presets_menu_keyboard(), parse_mode='HTML')
+        await _send_onboarding_terms(context, query.message.chat.id)
+    else:
+        await query.edit_message_text("⚡ Padrões & Assistentes", reply_markup=presets_menu_keyboard(), parse_mode='HTML')
 
 
 async def bankroll_manual_config_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -963,14 +983,14 @@ async def bankroll_manual_config_handler(update: Update, context: ContextTypes.D
         await query.edit_message_text(
             "🛠️ Você optou por ajustar tudo manualmente. Use o menu de configurações para definir cada parâmetro.",
             parse_mode='HTML',
-            reply_markup=info_menu_keyboard()
+            reply_markup=presets_menu_keyboard()
         )
         await _send_onboarding_terms(context, query.message.chat.id)
     else:
         await query.edit_message_text(
             "🛠️ Ajuste manual: acesse Configurações › Configurações de Trade para definir cada parâmetro da sua forma.",
             parse_mode='HTML',
-            reply_markup=info_menu_keyboard()
+            reply_markup=presets_menu_keyboard()
         )
 
 LEARN_PAGES = [
@@ -2426,18 +2446,37 @@ async def execute_manual_close_handler(update: Update, context: ContextTypes.DEF
 
 
 async def bot_config_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Exibe o menu de configuração do bot com o modo de aprovação atual."""
+    """Menu principal das configurações do bot (toggle + submenus)."""
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
-    
+
     db = SessionLocal()
     try:
         user = get_user_by_id(user_id)
         if user:
             await query.edit_message_text(
                 "<b>🤖 Configuração do Bot</b>\n\n"
-                "Ajuste o comportamento geral do bot.",
+                "Ligue/desligue o bot e acesse os submenus abaixo.",
+                parse_mode='HTML',
+                reply_markup=bot_settings_keyboard(user)
+            )
+    finally:
+        db.close()
+
+
+async def bot_general_settings_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Submenu de preferências gerais (aprovação, metas, pendentes)."""
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+
+    db = SessionLocal()
+    try:
+        user = get_user_by_id(user_id)
+        if user:
+            await query.edit_message_text(
+                "<b>⚙️ Preferências do Bot</b>\n\nAjuste aprovação, metas diárias e expiração de pendentes.",
                 parse_mode='HTML',
                 reply_markup=bot_config_keyboard(user)
             )
@@ -2455,17 +2494,13 @@ async def toggle_approval_mode_handler(update: Update, context: ContextTypes.DEF
         user = db.query(User).filter(User.telegram_id == user_id).first()
         
         if user:
-            if user.approval_mode == 'AUTOMATIC':
-                user.approval_mode = 'MANUAL'
-            else:
-                user.approval_mode = 'AUTOMATIC'
-            
+            user.approval_mode = 'MANUAL' if user.approval_mode == 'AUTOMATIC' else 'AUTOMATIC'
+
             db.commit() 
-            
+
             try:
                 await query.edit_message_text(
-                    "<b>🤖 Configuração do Bot</b>\n\n"
-                    "Ajuste o comportamento geral do bot.",
+                    "<b>⚙️ Preferências do Bot</b>\n\nAjuste aprovação, metas diárias e expiração de pendentes.",
                     parse_mode='HTML',
                     reply_markup=bot_config_keyboard(user)
                 )
@@ -3085,9 +3120,9 @@ async def toggle_bot_status_handler(update: Update, context: ContextTypes.DEFAUL
         # Re-renderiza a tela de Configuração do Bot (toggle foi movido para lá)
         try:
             await query.edit_message_text(
-                text="<b>🤖 Configuração do Bot</b>\n\nAjuste o comportamento geral do bot.",
+                text="<b>🤖 Configuração do Bot</b>\n\nLigue/desligue o bot e acesse os submenus abaixo.",
                 parse_mode='HTML',
-                reply_markup=bot_config_keyboard(user)
+                reply_markup=bot_settings_keyboard(user)
             )
         except BadRequest as e:
             logger.warning(f"Falha ao atualizar menu do bot após toggle: {e}")

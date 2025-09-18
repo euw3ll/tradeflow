@@ -195,44 +195,25 @@ def circuit_menu_keyboard(user) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(kb)
 
 def bot_config_keyboard(user_settings):
-    """
-    Retorna o teclado para o menu de configuração do bot, mostrando o modo de aprovação e as metas.
-    """
-    # Botão de Modo de Aprovação (lógica existente)
-    mode = user_settings.approval_mode
-    if mode == 'AUTOMATIC':
-        approval_button_text = "Entrada de Sinais: Automático ⚡"
-    else:
-        approval_button_text = "Entrada de Sinais: Manual 👋"
+    """Submenu de preferências gerais do bot (sem toggle)."""
+    mode = getattr(user_settings, 'approval_mode', 'AUTOMATIC')
+    approval_button_text = "Entrada de Sinais: Automático ⚡" if mode == 'AUTOMATIC' else "Entrada de Sinais: Manual 👋"
 
-    # --- NOVOS BOTÕES DE METAS ---
-    # Formata a meta de lucro para exibição
-    profit_target = user_settings.daily_profit_target
+    profit_target = float(getattr(user_settings, 'daily_profit_target', 0) or 0)
     profit_text = f"Meta de Lucro Diária: ${profit_target:.2f}" if profit_target > 0 else "Meta de Lucro Diária: Desativada"
 
-    # Formata o limite de perda para exibição
-    loss_limit = user_settings.daily_loss_limit
+    loss_limit = float(getattr(user_settings, 'daily_loss_limit', 0) or 0)
     loss_text = f"Limite de Perda Diário: ${loss_limit:.2f}" if loss_limit > 0 else "Limite de Perda Diário: Desativado"
 
-    # Status do bot (3 estados)
-    if not user_settings.is_active:
-        bot_toggle_text = "Bot: Pausado ⏸️"
-    elif user_settings.is_active and not user_settings.is_sleep_mode_enabled:
-        bot_toggle_text = "Bot: Ativo ☀️"
-    else:
-        bot_toggle_text = "Bot: Ativo com Modo Dormir 😴"
-
-    # Expiração de pendentes
     pend_exp = int(getattr(user_settings, 'pending_expiry_minutes', 0) or 0)
     pend_text = f"⏱️ Expirar Pendentes: {pend_exp} min" if pend_exp > 0 else "⏱️ Expirar Pendentes: Desativado"
 
     keyboard = [
-        [InlineKeyboardButton(bot_toggle_text, callback_data='toggle_bot_status')],
         [InlineKeyboardButton(approval_button_text, callback_data='toggle_approval_mode')],
         [InlineKeyboardButton(pend_text, callback_data='set_pending_expiry')],
         [InlineKeyboardButton(profit_text, callback_data='set_profit_target')],
         [InlineKeyboardButton(loss_text, callback_data='set_loss_limit')],
-        [InlineKeyboardButton("⬅️ Voltar", callback_data='open_settings_root')]
+        [InlineKeyboardButton("⬅️ Voltar", callback_data='bot_config')]
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -369,17 +350,31 @@ def settings_root_keyboard() -> InlineKeyboardMarkup:
     kb = [
         [InlineKeyboardButton("⚙️ Configurações de Trade", callback_data='user_settings')],
         [InlineKeyboardButton("🤖 Configuração do Bot", callback_data='bot_config')],
-        [InlineKeyboardButton("🔔 Configurações de Notificações", callback_data='notifications_settings')],
+        [InlineKeyboardButton("⚡ Padrões & Assistentes", callback_data='settings_presets')],
         [InlineKeyboardButton("⬅️ Voltar", callback_data='back_to_main_menu')],
     ]
     return InlineKeyboardMarkup(kb)
 
+def bot_settings_keyboard(user=None) -> InlineKeyboardMarkup:
+    is_active = bool(getattr(user, 'is_active', False)) if user else False
+    toggle_label = "🟢 Bot Ativo (toque para alternar)" if is_active else "🔴 Bot Pausado (toque para ativar)"
+    notify_mode = getattr(user, 'msg_cleanup_mode', 'OFF') if user else 'OFF'
+    notify_delay = int(getattr(user, 'msg_cleanup_delay_minutes', 30) or 30) if user else 30
+    notify_alert_mode = getattr(user, 'alert_cleanup_mode', 'OFF') if user else 'OFF'
+    notify_alert_delay = int(getattr(user, 'alert_cleanup_delay_minutes', 30) or 30) if user else 30
+    notify_text = 'Desativada' if notify_mode == 'OFF' else ('Após ' + str(notify_delay) + ' min' if notify_mode == 'AFTER' else 'Fim do dia')
+    alert_text = 'Desativada' if notify_alert_mode == 'OFF' else ('Após ' + str(notify_alert_delay) + ' min' if notify_alert_mode == 'AFTER' else 'Fim do dia')
+
+    kb = [
+        [InlineKeyboardButton(toggle_label, callback_data='toggle_bot_status', )],
+        [InlineKeyboardButton("⚙️ Preferências Gerais", callback_data='bot_config_submenu_general')],
+        [InlineKeyboardButton(f"🔔 Notificações: {notify_text} / {alert_text}", callback_data='bot_config_notifications')],
+        [InlineKeyboardButton("⬅️ Voltar", callback_data='open_settings_root')],
+    ]
+    return InlineKeyboardMarkup(kb)
+
 def notifications_menu_keyboard(user=None) -> InlineKeyboardMarkup:
-    """Menu de Configurações de Notificações.
-    Mostra e permite ajustar:
-      - Limpeza das mensagens de trades FECHADOS
-      - Limpeza das mensagens de ALERTA (avisos/erros)
-    """
+    """Menu de Configurações de Notificações dentro do submenu do bot."""
     mode = getattr(user, 'msg_cleanup_mode', 'OFF') if user is not None else 'OFF'
     delay = int(getattr(user, 'msg_cleanup_delay_minutes', 30) or 30) if user is not None else 30
 
@@ -405,17 +400,25 @@ def notifications_menu_keyboard(user=None) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(alert_text, callback_data='toggle_alert_cleanup_mode')],
         [InlineKeyboardButton("⏱️ Minutos (alertas)", callback_data='ask_alert_cleanup_minutes')],
         [InlineKeyboardButton("♻️ Recriar mensagens ativas", callback_data='refresh_active_messages')],
-        [InlineKeyboardButton("⬅️ Voltar", callback_data='open_settings_root')],
+        [InlineKeyboardButton("⬅️ Voltar", callback_data='bot_config')],
     ]
     return InlineKeyboardMarkup(kb)
 
 def info_menu_keyboard() -> InlineKeyboardMarkup:
     """Menu para a seção Informações (status + aprender)."""
     kb = [
-        [InlineKeyboardButton("📤 Exportar Configurações", callback_data='info_export_settings')],
-        [InlineKeyboardButton("📥 Importar Configurações", callback_data='info_import_settings')],
-        [InlineKeyboardButton("🎛️ Ajustar pela Banca", callback_data='info_bankroll_wizard')],
         [InlineKeyboardButton("📖 Quero aprender", callback_data='info_learn_start')],
         [InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data='back_to_main_menu')],
+    ]
+    return InlineKeyboardMarkup(kb)
+
+
+def presets_menu_keyboard() -> InlineKeyboardMarkup:
+    """Menu para exportar/importar e usar assistentes de configuração."""
+    kb = [
+        [InlineKeyboardButton("📤 Exportar Configurações", callback_data='settings_presets_export')],
+        [InlineKeyboardButton("📥 Importar Configurações", callback_data='settings_presets_import')],
+        [InlineKeyboardButton("🎛️ Assistente por Banca", callback_data='settings_presets_bankroll')],
+        [InlineKeyboardButton("⬅️ Voltar", callback_data='open_settings_root')],
     ]
     return InlineKeyboardMarkup(kb)
