@@ -357,7 +357,13 @@ def settings_root_keyboard() -> InlineKeyboardMarkup:
 
 def bot_settings_keyboard(user=None) -> InlineKeyboardMarkup:
     is_active = bool(getattr(user, 'is_active', False)) if user else False
-    toggle_label = "🟢 Bot Ativo (toque para alternar)" if is_active else "🔴 Bot Pausado (toque para ativar)"
+    sleep_enabled = bool(getattr(user, 'is_sleep_mode_enabled', False)) if user else False
+    if not is_active:
+        toggle_label = "🔴 Bot Pausado (toque para ativar)"
+    elif sleep_enabled:
+        toggle_label = "🌙 Bot Ativo (Modo Dormir)"
+    else:
+        toggle_label = "🟢 Bot Ativo (24h)"
     notify_mode = getattr(user, 'msg_cleanup_mode', 'OFF') if user else 'OFF'
     notify_delay = int(getattr(user, 'msg_cleanup_delay_minutes', 30) or 30) if user else 30
     notify_alert_mode = getattr(user, 'alert_cleanup_mode', 'OFF') if user else 'OFF'
