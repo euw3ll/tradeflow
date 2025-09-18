@@ -13,7 +13,7 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision: str = 'c12345d6789a'
-down_revision: Union[str, Sequence[str], None] = '9e2a1f3c7a10'
+down_revision: Union[str, Sequence[str], None] = 'cb01_add_circuit_breaker_fields'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
@@ -34,4 +34,3 @@ def downgrade() -> None:
     op.drop_column('users', 'adaptive_sl_timeout_minutes')
     op.drop_column('users', 'adaptive_sl_tighten_pct')
     op.drop_column('users', 'adaptive_sl_max_pct')
-
