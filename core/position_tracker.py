@@ -28,6 +28,21 @@ logger = logging.getLogger(__name__)
 # chave: trade.id, valor: {"sync_notified": bool}
 _SYNC_CACHE = {}
 
+
+async def _safe_delete_message(application: Application, chat_id: int, message_id: Optional[int]) -> None:
+    if not message_id:
+        return
+    try:
+        await application.bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except BadRequest as e:
+        msg = str(e).lower()
+        if "message to delete not found" in msg or "message can't be deleted" in msg:
+            logger.debug("[pending:delete] mensagem já removida (chat=%s id=%s)", chat_id, message_id)
+        else:
+            logger.warning("[pending:delete] falha ao remover mensagem %s/%s: %s", chat_id, message_id, e)
+    except Exception:
+        logger.exception("[pending:delete] erro inesperado ao remover mensagem %s/%s", chat_id, message_id)
+
 def _compute_tp_distribution(strategy: str, total_tps: int) -> list[float]:
     """Gera uma distribuição de percentuais (soma 100) para N TPs.
     Suporta:
@@ -201,6 +216,7 @@ async def check_pending_orders_for_user(application: Application, user: User, db
                 await cancel_order(api_key, api_secret, order.order_id, order.symbol)
             except Exception as e:
                 logger.error(f"[tracker:OFF] Exceção ao cancelar {order.order_id} ({order.symbol}): {e}", exc_info=True)
+            await _safe_delete_message(application, user.telegram_id, getattr(order, 'notification_message_id', None))
             db.delete(order)
         db.commit()
         logger.info(f"[tracker:OFF] PendingSignals do usuário {user.telegram_id} cancelados/limpos.")
@@ -220,6 +236,7 @@ async def check_pending_orders_for_user(application: Application, user: User, db
         status_upper = order_status.upper() if order_status else ""
         if status_upper in ("CANCELLED", "CANCELED", "REJECTED", "EXPIRED", "DEACTIVATED"):
             logger.info(f"[pending:cleanup] Removendo {order.order_id} ({order.symbol}) com status={order_status}.")
+            await _safe_delete_message(application, user.telegram_id, getattr(order, 'notification_message_id', None))
             db.delete(order)
             await send_user_alert(application, user.telegram_id,
                                   f"ℹ️ Sua ordem limite para <b>{order.symbol}</b> não está mais aberta (status: {order_status}). Removida da lista de pendentes.")
@@ -250,6 +267,7 @@ async def check_pending_orders_for_user(application: Application, user: User, db
                             await cancel_order(api_key, api_secret, order.order_id, order.symbol)
                         except Exception:
                             logger.exception(f"[pending:expire] Falha ao cancelar {order.order_id} ({order.symbol})")
+                        await _safe_delete_message(application, user.telegram_id, getattr(order, 'notification_message_id', None))
                         db.delete(order)
                         await send_user_alert(application, user.telegram_id,
                                               f"⌛ Sua ordem limite para <b>{order.symbol}</b> foi expirada após {int(age_min)} min.")

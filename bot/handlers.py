@@ -1798,6 +1798,11 @@ async def pending_positions_handler(update: Update, context: ContextTypes.DEFAUL
                     # Remove da lista local se estiver cancelada/expirada/rejeitada ou totalmente executada
                     status_upper = status_raw.upper() if status_raw else ""
                     if status_upper in ("CANCELLED", "CANCELED", "REJECTED", "EXPIRED", "DEACTIVATED"):
+                        if getattr(p, 'notification_message_id', None):
+                            try:
+                                await context.bot.delete_message(chat_id=user_id, message_id=p.notification_message_id)
+                            except BadRequest:
+                                pass
                         db.delete(p)
                         cleaned_any = True
                         await send_user_alert(context.application, user_id,
@@ -1805,6 +1810,11 @@ async def pending_positions_handler(update: Update, context: ContextTypes.DEFAUL
                         continue
                     if status_upper == "FILLED":
                         # Será promovida pelo tracker; não exibir aqui
+                        if getattr(p, 'notification_message_id', None):
+                            try:
+                                await context.bot.delete_message(chat_id=user_id, message_id=p.notification_message_id)
+                            except BadRequest:
+                                pass
                         db.delete(p)
                         cleaned_any = True
                         continue
@@ -1920,6 +1930,11 @@ async def execute_cancel_pending_handler(update: Update, context: ContextTypes.D
                 await query.edit_message_text(f"❌ Falha ao cancelar: {resp.get('error', 'erro desconhecido')}\nTente novamente.")
                 return
 
+        if getattr(p, 'notification_message_id', None):
+            try:
+                await context.bot.delete_message(chat_id=user_id, message_id=p.notification_message_id)
+            except BadRequest:
+                pass
         db.delete(p)
         db.commit()
 
