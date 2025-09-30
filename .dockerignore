@@ -1,0 +1,10 @@
+.env
+data/
+logs/
+postgres_data/
+__pycache__/
+*.pyc
+.git/
+.github/
+tests/
+*.sqlite

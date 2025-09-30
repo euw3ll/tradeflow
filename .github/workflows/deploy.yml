@@ -1,54 +1,62 @@
-# Nome do Workflow que aparecerá na aba "Actions" do GitHub
-name: Deploy Tradeflow to VPS
+name: Deploy TradeFlow
 
-# Gatilho: Este workflow roda a cada push na branch 'main'
 on:
   push:
-    branches:
-      - main
+    branches: ["main"]
+  workflow_dispatch: {}
 
-# Tarefas que o workflow irá executar
 jobs:
   deploy:
-    # O sistema operacional que o robô do GitHub usará
     runs-on: ubuntu-latest
-
-    # Passos a serem executados
     steps:
-      - name: Deploy to VPS via SSH
-        # Usa uma Action pronta da comunidade para SSH
-        uses: appleboy/ssh-action@v1.0.3
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup SSH Agent
+        uses: webfactory/ssh-agent@v0.9.0
         with:
-          # Usa os segredos que você configurou
-          host: ${{ secrets.VPS_HOST }}
-          username: ${{ secrets.VPS_USER }}
-          key: ${{ secrets.VPS_SSH_PRIVATE_KEY }}
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
 
-          # Script com os comandos a serem executados na VPS
-          script: |
-            set -euo pipefail
-            # Navega para a pasta da aplicação
-            cd /srv/apps/tradeflow
+      - name: Add VPS to known_hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -p "${{ secrets.SSH_PORT }}" "${{ secrets.SSH_HOST }}" >> ~/.ssh/known_hosts
 
-            echo "==> Atualizando o código-fonte..."
-            git fetch origin
-            git reset --hard origin/main
+      - name: Rsync repository to VPS
+        run: |
+          rsync -az --delete \
+            --exclude '.git/' \
+            --exclude '.github/' \
+            --exclude '.env' \
+            --exclude 'data/' \
+            --exclude 'logs/' \
+            --exclude 'postgres_data/' \
+            --exclude '__pycache__/' \
+            ./ ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/opt/tradeflow/
 
-            # --- SEÇÃO ADICIONADA ---
-            echo "==> Gerando informações do commit para o bot..."
-            SHA=$(git rev-parse HEAD)
-            DATE=$(date -u +"%Y-%m-%d %H:%M:%S%z")
-            MSG=$(git log -1 --pretty=%B | tr -d '\r')
-            printf "%s\n%s\n%s\n" "$SHA" "$DATE" "$MSG" > COMMIT_INFO
+      - name: Remote compose up
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+        run: |
+          ssh -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" <<'EOF'
+          set -euo pipefail
+          cd /opt/tradeflow
+          if [ ! -f .env ]; then
+            echo "[ERROR] /opt/tradeflow/.env não existe na VPS" >&2
+            exit 1
+          fi
+          mkdir -p logs
+          chmod +x start.sh || true
+          docker compose pull || true
+          docker compose build --pull
+          docker compose up -d
+          docker image prune -f || true
+          EOF
 
-            echo "==> Parando e removendo contêineres antigos para evitar conflitos..."
-            sudo docker-compose down --remove-orphans
-
-            echo "==> Reconstruindo e reiniciando os serviços..."
-            sudo docker-compose up -d --build
-
-            echo "==> Limpando imagens Docker antigas..."
-            sudo docker image prune -af
-
-            echo "==> Verificando serviços ativos..."
-            sudo docker-compose ps
+    # Requer Secrets no repositório:
+    # - SSH_HOST (ex.: 72.60.159.107)
+    # - SSH_PORT (ex.: 22)
+    # - SSH_USER (ex.: deploy)
+    # - SSH_PRIVATE_KEY (chave privada correspondente à pública na VPS)
