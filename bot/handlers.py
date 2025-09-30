@@ -2053,12 +2053,8 @@ async def admin_create_invite_handler(update: Update, context: ContextTypes.DEFA
     try:
         db.add(InviteCode(code=code, is_used=False))
         db.commit()
-        text = (
-            "<b>🎟️ Código de Convite criado</b>\n\n"
-            f"Use este código no /start: <code>{code}</code>\n\n"
-            "Dica: encaminhe ao usuário e apague após uso."
-        )
-        await query.edit_message_text(text=text, parse_mode='HTML', reply_markup=admin_menu_keyboard())
+        # Exibe somente o código gerado (uso único; será marcado como usado ao ser aceito no /start)
+        await query.edit_message_text(text=f"<code>{code}</code>", parse_mode='HTML', reply_markup=admin_menu_keyboard())
     except Exception as e:
         db.rollback()
         logger.error(f"[admin] Falha ao criar convite: {e}")
