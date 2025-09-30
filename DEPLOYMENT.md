@@ -1,5 +1,9 @@
 TradeFlow — Implantação na VPS
 
+Versão atual
+- TradeFlow v1.0.0 (2025-09-30)
+- Escopo: bot Telegram em produção (polling), Postgres via Docker Compose, deploy automatizado (GitHub Actions), utilidades /admin (criar convite, listar canais/tópicos com botão Voltar, ver alvos ativos).
+
 Visão geral
 - VPS: Ubuntu 24.04 (Hostinger KVM1)
 - Proxy reverso: Traefik v3 em /opt/traefik (TLS Let’s Encrypt HTTP‑01)
@@ -19,18 +23,26 @@ Como o serviço roda
 - Restart policy: always (como no compose original)
 - Persistência: volume bind ./data -> /data no serviço "bot" para guardar tradeflow_user.session
 
+Funcionalidades administrativas (v1.0.0)
+- Menu /admin (somente ADMIN_TELEGRAM_ID):
+  - 📡 Listar Grupos/Canais → agora com “⬅️ Voltar ao Menu Admin”.
+  - 🎟️ Criar Código de Convite (gera e salva InviteCode e exibe no chat).
+  - 👁️ Ver Alvos Ativos (canais/tópicos monitorados).
+
 Variáveis de ambiente (.env em /opt/tradeflow)
-- POSTGRES_USER=tradeflow
-- POSTGRES_PASSWORD=<senha-forte>
-- POSTGRES_DB=tradeflow
 - TELEGRAM_BOT_TOKEN=<token do bot>
+- ADMIN_TELEGRAM_ID=<id numérico do admin>
+- ERROR_CHANNEL_ID=<opcional: chat id para erros>
+- ENCRYPTION_KEY=<Fernet urlsafe base64 de 44 chars>
 - API_ID=<api id do Telegram>
 - API_HASH=<api hash>
-- ADMIN_TELEGRAM_ID=<id numérico do admin>
-- ERROR_CHANNEL_ID=0 (ou um chat id para erros)
-- ENCRYPTION_KEY=<chave gerada: python -c 'from cryptography.fernet import Fernet;print(Fernet.generate_key().decode())'>
+- POSTGRES_USER=tradeflow_user
+- POSTGRES_PASSWORD=<senha URL‑safe>
+- POSTGRES_DB=tradeflow_db
+- LOGS_DIR=logs
 - MIGRATIONS_MAX_TRIES=20
 - MIGRATIONS_RETRY_SLEEP=3
+- (fora do compose) DATABASE_URL=postgresql://USER:PASS@localhost:5432/DB
 
 Deploy automático (GitHub Actions)
 - Workflow: .github/workflows/deploy.yml
@@ -77,3 +89,14 @@ Comandos úteis
 - Recriar apenas o bot: `docker compose up -d --build bot`
 - Limpar imagens antigas: `docker image prune -f`
 - Acessar shell do bot: `docker exec -it tradeflow_bot bash` (ou `sh` na imagem slim)
+
+Como visualizar/copiar o .env da VPS
+- Exibir no terminal: `ssh deploy@SEU_IP "sed -n '1,200p' /opt/tradeflow/.env"`
+- Copiar para local: `scp deploy@SEU_IP:/opt/tradeflow/.env ./tradeflow.env.vps`
+- Conferir variáveis em execução: `docker exec tradeflow_bot env | egrep 'TELEGRAM|API_|ENCRYPTION|POSTGRES|DATABASE_URL'`
+
+Release v1.0.0 — Resumo
+- Infra: Postgres 15-alpine; bot Python 3.12; Alembic no boot com retries.
+- Segurança: senha Postgres URL‑safe; ENCRYPTION_KEY válida na VPS; .env não versionado.
+- Operação: deploy por GitHub Actions (rsync + compose up -d); sessão Telethon persistida em /opt/tradeflow/data.
+- Admin: criar código de convite no /admin; listagem com botão Voltar; visualizar alvos ativos.
