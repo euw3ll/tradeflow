@@ -234,7 +234,7 @@ async def _send_bankroll_entry_menu(context: ContextTypes.DEFAULT_TYPE, chat_id:
         context.user_data['bankroll_message_id'] = msg.message_id
 
 
-async def _send_onboarding_terms(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+async def _send_onboarding_terms(context: ContextTypes.DEFAULT_TYPE, chat_id: int, *, edit_message_id: Optional[int] = None) -> None:
     terms = (
         "📜 Termo de Responsabilidade\n\n"
         "• Este bot NÃO promete ganhos e NÃO garante resultados.\n"
@@ -243,7 +243,15 @@ async def _send_onboarding_terms(context: ContextTypes.DEFAULT_TYPE, chat_id: in
         "• Monitoramos fontes de alta qualidade, mas risco sempre existe.\n\n"
         "Para concluir a ativação do app, confirme que você leu e concorda."
     )
-    await context.bot.send_message(chat_id=chat_id, text=terms, reply_markup=onboarding_terms_keyboard())
+    if edit_message_id:
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=edit_message_id,
+            text=terms,
+            reply_markup=onboarding_terms_keyboard()
+        )
+    else:
+        await context.bot.send_message(chat_id=chat_id, text=terms, reply_markup=onboarding_terms_keyboard())
 
 # ---- helpers (resumos no topo dos submenus) ----
 def _risk_summary(user) -> str:
@@ -370,14 +378,10 @@ async def open_settings_root_handler(update: Update, context: ContextTypes.DEFAU
     """Abre o menu raiz de Configurações consolidado."""
     query = update.callback_query
     await query.answer()
-    try:
-        await query.message.delete()
-    except Exception:
-        pass
-    msg = await context.bot.send_message(chat_id=query.message.chat_id,
-                                         text="⚙️ Configurações",
-                                         reply_markup=settings_root_keyboard())
-    context.user_data['last_menu_msg_id'] = getattr(msg, 'message_id', None)
+    await query.edit_message_text(
+        text="⚙️ Configurações",
+        reply_markup=settings_root_keyboard()
+    )
 
 async def settings_presets_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Exibe menu com opções de exportação/importação e assistentes."""
@@ -1471,7 +1475,7 @@ def _compute_recommendations(equity: float) -> dict:
         "aggressive":   rec(10.0, 20, 55.0, 3.0, 1.0, 5.0, 2.0),
     }
 
-async def show_onboarding_risk_options(update: Update, context: ContextTypes.DEFAULT_TYPE, equity: float):
+async def show_onboarding_risk_options(update: Update, context: ContextTypes.DEFAULT_TYPE, equity: float, *, edit_message_id: Optional[int] = None):
     chat_id = update.effective_user.id
     recs = _compute_recommendations(equity)
     # Lê algumas configs atuais do usuário para exibir
@@ -1514,7 +1518,16 @@ async def show_onboarding_risk_options(update: Update, context: ContextTypes.DEF
         "Você pode alterar tudo depois em Configurações.\n\n"
         "Ou escolha <b>Configuração Manual</b> para ajustar do zero."
     )
-    await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='HTML', reply_markup=onboarding_risk_keyboard())
+    if edit_message_id:
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=edit_message_id,
+            text=msg,
+            parse_mode='HTML',
+            reply_markup=onboarding_risk_keyboard()
+        )
+    else:
+        await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='HTML', reply_markup=onboarding_risk_keyboard())
 
 async def onboard_select_preset_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Aplica o preset escolhido (ou manual) e mostra os termos."""
@@ -1584,22 +1597,16 @@ async def onboard_risk_back_handler(update: Update, context: ContextTypes.DEFAUL
     """Volta para a seleção de perfis de risco durante o onboarding."""
     query = update.callback_query
     await query.answer()
-    try:
-        await query.message.delete()
-    except Exception:
-        pass
     equity = float(context.user_data.get('onboarding_equity') or 0.0)
-    await show_onboarding_risk_options(update, context, equity)
+    # Reaproveita a mesma mensagem, sem perder a posição no chat
+    await show_onboarding_risk_options(update, context, equity, edit_message_id=query.message.message_id)
 
 async def onboard_risk_confirm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Confirma o perfil escolhido e exibe os termos de responsabilidade."""
     query = update.callback_query
     await query.answer()
-    try:
-        await query.message.delete()
-    except Exception:
-        pass
-    await _send_onboarding_terms(context, query.message.chat.id)
+    # Edita a própria mensagem para mostrar os termos
+    await _send_onboarding_terms(context, query.message.chat.id, edit_message_id=query.message.message_id)
 
 # --- FLUXO DE REMOÇÃO DE API ---
 async def remove_api_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -2063,21 +2070,32 @@ async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Você não tem permissão para usar este comando.")
         return
 
-    # Limpa a mensagem do comando e último menu, se houver
+    # Limpa a mensagem do comando; mantém o menu anterior e edita-o se possível
     try:
         if getattr(update, 'message', None):
             await update.message.delete()
     except Exception:
         pass
     last_id = context.user_data.get('last_menu_msg_id')
-    try:
-        if last_id:
-            await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=last_id)
-    except Exception:
-        pass
-    msg = await context.bot.send_message(chat_id=update.effective_chat.id,
-                                         text="Bem-vindo ao painel de administração.",
-                                         reply_markup=admin_menu_keyboard())
+    if last_id:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=update.effective_chat.id,
+                message_id=last_id,
+                text="Bem-vindo ao painel de administração.",
+                reply_markup=admin_menu_keyboard()
+            )
+            # Mantém o mesmo message_id
+            context.user_data['last_menu_msg_id'] = last_id
+            return
+        except Exception:
+            # Cai para criar uma nova mensagem
+            pass
+    msg = await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="Bem-vindo ao painel de administração.",
+        reply_markup=admin_menu_keyboard()
+    )
     context.user_data['last_menu_msg_id'] = getattr(msg, 'message_id', None)
 
 async def admin_create_invite_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2136,15 +2154,10 @@ async def back_to_admin_menu_handler(update: Update, context: ContextTypes.DEFAU
     """Retorna o usuário para o menu de administração principal."""
     query = update.callback_query
     await query.answer()
-    
-    try:
-        await query.message.delete()
-    except Exception:
-        pass
-    msg = await context.bot.send_message(chat_id=query.message.chat_id,
-                                         text="Bem-vindo ao painel de administração.",
-                                         reply_markup=admin_menu_keyboard())
-    context.user_data['last_menu_msg_id'] = getattr(msg, 'message_id', None)
+    await query.edit_message_text(
+        text="Bem-vindo ao painel de administração.",
+        reply_markup=admin_menu_keyboard()
+    )
 
 async def list_channels_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Coloca um pedido na fila para listar os grupos e canais do usuário."""
@@ -2156,18 +2169,14 @@ async def list_channels_handler(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text("Erro: Fila de comunicação não encontrada.")
         return
     
-    # Remove o menu anterior e cria placeholder novo
-    try:
-        await query.message.delete()
-    except Exception:
-        pass
-    placeholder = await context.bot.send_message(chat_id=query.message.chat_id,
-                                                 text="Buscando sua lista de canais... Se você tiver muitos grupos, isso pode levar até um minuto. Por favor, aguarde.")
-    context.user_data['last_menu_msg_id'] = getattr(placeholder, 'message_id', None)
+    # Edita a mensagem atual para placeholder sem perder a posição
+    await query.edit_message_text(
+        text="Buscando sua lista de canais... Se você tiver muitos grupos, isso pode levar até um minuto. Por favor, aguarde."
+    )
     request_data = {
         "action": "list_channels",
         "chat_id": query.message.chat_id,
-        "message_id": placeholder.message_id,
+        "message_id": query.message.message_id,
     }
     await comm_queue.put(request_data)
     
@@ -2190,17 +2199,12 @@ async def select_channel_to_monitor(update: Update, context: ContextTypes.DEFAUL
                 channel_name = button.text.replace(" ✅", "")
                 break
 
-    # Limpa a mensagem e cria placeholder
-    try:
-        await query.message.delete()
-    except Exception:
-        pass
-    placeholder = await context.bot.send_message(chat_id=query.message.chat_id, text="Processando...")
-    context.user_data['last_menu_msg_id'] = getattr(placeholder, 'message_id', None)
+    # Edita a mensagem atual para placeholder sem perder a posição
+    await query.edit_message_text(text="Processando...")
     request_data = {
         "action": "list_topics",
         "chat_id": query.message.chat_id,
-        "message_id": placeholder.message_id,
+        "message_id": query.message.message_id,
         "channel_id": channel_id,
         "channel_name": channel_name
     }
