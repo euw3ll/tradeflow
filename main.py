@@ -64,6 +64,7 @@ from bot.handlers import (
     show_tp_strategy_menu_handler, ask_tp_distribution, receive_tp_distribution, ASKING_TP_DISTRIBUTION,
     cycle_tp_preset_handler,
     onboard_select_preset_handler, onboard_accept_terms_handler, onboard_decline_terms_handler,
+    onboard_risk_back_handler, onboard_risk_confirm_handler,
     info_learn_start_handler, info_learn_nav_handler,
 )
 from services.telethon_service import start_signal_monitor
@@ -425,6 +426,8 @@ async def main():
     application.add_handler(CallbackQueryHandler(onboard_select_preset_handler, pattern='^onboard_risk_'))
     application.add_handler(CallbackQueryHandler(onboard_accept_terms_handler, pattern='^onboard_accept_terms$'))
     application.add_handler(CallbackQueryHandler(onboard_decline_terms_handler, pattern='^onboard_decline_terms$'))
+    application.add_handler(CallbackQueryHandler(onboard_risk_back_handler, pattern='^onboard_risk_back$'))
+    application.add_handler(CallbackQueryHandler(onboard_risk_confirm_handler, pattern='^onboard_risk_confirm$'))
 
     application.add_handler(CallbackQueryHandler(show_risk_menu_handler, pattern='^settings_risk$'))
     application.add_handler(CallbackQueryHandler(show_stopgain_menu_handler, pattern='^settings_stopgain$'))

@@ -940,14 +940,18 @@ async def bankroll_profile_choice_handler(update: Update, context: ContextTypes.
 
     from_onboarding = bool(context.user_data.pop('bankroll_from_onboarding', False))
 
-    await query.edit_message_text(
-        summary,
-        parse_mode='HTML',
-        reply_markup=presets_menu_keyboard()
-    )
-
     if from_onboarding:
-        await _send_onboarding_terms(context, query.message.chat.id)
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ Voltar", callback_data='onboard_risk_back')],
+            [InlineKeyboardButton("✅ Confirmar", callback_data='onboard_risk_confirm')],
+        ])
+        await query.edit_message_text(summary, parse_mode='HTML', reply_markup=kb)
+    else:
+        await query.edit_message_text(
+            summary,
+            parse_mode='HTML',
+            reply_markup=presets_menu_keyboard()
+        )
 
 
 async def cancel_bankroll_wizard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1575,6 +1579,27 @@ async def onboard_decline_terms_handler(update: Update, context: ContextTypes.DE
     await query.answer()
     await query.edit_message_text(
         "Você precisa aceitar o termo para concluir a configuração. Você pode voltar ao /start quando quiser.")
+
+async def onboard_risk_back_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Volta para a seleção de perfis de risco durante o onboarding."""
+    query = update.callback_query
+    await query.answer()
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+    equity = float(context.user_data.get('onboarding_equity') or 0.0)
+    await show_onboarding_risk_options(update, context, equity)
+
+async def onboard_risk_confirm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Confirma o perfil escolhido e exibe os termos de responsabilidade."""
+    query = update.callback_query
+    await query.answer()
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+    await _send_onboarding_terms(context, query.message.chat.id)
 
 # --- FLUXO DE REMOÇÃO DE API ---
 async def remove_api_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
