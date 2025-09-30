@@ -104,41 +104,25 @@ logging.getLogger("telegram").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 async def run_ptb(application: Application, queue: asyncio.Queue):
-    """Inicializa e roda a aplicação python-telegram-bot.
+    """Inicializa e inicia o polling do PTB dentro do nosso event loop.
 
-    Compatível com múltiplas versões do PTB:
-    - v22+: usa run_polling()
-    - v20/v21: fallback para initialize/start e start_polling()/updater.start_polling()
+    Importante: NÃO usa run_polling(), pois esse método gerencia/fecha o
+    event loop internamente e conflita com nosso asyncio.gather.
     """
     application.bot_data['comm_queue'] = queue
     logger.info("Inicializando o bot do Telegram (PTB)...")
-    # Preferência: API moderna com run_polling (bloqueante)
-    try:
-        # Algumas versões aceitam parâmetros; chamamos sem argumentos por compatibilidade
-        await application.run_polling()
-        logger.info("✅ Bot do Telegram (PTB) ativo (run_polling).")
-        return
-    except AttributeError:
-        # Versões antigas não possuem run_polling(); caímos no modo manual
-        logger.info("PTB sem run_polling(); iniciando via initialize/start...")
-    except TypeError:
-        # Assinatura inesperada; tenta caminho antigo
-        logger.info("Assinatura inesperada de run_polling(); iniciando via initialize/start...")
-
-    # Fallback compatível com releases que mantêm start/start_polling
     await application.initialize()
     await application.start()
-    # Tenta start_polling diretamente no Application
     try:
-        start_polling = getattr(application, 'start_polling', None)
-        if callable(start_polling):
-            await start_polling()
+        # PTB com método start_polling direto
+        if callable(getattr(application, 'start_polling', None)):
+            await application.start_polling()  # type: ignore[attr-defined]
         else:
-            # Último recurso: usar o objeto updater, se existir
+            # PTB com .updater.start_polling()
             await application.updater.start_polling()  # type: ignore[attr-defined]
-        logger.info("✅ Bot do Telegram (PTB) ativo (start_polling).")
+        logger.info("✅ Bot do Telegram (PTB) ativo.")
     except Exception as e:
-        logger.critical(f"Falha ao iniciar o polling do PTB: {e}", exc_info=True)
+        logger.critical(f"Falha ao iniciar polling do PTB: {e}", exc_info=True)
         raise
 
 async def on_error(update: Update, context: ContextTypes.DEFAULT_TYPE):
