@@ -17,7 +17,7 @@ def main_menu_keyboard(telegram_id: int):
         keyboard.append([InlineKeyboardButton("ℹ️ Informações", callback_data='open_info')])
     else:
         keyboard.append([InlineKeyboardButton("⚙️ Configurar API Bybit", callback_data='config_api')])
-        keyboard.append([InlineKeyboardButton("ℹ️ Informações", callback_data='open_info')])
+        # Sem botão de informações quando o usuário ainda não configurou a API
 
     return InlineKeyboardMarkup(keyboard)
 
