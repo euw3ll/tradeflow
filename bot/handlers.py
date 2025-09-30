@@ -311,7 +311,7 @@ async def show_no_invite_info_handler(update: Update, context: ContextTypes.DEFA
         "• Você mantém o controle total: ajuste alavancagem, tamanho, filtros e metas no app.\n\n"
         "Acesso e convites\n\n"
         "• No momento, o acesso é somente com convite.\n"
-        "• Para pedir acesso, fale com um membro da comunidade ou aguarde novas vagas.\n\n"
+        "• Para pedir acesso, fale com @euw3ll.\n\n"
         "Se já tiver um convite, clique abaixo para ativá-lo."
     )
     await query.edit_message_text(text, reply_markup=invite_info_keyboard())
@@ -332,7 +332,8 @@ async def enter_invite_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     """Inicia a coleta do código de convite via callback, mudando para o estado WAITING_CODE."""
     query = update.callback_query
     await query.answer()
-    await query.edit_message_text("Perfeito! Envie seu código de convite nesta conversa.")
+    # Responde em uma nova mensagem para evitar falhas de edição de mensagens antigas
+    await query.message.reply_text("Perfeito! Envie seu código de convite nesta conversa.")
     return WAITING_CODE
 
 async def receive_invite_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
