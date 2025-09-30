@@ -10,9 +10,6 @@ COPY requirements.txt .
 # Instala as dependências do Python
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copia o arquivo de sessão do Telethon para o container
-COPY tradeflow_user.session .
-
 # Copia todo o resto do código do projeto
 COPY . .
 

@@ -12,7 +12,7 @@ Visão geral
 
 Diretórios
 - Código do TradeFlow: /opt/tradeflow
-- Sessão do bot: persistida em /opt/tradeflow/data (montada em /data no container)
+- Sessão do bot: persistida em /opt/tradeflow/data/tradeflow_user.session (montada em /data no container)
 - Logs da aplicação: por padrão ficam dentro do container; caso queira persistir, mapeie /app/logs para /opt/tradeflow/logs
 - Dados do Postgres: volume docker nomeado tradeflow_postgres_data
 
@@ -66,7 +66,7 @@ Operações comuns
 
 Backup
 - Banco: docker exec tradeflow_db pg_dump -U $POSTGRES_USER $POSTGRES_DB > /opt/tradeflow/backup_$(date +%F).sql
-- Sessão do Telethon: tradeflow_user.session (mantida no repositório nesta opção). Sugestão futura: mover para /opt/tradeflow/data e montar volume.
+- Sessão do Telethon: copie /opt/tradeflow/data/tradeflow_user.session para um local seguro.
 
 Segurança
 - UFW limita portas a 22/80/443; Fail2ban ativo

@@ -16,11 +16,9 @@ from .signal_parser import parse_signal
 
 logger = logging.getLogger(__name__)
 
-# --- LÓGICA DE CAMINHO DINÂMICO ---
-if os.path.isdir('/data'):
-    SESSION_PATH = '/data/tradeflow_user'
-else:
-    SESSION_PATH = 'tradeflow_user'
+# --- CAMINHO DA SESSÃO (único) ---
+# A sessão do Telethon é SEMPRE lida de /data para evitar divergências.
+SESSION_PATH = '/data/tradeflow_user'
 
 # --- DEFINIÇÃO ÚNICA E CORRETA DO CLIENTE ---
 client = TelegramClient(SESSION_PATH, API_ID, API_HASH)
@@ -255,28 +253,30 @@ async def start_signal_monitor(queue: asyncio.Queue):
     # Recebe a aplicação PTB para poder enviar alertas ao admin
     ptb_app = await queue.get()
 
-    # Conecta e valida sessão existente
-    await client.connect()
-    try:
-        authorized = await client.is_user_authorized()
-    except Exception:
-        authorized = False
-    if not authorized:
-        session_file = f"{SESSION_PATH}.session"
-        logger.critical(
-            "Sessão Telethon ausente ou inválida em %s. Gere via scripts/generate_session.py "
-            "e monte o arquivo no volume /data (nome base 'tradeflow_user').", session_file
-        )
+    # Loop de espera até a sessão ser autorizada; alerta o admin apenas 1 vez.
+    alerted = False
+    while True:
+        await client.connect()
         try:
-            await send_error_report(ptb_app, (
-                "⚠️ <b>Telethon inativo</b>\n"
-                f"Sessão ausente ou inválida em <code>{session_file}</code>.\n"
-                "Gere localmente com <code>scripts/generate_session.py</code> e envie para /opt/tradeflow/data."
-            ))
+            authorized = await client.is_user_authorized()
         except Exception:
-            pass
-        # Não derruba o app: seguimos sem o monitor Telethon
-        return
+            authorized = False
+        if authorized:
+            break
+        session_file = f"{SESSION_PATH}.session"
+        msg = (
+            "⚠️ <b>Telethon inativo</b>\n"
+            f"Sessão ausente/ inválida em <code>{session_file}</code>.\n"
+            "Gere com <code>scripts/generate_session.py</code> usando o mesmo API_ID/API_HASH e envie para /opt/tradeflow/data."
+        )
+        logger.critical("Sessão Telethon não autorizada: %s", session_file)
+        if not alerted:
+            try:
+                await send_error_report(ptb_app, msg)
+            except Exception:
+                pass
+            alerted = True
+        await asyncio.sleep(30)
 
 
     logger.info("✅ Monitor de sinais e processador de fila ativos.")
