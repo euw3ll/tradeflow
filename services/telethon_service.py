@@ -157,7 +157,7 @@ async def queue_processor(queue: asyncio.Queue, ptb_app: Application):
                 db = SessionLocal()
                 monitored_channels_ids = {target.channel_id for target in db.query(MonitoredTarget).all()}
                 db.close()
-                keyboard = []
+                keyboard = [[InlineKeyboardButton("⬅️ Voltar ao Menu Admin", callback_data="back_to_admin_menu")]]
                 
                 if channels:
                     for channel_name, channel_id in channels:

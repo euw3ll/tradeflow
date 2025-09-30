@@ -330,6 +330,7 @@ async def main():
     
     application.add_handler(CommandHandler("admin", admin_menu))
     application.add_handler(CallbackQueryHandler(list_channels_handler, pattern='^admin_list_channels$'))
+    application.add_handler(CallbackQueryHandler(admin_create_invite_handler, pattern='^admin_create_invite$'))
     application.add_handler(CallbackQueryHandler(select_channel_to_monitor, pattern='^monitor_channel_'))
     application.add_handler(CallbackQueryHandler(select_topic_to_monitor, pattern='^monitor_topic_'))
     application.add_handler(CallbackQueryHandler(admin_view_targets_handler, pattern='^admin_view_targets$'))

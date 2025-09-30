@@ -2038,6 +2038,33 @@ async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=admin_menu_keyboard()
     )
 
+async def admin_create_invite_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gera e mostra um novo código de convite (somente ADMIN)."""
+    query = update.callback_query
+    await query.answer()
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    import secrets, string
+    alphabet = string.ascii_uppercase + string.digits
+    code = ''.join(secrets.choice(alphabet) for _ in range(8))
+
+    db = SessionLocal()
+    try:
+        db.add(InviteCode(code=code, is_used=False))
+        db.commit()
+        text = (
+            "<b>🎟️ Código de Convite criado</b>\n\n"
+            f"Use este código no /start: <code>{code}</code>\n\n"
+            "Dica: encaminhe ao usuário e apague após uso."
+        )
+        await query.edit_message_text(text=text, parse_mode='HTML', reply_markup=admin_menu_keyboard())
+    except Exception as e:
+        db.rollback()
+        logger.error(f"[admin] Falha ao criar convite: {e}")
+        await query.edit_message_text("Falha ao criar convite.", reply_markup=admin_menu_keyboard())
+    finally:
+        db.close()
 
 async def admin_view_targets_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Busca e exibe a lista de todos os canais e tópicos sendo monitorados."""

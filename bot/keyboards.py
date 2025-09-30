@@ -49,6 +49,7 @@ def admin_menu_keyboard():
     """Retorna o teclado do menu de administrador."""
     keyboard = [
         [InlineKeyboardButton("📡 Listar Grupos/Canais", callback_data='admin_list_channels')],
+        [InlineKeyboardButton("🎟️ Criar Código de Convite", callback_data='admin_create_invite')],
         # --- NOVO BOTÃO ---
         [InlineKeyboardButton("👁️ Ver Alvos Ativos", callback_data='admin_view_targets')]
     ]
