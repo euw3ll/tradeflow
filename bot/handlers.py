@@ -370,10 +370,14 @@ async def open_settings_root_handler(update: Update, context: ContextTypes.DEFAU
     """Abre o menu raiz de Configurações consolidado."""
     query = update.callback_query
     await query.answer()
-    await query.edit_message_text(
-        text="⚙️ Configurações",
-        reply_markup=settings_root_keyboard()
-    )
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+    msg = await context.bot.send_message(chat_id=query.message.chat_id,
+                                         text="⚙️ Configurações",
+                                         reply_markup=settings_root_keyboard())
+    context.user_data['last_menu_msg_id'] = getattr(msg, 'message_id', None)
 
 async def settings_presets_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Exibe menu com opções de exportação/importação e assistentes."""
@@ -2034,10 +2038,22 @@ async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Você não tem permissão para usar este comando.")
         return
 
-    await update.message.reply_text(
-        "Bem-vindo ao painel de administração.",
-        reply_markup=admin_menu_keyboard()
-    )
+    # Limpa a mensagem do comando e último menu, se houver
+    try:
+        if getattr(update, 'message', None):
+            await update.message.delete()
+    except Exception:
+        pass
+    last_id = context.user_data.get('last_menu_msg_id')
+    try:
+        if last_id:
+            await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=last_id)
+    except Exception:
+        pass
+    msg = await context.bot.send_message(chat_id=update.effective_chat.id,
+                                         text="Bem-vindo ao painel de administração.",
+                                         reply_markup=admin_menu_keyboard())
+    context.user_data['last_menu_msg_id'] = getattr(msg, 'message_id', None)
 
 async def admin_create_invite_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Gera e mostra um novo código de convite (somente ADMIN)."""
@@ -2096,10 +2112,14 @@ async def back_to_admin_menu_handler(update: Update, context: ContextTypes.DEFAU
     query = update.callback_query
     await query.answer()
     
-    await query.edit_message_text(
-        "Bem-vindo ao painel de administração.",
-        reply_markup=admin_menu_keyboard()
-    )
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+    msg = await context.bot.send_message(chat_id=query.message.chat_id,
+                                         text="Bem-vindo ao painel de administração.",
+                                         reply_markup=admin_menu_keyboard())
+    context.user_data['last_menu_msg_id'] = getattr(msg, 'message_id', None)
 
 async def list_channels_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Coloca um pedido na fila para listar os grupos e canais do usuário."""
@@ -2111,15 +2131,20 @@ async def list_channels_handler(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text("Erro: Fila de comunicação não encontrada.")
         return
     
+    # Remove o menu anterior e cria placeholder novo
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+    placeholder = await context.bot.send_message(chat_id=query.message.chat_id,
+                                                 text="Buscando sua lista de canais... Se você tiver muitos grupos, isso pode levar até um minuto. Por favor, aguarde.")
+    context.user_data['last_menu_msg_id'] = getattr(placeholder, 'message_id', None)
     request_data = {
         "action": "list_channels",
         "chat_id": query.message.chat_id,
-        "message_id": query.message.message_id,
+        "message_id": placeholder.message_id,
     }
-    
     await comm_queue.put(request_data)
-    
-    await query.edit_message_text("Buscando sua lista de canais... Se você tiver muitos grupos, isso pode levar até um minuto. Por favor, aguarde.")
     
 async def select_channel_to_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Coloca um pedido na fila para listar tópicos (ou gerenciar um canal plano)."""
@@ -2140,16 +2165,21 @@ async def select_channel_to_monitor(update: Update, context: ContextTypes.DEFAUL
                 channel_name = button.text.replace(" ✅", "")
                 break
 
+    # Limpa a mensagem e cria placeholder
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+    placeholder = await context.bot.send_message(chat_id=query.message.chat_id, text="Processando...")
+    context.user_data['last_menu_msg_id'] = getattr(placeholder, 'message_id', None)
     request_data = {
         "action": "list_topics",
         "chat_id": query.message.chat_id,
-        "message_id": query.message.message_id,
+        "message_id": placeholder.message_id,
         "channel_id": channel_id,
         "channel_name": channel_name
     }
-    
     await comm_queue.put(request_data)
-    await query.edit_message_text("Processando...")
 
 async def select_topic_to_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Salva/remove o tópico e pede para a fila recarregar o menu de tópicos."""
