@@ -25,6 +25,7 @@ from bot.handlers import (
     ask_ma_period, receive_ma_period, ASKING_MA_PERIOD,
     admin_menu, list_channels_handler, select_channel_to_monitor, select_topic_to_monitor,
     admin_view_targets_handler, back_to_admin_menu_handler,
+    admin_create_invite_handler,
     bot_config_handler, bot_general_settings_handler, toggle_approval_mode_handler, handle_signal_approval, 
     ask_profit_target, receive_profit_target, ASKING_PROFIT_TARGET,
     ask_loss_limit, receive_loss_limit, ASKING_LOSS_LIMIT, 
