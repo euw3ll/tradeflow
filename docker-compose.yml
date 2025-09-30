@@ -13,6 +13,11 @@ services:
       POSTGRES_DB: ${POSTGRES_DB}
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB} || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
     ports:
       # Mapeia a porta 5432 do container para a 5432 da VPS.
       # Útil para conectar um cliente de DB externo, se necessário.
@@ -24,6 +29,10 @@ services:
     build: .
     container_name: tradeflow_bot
     restart: always
+    volumes:
+      # Persiste sessão do Telethon e (opcionalmente) logs
+      - ./data:/data
+      # Descomente se quiser logs no host: ./logs:/app/logs
     environment:
       # Passa a URL do banco para a aplicação.
       # Note que o host é 'db', o nome do serviço do banco de dados.

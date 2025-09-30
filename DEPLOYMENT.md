@@ -8,7 +8,7 @@ Visão geral
 
 Diretórios
 - Código do TradeFlow: /opt/tradeflow
-- Sessão do bot: tradeflow_user.session permanece no diretório do projeto (copiada para a imagem durante o build — opção B)
+- Sessão do bot: persistida em /opt/tradeflow/data (montada em /data no container)
 - Logs da aplicação: por padrão ficam dentro do container; caso queira persistir, mapeie /app/logs para /opt/tradeflow/logs
 - Dados do Postgres: volume docker nomeado tradeflow_postgres_data
 
@@ -17,6 +17,7 @@ Como o serviço roda
   - db: postgres:15-alpine (porta 5432 exposta para compatibilidade com clientes externos)
   - bot: imagem construída a partir do Dockerfile; aplica migrações Alembic e inicia o bot do Telegram (polling)
 - Restart policy: always (como no compose original)
+- Persistência: volume bind ./data -> /data no serviço "bot" para guardar tradeflow_user.session
 
 Variáveis de ambiente (.env em /opt/tradeflow)
 - POSTGRES_USER=tradeflow
@@ -62,3 +63,17 @@ Segurança
 Notas
 - Este projeto usa polling do Telegram; não requer domínio nem roteamento Traefik.
 - Para serviços HTTP futuros (ex.: webhook de pagamentos), crie um novo serviço e exponha via Traefik com labels.
+
+Diagnóstico rápido (app "não está online")
+- Ver containers: `docker compose ps`
+- Logs do bot: `docker logs -f tradeflow_bot`
+- Erros comuns e correções:
+  - Token/API inválidos: confira `/opt/tradeflow/.env` (TELEGRAM_BOT_TOKEN, API_ID, API_HASH).
+  - Falha ao aplicar migrações: aguarde os retries do `start.sh` ou verifique a saúde do DB (`docker inspect --format='{{json .State.Health}}' tradeflow_db | jq`).
+  - Quebra por versão do PTB: o código já está compatível com python-telegram-bot v22+ via `run_polling()` com fallback. Se ainda ver erro “Application has no attribute updater”, redeploy após `git push`.
+  - Permissões do `start.sh`: o workflow ajusta antes do build; confirme dentro do container com `docker exec -it tradeflow_bot ls -l /app/start.sh`.
+
+Comandos úteis
+- Recriar apenas o bot: `docker compose up -d --build bot`
+- Limpar imagens antigas: `docker image prune -f`
+- Acessar shell do bot: `docker exec -it tradeflow_bot bash` (ou `sh` na imagem slim)

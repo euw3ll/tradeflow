@@ -47,7 +47,7 @@ jobs:
             echo "[ERROR] /opt/tradeflow/.env não existe na VPS" >&2
             exit 1
           fi
-          mkdir -p logs
+          mkdir -p logs data
           chmod +x start.sh || true
           docker compose pull || true
           docker compose build --pull

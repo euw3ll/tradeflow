@@ -103,13 +103,42 @@ logging.getLogger("telegram").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 async def run_ptb(application: Application, queue: asyncio.Queue):
-    """Inicializa e roda a aplicação python-telegram-bot."""
+    """Inicializa e roda a aplicação python-telegram-bot.
+
+    Compatível com múltiplas versões do PTB:
+    - v22+: usa run_polling()
+    - v20/v21: fallback para initialize/start e start_polling()/updater.start_polling()
+    """
     application.bot_data['comm_queue'] = queue
     logger.info("Inicializando o bot do Telegram (PTB)...")
+    # Preferência: API moderna com run_polling (bloqueante)
+    try:
+        # Algumas versões aceitam parâmetros; chamamos sem argumentos por compatibilidade
+        await application.run_polling()
+        logger.info("✅ Bot do Telegram (PTB) ativo (run_polling).")
+        return
+    except AttributeError:
+        # Versões antigas não possuem run_polling(); caímos no modo manual
+        logger.info("PTB sem run_polling(); iniciando via initialize/start...")
+    except TypeError:
+        # Assinatura inesperada; tenta caminho antigo
+        logger.info("Assinatura inesperada de run_polling(); iniciando via initialize/start...")
+
+    # Fallback compatível com releases que mantêm start/start_polling
     await application.initialize()
     await application.start()
-    await application.updater.start_polling()
-    logger.info("✅ Bot do Telegram (PTB) ativo.")
+    # Tenta start_polling diretamente no Application
+    try:
+        start_polling = getattr(application, 'start_polling', None)
+        if callable(start_polling):
+            await start_polling()
+        else:
+            # Último recurso: usar o objeto updater, se existir
+            await application.updater.start_polling()  # type: ignore[attr-defined]
+        logger.info("✅ Bot do Telegram (PTB) ativo (start_polling).")
+    except Exception as e:
+        logger.critical(f"Falha ao iniciar o polling do PTB: {e}", exc_info=True)
+        raise
 
 async def on_error(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Error handler global: loga a exceção com contexto e avisa o usuário (apenas em chat privado)."""
