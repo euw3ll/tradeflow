@@ -251,7 +251,10 @@ async def start_signal_monitor(queue: asyncio.Queue):
     clara ao invés de bloquear no input().
     """
     logger.info("Iniciando monitor de sinais com Telethon...")
-    
+
+    # Recebe a aplicação PTB para poder enviar alertas ao admin
+    ptb_app = await queue.get()
+
     # Conecta e valida sessão existente
     await client.connect()
     try:
@@ -264,10 +267,17 @@ async def start_signal_monitor(queue: asyncio.Queue):
             "Sessão Telethon ausente ou inválida em %s. Gere via scripts/generate_session.py "
             "e monte o arquivo no volume /data (nome base 'tradeflow_user').", session_file
         )
+        try:
+            await send_error_report(ptb_app, (
+                "⚠️ <b>Telethon inativo</b>\n"
+                f"Sessão ausente ou inválida em <code>{session_file}</code>.\n"
+                "Gere localmente com <code>scripts/generate_session.py</code> e envie para /opt/tradeflow/data."
+            ))
+        except Exception:
+            pass
         # Não derruba o app: seguimos sem o monitor Telethon
         return
-    
-    ptb_app = await queue.get()
+
 
     logger.info("✅ Monitor de sinais e processador de fila ativos.")
     
