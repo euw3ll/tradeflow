@@ -71,6 +71,11 @@ from core.position_tracker import run_tracker
 from services.notification_service import send_user_alert, send_error_report
 
 import warnings
+try:
+    from telegram.warnings import PTBUserWarning
+    warnings.filterwarnings("ignore", category=PTBUserWarning)
+except Exception:
+    pass
 warnings.filterwarnings("ignore", category=UserWarning, module="telegram.ext.conversationhandler")
 logging.getLogger("telegram").setLevel(logging.ERROR)
 logging.getLogger("telegram.ext").setLevel(logging.ERROR)

@@ -245,10 +245,27 @@ async def queue_processor(queue: asyncio.Queue, ptb_app: Application):
 # --- Função Principal do Serviço ---
 
 async def start_signal_monitor(queue: asyncio.Queue):
-    """Inicia o cliente Telethon, o ouvinte de sinais e o processador da fila."""
+    """Inicia o cliente Telethon, o ouvinte de sinais e o processador da fila.
+
+    Evita prompt interativo: se não houver sessão válida, falha com mensagem
+    clara ao invés de bloquear no input().
+    """
     logger.info("Iniciando monitor de sinais com Telethon...")
     
-    await client.start()
+    # Conecta e valida sessão existente
+    await client.connect()
+    try:
+        authorized = await client.is_user_authorized()
+    except Exception:
+        authorized = False
+    if not authorized:
+        session_file = f"{SESSION_PATH}.session"
+        logger.critical(
+            "Sessão Telethon ausente ou inválida em %s. Gere via scripts/generate_session.py "
+            "e monte o arquivo no volume /data (nome base 'tradeflow_user').", session_file
+        )
+        # Não derruba o app: seguimos sem o monitor Telethon
+        return
     
     ptb_app = await queue.get()
 
